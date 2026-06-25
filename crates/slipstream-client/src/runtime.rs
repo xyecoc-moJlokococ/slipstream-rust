@@ -180,6 +180,7 @@ pub async fn run_client_with_control(
             tun::start_tun_engine(
                 tun_fd,
                 config.tun_dns_server.unwrap_or("8.8.8.8"),
+                tokio::runtime::Handle::current(),
                 command_tx.clone(),
                 acceptor.clone(),
                 config.debug_streams,

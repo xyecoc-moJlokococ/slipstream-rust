@@ -10,6 +10,7 @@ use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{duplex, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::runtime::Handle as RuntimeHandle;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
@@ -37,6 +38,7 @@ impl Drop for TunEngine {
 pub(crate) fn start_tun_engine(
     tun_fd: i32,
     dns_server: &str,
+    runtime_handle: RuntimeHandle,
     command_tx: mpsc::UnboundedSender<Command>,
     acceptor: ClientAcceptor,
     debug_streams: bool,
@@ -75,6 +77,7 @@ pub(crate) fn start_tun_engine(
                                 Arc::clone(&thread_write),
                                 command_tx.clone(),
                                 acceptor.clone(),
+                                runtime_handle.clone(),
                                 cleanup_tx.clone(),
                                 debug_streams,
                             );
@@ -86,6 +89,7 @@ pub(crate) fn start_tun_engine(
                                     Arc::clone(&thread_write),
                                     command_tx.clone(),
                                     acceptor.clone(),
+                                    runtime_handle.clone(),
                                     debug_streams,
                                 );
                             }
@@ -138,6 +142,7 @@ fn handle_tcp_packet(
     tun_writer: Arc<Mutex<File>>,
     command_tx: mpsc::UnboundedSender<Command>,
     acceptor: ClientAcceptor,
+    runtime_handle: RuntimeHandle,
     cleanup_tx: std_mpsc::Sender<FlowKey>,
     debug_streams: bool,
 ) {
@@ -155,6 +160,7 @@ fn handle_tcp_packet(
             Arc::clone(&tun_writer),
             command_tx,
             acceptor,
+            runtime_handle,
             cleanup_tx,
             debug_streams,
         );
@@ -189,13 +195,14 @@ fn spawn_flow(
     tun_writer: Arc<Mutex<File>>,
     command_tx: mpsc::UnboundedSender<Command>,
     acceptor: ClientAcceptor,
+    runtime_handle: RuntimeHandle,
     cleanup_tx: std_mpsc::Sender<FlowKey>,
     debug_streams: bool,
 ) -> FlowHandle {
     let (tx, rx) = mpsc::unbounded_channel();
     let flow_id = FLOW_ID.fetch_add(1, Ordering::SeqCst);
     let handle = FlowHandle { tx, server_isn };
-    tokio::spawn(run_flow(
+    runtime_handle.spawn(run_flow(
         flow_id,
         key,
         client_isn,
@@ -474,9 +481,10 @@ fn spawn_dns_query(
     tun_writer: Arc<Mutex<File>>,
     command_tx: mpsc::UnboundedSender<Command>,
     acceptor: ClientAcceptor,
+    runtime_handle: RuntimeHandle,
     debug_streams: bool,
 ) {
-    tokio::spawn(async move {
+    runtime_handle.spawn(async move {
         if packet.payload.is_empty() {
             return;
         }
