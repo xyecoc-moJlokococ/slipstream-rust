@@ -98,7 +98,7 @@ pub(crate) fn maybe_report_debug(
     } else {
         String::new()
     };
-    debug!(
+    let message = format!(
         "debug: {} dns+={} send_pkts+={} send_bytes+={} polls+={} zero_send+={} zero_send_streams+={} streams={} enqueued+={} last_enqueue_ms={} pending_polls={} inflight_polls={}{}",
         label,
         dns_delta,
@@ -114,6 +114,9 @@ pub(crate) fn maybe_report_debug(
         inflight_polls,
         pacing_summary
     );
+    debug!("{}", message);
+    #[cfg(target_os = "android")]
+    crate::platform::log_info("SlipstreamNative", &message);
     debug.last_report_at = now;
     debug.last_report_dns = debug.dns_responses;
     debug.last_report_zero = debug.zero_send_loops;

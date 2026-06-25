@@ -593,6 +593,40 @@ pub async fn run_client_with_control(
             {
                 let backlog = unsafe { (*state_ptr).stream_backlog_summaries(8) };
                 let flow_debug = unsafe { flow_debug_snapshot(cnx) };
+                let transfer_message = format!(
+                    "transfer_debug: streams={} streams_with_rx_queued={} streams_with_data_rx_queued={} data_rx_queued_chunks_total={} queued_bytes_total={} streams_with_recv_fin={} streams_with_send_fin={} streams_discarding={} streams_with_unconsumed_rx={} enqueued_bytes={} dns_send_bytes_total={} last_enqueue_ms={} zero_send_with_streams={} zero_send_loops={} flow_blocked={} has_ready_stream={} maxdata_remote={} data_sent={} tx_window={} maxdata_local={} data_consumed={} rx_window={} backlog={:?}",
+                    streams_len,
+                    metrics.streams_with_rx_queued,
+                    metrics.streams_with_data_rx_queued,
+                    metrics.data_rx_queued_chunks_total,
+                    metrics.queued_bytes_total,
+                    metrics.streams_with_recv_fin,
+                    metrics.streams_with_send_fin,
+                    metrics.streams_discarding,
+                    metrics.streams_with_unconsumed_rx,
+                    enqueued_bytes,
+                    dns_send_bytes_total,
+                    last_enqueue_ms,
+                    zero_send_with_streams,
+                    zero_send_loops,
+                    flow_blocked,
+                    has_ready_stream,
+                    flow_debug.maxdata_remote,
+                    flow_debug.data_sent,
+                    flow_debug.tx_window(),
+                    flow_debug.maxdata_local,
+                    flow_debug.data_consumed,
+                    flow_debug.rx_window(),
+                    backlog
+                );
+                if config.debug_poll || config.debug_streams {
+                    #[cfg(target_os = "android")]
+                    if flow_blocked {
+                        crate::platform::log_error("SlipstreamNative", &transfer_message);
+                    } else {
+                        crate::platform::log_info("SlipstreamNative", &transfer_message);
+                    }
+                }
                 if flow_blocked {
                     error!(
                         "transfer_debug: streams={} streams_with_rx_queued={} streams_with_data_rx_queued={} data_rx_queued_chunks_total={} queued_bytes_total={} streams_with_recv_fin={} streams_with_send_fin={} streams_discarding={} streams_with_unconsumed_rx={} enqueued_bytes={} dns_send_bytes_total={} last_enqueue_ms={} zero_send_with_streams={} zero_send_loops={} flow_blocked={} has_ready_stream={} maxdata_remote={} data_sent={} tx_window={} maxdata_local={} data_consumed={} rx_window={} backlog={:?}",
@@ -665,6 +699,18 @@ pub async fn run_client_with_control(
             if stalled_no_progress && (local_pressure || no_progress_since != 0) {
                 if no_progress_since == 0 {
                     no_progress_since = now;
+                    let message = format!(
+                        "no-progress detector armed: streams={} enqueued_bytes={} dns_send_bytes_total={} flow_blocked={} has_ready_stream={} data_rx_queued_chunks_total={} zero_send_with_streams={}",
+                        streams_len,
+                        enqueued_bytes,
+                        dns_send_bytes_total,
+                        flow_blocked,
+                        has_ready_stream,
+                        metrics.data_rx_queued_chunks_total,
+                        zero_send_with_streams
+                    );
+                    #[cfg(target_os = "android")]
+                    crate::platform::log_warn("SlipstreamNative", &message);
                     warn!(
                         "no-progress detector armed: streams={} enqueued_bytes={} dns_send_bytes_total={} flow_blocked={} has_ready_stream={} data_rx_queued_chunks_total={} zero_send_with_streams={}",
                         streams_len,
@@ -676,6 +722,19 @@ pub async fn run_client_with_control(
                         zero_send_with_streams
                     );
                 } else if now.saturating_sub(no_progress_since) >= NO_PROGRESS_TIMEOUT_US {
+                    let message = format!(
+                        "no-progress detected for {}ms: streams={} enqueued_bytes={} dns_send_bytes_total={} flow_blocked={} has_ready_stream={} data_rx_queued_chunks_total={} zero_send_with_streams={}; resetting connection",
+                        now.saturating_sub(no_progress_since) / 1_000,
+                        streams_len,
+                        enqueued_bytes,
+                        dns_send_bytes_total,
+                        flow_blocked,
+                        has_ready_stream,
+                        metrics.data_rx_queued_chunks_total,
+                        zero_send_with_streams
+                    );
+                    #[cfg(target_os = "android")]
+                    crate::platform::log_error("SlipstreamNative", &message);
                     error!(
                         "no-progress detected for {}ms: streams={} enqueued_bytes={} dns_send_bytes_total={} flow_blocked={} has_ready_stream={} data_rx_queued_chunks_total={} zero_send_with_streams={}; resetting connection",
                         now.saturating_sub(no_progress_since) / 1_000,
