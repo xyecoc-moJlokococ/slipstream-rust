@@ -31,6 +31,9 @@ pub enum ResolverTransport {
 pub struct ClientConfig<'a> {
     pub tcp_listen_host: &'a str,
     pub tcp_listen_port: u16,
+    pub tcp_listener_enabled: bool,
+    pub tun_fd: Option<i32>,
+    pub tun_dns_server: Option<&'a str>,
     pub resolvers: &'a [ResolverSpec],
     pub domain: &'a str,
     pub cert: Option<&'a str>,

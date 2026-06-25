@@ -10,7 +10,6 @@ use slipstream_core::flow_control::{
     conn_reserve_bytes, consume_error_log_message, consume_stream_data, promote_error_log_message,
     promote_streams, reserve_target_offset, FlowControlState, PromoteEntry,
 };
-use slipstream_core::tcp::{stream_read_limit_chunks, tcp_send_buffer_bytes};
 use slipstream_ffi::picoquic::{
     picoquic_add_to_stream, picoquic_cnx_t, picoquic_current_time,
     picoquic_get_next_local_stream_id, picoquic_mark_active_stream, picoquic_stream_data_consumed,
@@ -82,7 +81,6 @@ pub(crate) fn handle_command(
                 drop(stream);
                 return;
             }
-            let _ = stream.set_nodelay(true);
             #[cfg(test)]
             let forced_failure = test_hooks::take_mark_active_stream_failure();
             #[cfg(not(test))]
@@ -128,17 +126,12 @@ pub(crate) fn handle_command(
                 }
                 return;
             }
-            let read_limit = stream_read_limit_chunks(
-                &stream,
-                DEFAULT_TCP_RCVBUF_BYTES,
-                STREAM_READ_CHUNK_BYTES,
-            );
+            let (read_half, write_half, write_coalesce_bytes) = stream.split();
+            let read_limit = (DEFAULT_TCP_RCVBUF_BYTES / STREAM_READ_CHUNK_BYTES).max(1);
             let (data_tx, data_rx) = mpsc::channel(read_limit);
             let data_notify = state.data_notify.clone();
-            let send_buffer_bytes = tcp_send_buffer_bytes(&stream)
-                .filter(|bytes| *bytes > 0)
+            let send_buffer_bytes = write_coalesce_bytes
                 .unwrap_or(CLIENT_WRITE_COALESCE_DEFAULT_BYTES);
-            let (read_half, write_half) = stream.into_split();
             let (write_tx, write_rx) = mpsc::unbounded_channel();
             let command_tx = state.command_tx.clone();
             let (read_abort_tx, read_abort_rx) = oneshot::channel();

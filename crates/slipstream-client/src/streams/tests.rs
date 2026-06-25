@@ -318,7 +318,7 @@ fn mark_active_stream_failure_removes_stream() {
             std::ptr::null_mut(),
             &mut state as *mut _,
             Command::NewStream {
-                stream,
+                stream: DownstreamStream::from_tcp_stream(stream, None),
                 reservation,
             },
         );

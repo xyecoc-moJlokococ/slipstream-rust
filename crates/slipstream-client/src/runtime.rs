@@ -18,6 +18,7 @@ use crate::streams::{
     acceptor::ClientAcceptor, client_callback, drain_commands, drain_stream_data, handle_command,
     ClientState, Command,
 };
+use crate::tun;
 use slipstream_dns::{build_qname, encode_query, QueryParams, CLASS_IN, RR_TXT};
 use slipstream_ffi::{
     configure_quic_with_custom,
@@ -163,13 +164,30 @@ pub async fn run_client_with_control(
     let data_notify = Arc::new(Notify::new());
     let acceptor = ClientAcceptor::new();
     let debug_streams = config.debug_streams;
-    let tcp_host = config.tcp_listen_host;
-    let tcp_port = config.tcp_listen_port;
-    let (listener, bound_host) = bind_tcp_listener(tcp_host, tcp_port)
-        .await
-        .map_err(map_io)?;
-    acceptor.spawn(listener, command_tx.clone());
-    info!("Listening on TCP port {} (host {})", tcp_port, bound_host);
+    if config.tcp_listener_enabled {
+        let tcp_host = config.tcp_listen_host;
+        let tcp_port = config.tcp_listen_port;
+        let (listener, bound_host) = bind_tcp_listener(tcp_host, tcp_port)
+            .await
+            .map_err(map_io)?;
+        acceptor.spawn(listener, command_tx.clone());
+        info!("Listening on TCP port {} (host {})", tcp_port, bound_host);
+    } else {
+        info!("TCP listener disabled; waiting for native TUN streams");
+    }
+    let _tun_engine = match config.tun_fd {
+        Some(tun_fd) => Some(
+            tun::start_tun_engine(
+                tun_fd,
+                config.tun_dns_server.unwrap_or("8.8.8.8"),
+                command_tx.clone(),
+                acceptor.clone(),
+                config.debug_streams,
+            )
+            .map_err(|err| ClientError::new(format!("native TUN start failed: {}", err)))?,
+        ),
+        None => None,
+    };
 
     let alpn = CString::new(SLIPSTREAM_ALPN)
         .map_err(|_| ClientError::new("ALPN contains an unexpected null byte"))?;

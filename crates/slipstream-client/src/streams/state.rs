@@ -1,10 +1,10 @@
 use super::acceptor;
+use super::downstream::DownstreamStream;
 use super::io_tasks::StreamWrite;
 use slipstream_core::flow_control::{FlowControlState, HasFlowControlState};
 use slipstream_ffi::picoquic::picoquic_cnx_t;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::net::TcpStream as TokioTcpStream;
 use tokio::sync::{mpsc, oneshot, Notify};
 use tracing::{debug, info};
 
@@ -278,7 +278,7 @@ impl HasFlowControlState for ClientStream {
 
 pub(crate) enum Command {
     NewStream {
-        stream: TokioTcpStream,
+        stream: DownstreamStream,
         reservation: acceptor::AcceptorReservation,
     },
     StreamData {

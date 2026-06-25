@@ -5,6 +5,7 @@ mod pinning;
 mod platform;
 mod runtime;
 mod streams;
+mod tun;
 
 use jni::objects::{JBooleanArray, JIntArray, JObject, JObjectArray, JString};
 use jni::sys::{jdouble, jint, jstring, JNI_VERSION_1_6};
@@ -192,6 +193,9 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeStartSlips
             let config = ClientConfig {
                 tcp_listen_host: &listen_host,
                 tcp_listen_port: listen_port as u16,
+                tcp_listener_enabled: true,
+                tun_fd: None,
+                tun_dns_server: None,
                 resolvers: &resolvers,
                 congestion_control: congestion_control.as_deref(),
                 gso: gso_enabled,
@@ -217,6 +221,180 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeStartSlips
         Ok(thread) => thread,
         Err(err) => {
             set_last_error(format!("failed to spawn Slipstream client thread: {}", err));
+            if is_current_generation(generation) {
+                RUNNING.store(false, Ordering::SeqCst);
+                READY.store(false, Ordering::SeqCst);
+            }
+            return -10;
+        }
+    };
+    let _ = started_rx.recv_timeout(Duration::from_secs(1));
+    thread::sleep(Duration::from_millis(150));
+    if !RUNNING.load(Ordering::SeqCst) {
+        let _ = thread.join();
+        return -11;
+    }
+
+    thread::spawn(move || {
+        while let Ok(ready) = ready_rx.recv() {
+            store_ready(generation, ready);
+        }
+        store_ready(generation, false);
+    });
+
+    if let Ok(mut client) = client_slot().lock() {
+        *client = Some(ClientHandle {
+            stop_tx,
+            thread,
+            generation,
+        });
+        0
+    } else {
+        set_last_error("failed to lock Slipstream client state");
+        -10
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeStartSlipstreamTun(
+    mut env: JNIEnv<'_>,
+    _this: JObject<'_>,
+    domain: JString<'_>,
+    resolver_hosts: JObjectArray<'_>,
+    resolver_ports: JIntArray<'_>,
+    resolver_authoritative: JBooleanArray<'_>,
+    tun_fd: jint,
+    congestion_control: JString<'_>,
+    keep_alive_interval: jint,
+    gso_enabled: bool,
+    debug_poll: bool,
+    debug_streams: bool,
+    _idle_poll_interval: jint,
+    _idle_timeout_ms: jint,
+    resolver_transport: JString<'_>,
+    tun_dns_server: JString<'_>,
+    pacing_gain_probe: jdouble,
+    dns_tcp_packet_loop_burst: jint,
+) -> jint {
+    clear_last_error();
+    if RUNNING.load(Ordering::SeqCst) {
+        set_last_error("Slipstream client is already running");
+        return -10;
+    }
+    let _ = stop_running_client();
+
+    let domain = match java_string(&mut env, &domain)
+        .and_then(|value| normalize_domain(&value).map_err(|err| err.to_string()))
+    {
+        Ok(domain) => domain,
+        Err(err) => {
+            set_last_error(err);
+            return -1;
+        }
+    };
+    let congestion_control = match java_string(&mut env, &congestion_control) {
+        Ok(value) if value.trim().is_empty() => None,
+        Ok(value) => Some(value),
+        Err(err) => {
+            set_last_error(err);
+            return -2;
+        }
+    };
+    let resolver_transport = match java_string(&mut env, &resolver_transport) {
+        Ok(value) => parse_resolver_transport(&value),
+        Err(err) => {
+            set_last_error(err);
+            return -2;
+        }
+    };
+    let tun_dns_server = match java_string(&mut env, &tun_dns_server) {
+        Ok(value) if value.trim().is_empty() => "8.8.8.8".to_string(),
+        Ok(value) => value,
+        Err(err) => {
+            set_last_error(err);
+            return -2;
+        }
+    };
+    let mut resolvers = match read_resolvers(
+        &mut env,
+        resolver_hosts,
+        resolver_ports,
+        resolver_authoritative,
+    ) {
+        Ok(resolvers) => resolvers,
+        Err(err) => {
+            set_last_error(err);
+            return -2;
+        }
+    };
+    if resolver_transport == ResolverTransport::Tcp && resolvers.len() > 1 {
+        resolvers.truncate(1);
+    }
+    if resolvers.is_empty() || tun_fd < 0 {
+        set_last_error("invalid Slipstream TUN configuration");
+        return -2;
+    }
+    let pacing_gain_probe = sanitize_pacing_gain_probe(pacing_gain_probe);
+    let dns_tcp_packet_loop_burst = if dns_tcp_packet_loop_burst > 0 {
+        sanitize_dns_tcp_packet_loop_burst(dns_tcp_packet_loop_burst as usize)
+    } else {
+        DEFAULT_DNS_TCP_PACKET_LOOP_BURST
+    };
+
+    let (stop_tx, stop_rx) = mpsc::unbounded_channel();
+    let (ready_tx, ready_rx) = std_mpsc::channel();
+    let (started_tx, started_rx) = std_mpsc::channel();
+    let generation = CLIENT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    let thread = match thread::Builder::new()
+        .name("slipstream-client-tun".to_string())
+        .spawn(move || {
+            store_running(generation, true);
+            store_ready(generation, false);
+            let _ = started_tx.send(());
+            let runtime = match Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    set_last_error(format!("failed to build Tokio runtime: {}", err));
+                    store_running(generation, false);
+                    return;
+                }
+            };
+            let config = ClientConfig {
+                tcp_listen_host: "",
+                tcp_listen_port: 0,
+                tcp_listener_enabled: false,
+                tun_fd: Some(tun_fd),
+                tun_dns_server: Some(&tun_dns_server),
+                resolvers: &resolvers,
+                congestion_control: congestion_control.as_deref(),
+                gso: gso_enabled,
+                domain: &domain,
+                cert: None,
+                keep_alive_interval: keep_alive_interval.max(0) as usize,
+                resolver_transport,
+                pacing_gain_probe,
+                dns_tcp_packet_loop_burst,
+                debug_poll,
+                debug_streams,
+            };
+            if let Err(err) = runtime.block_on(runtime::run_client_with_control(
+                &config,
+                Some(stop_rx),
+                Some(ready_tx),
+            )) {
+                set_last_error(err.to_string());
+            }
+            store_ready(generation, false);
+            store_running(generation, false);
+        }) {
+        Ok(thread) => thread,
+        Err(err) => {
+            set_last_error(format!("failed to spawn Slipstream TUN client thread: {}", err));
             if is_current_generation(generation) {
                 RUNNING.store(false, Ordering::SeqCst);
                 READY.store(false, Ordering::SeqCst);

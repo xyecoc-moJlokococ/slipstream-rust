@@ -1,6 +1,7 @@
 pub(crate) mod acceptor;
 mod callback;
 mod command_dispatch;
+mod downstream;
 mod invariants;
 mod io_tasks;
 mod state;
@@ -12,4 +13,5 @@ mod tests;
 
 pub(crate) use callback::client_callback;
 pub(crate) use command_dispatch::{drain_commands, drain_stream_data, handle_command};
+pub(crate) use downstream::DownstreamStream;
 pub(crate) use state::{ClientState, Command, PathEvent};

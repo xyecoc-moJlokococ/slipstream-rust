@@ -1,4 +1,5 @@
 use super::Command;
+use super::downstream::{DownstreamReadHalf, DownstreamWriteHalf};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Notify};
@@ -14,7 +15,7 @@ pub(super) enum StreamWrite {
 
 pub(super) fn spawn_client_reader(
     stream_id: u64,
-    mut read_half: tokio::net::tcp::OwnedReadHalf,
+    mut read_half: DownstreamReadHalf,
     mut read_abort_rx: oneshot::Receiver<()>,
     generation: usize,
     command_tx: mpsc::UnboundedSender<Command>,
@@ -92,7 +93,7 @@ pub(super) fn spawn_client_reader(
 
 pub(super) fn spawn_client_writer(
     stream_id: u64,
-    mut write_half: tokio::net::tcp::OwnedWriteHalf,
+    mut write_half: DownstreamWriteHalf,
     mut write_rx: mpsc::UnboundedReceiver<StreamWrite>,
     generation: usize,
     command_tx: mpsc::UnboundedSender<Command>,

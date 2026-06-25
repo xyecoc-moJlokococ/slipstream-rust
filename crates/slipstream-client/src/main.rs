@@ -5,6 +5,7 @@ mod pinning;
 mod platform;
 mod runtime;
 mod streams;
+mod tun;
 
 use clap::{parser::ValueSource, ArgGroup, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use slipstream_core::{
@@ -210,6 +211,9 @@ fn main() {
     let config = ClientConfig {
         tcp_listen_host: &tcp_listen_host,
         tcp_listen_port,
+        tcp_listener_enabled: true,
+        tun_fd: None,
+        tun_dns_server: None,
         resolvers: &resolvers,
         congestion_control: congestion_control.as_deref(),
         gso: args.gso,

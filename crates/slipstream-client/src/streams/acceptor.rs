@@ -1,4 +1,7 @@
 use super::Command;
+use super::downstream::DownstreamStream;
+use super::state::CLIENT_WRITE_COALESCE_DEFAULT_BYTES;
+use slipstream_core::tcp::tcp_send_buffer_bytes;
 use slipstream_ffi::picoquic::{picoquic_cnx_t, slipstream_get_max_streams_bidir_remote};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -51,6 +54,10 @@ impl ClientAcceptor {
 
     #[cfg(test)]
     pub(crate) async fn reserve_for_test(&self) -> AcceptorReservation {
+        self.limiter.reserve().await
+    }
+
+    pub(crate) async fn reserve(&self) -> AcceptorReservation {
         self.limiter.reserve().await
     }
 }
@@ -216,6 +223,11 @@ impl AcceptorGate {
                     drop(stream);
                     return true;
                 };
+                let _ = stream.set_nodelay(true);
+                let write_coalesce_bytes = tcp_send_buffer_bytes(&stream)
+                    .filter(|bytes| *bytes > 0)
+                    .unwrap_or(CLIENT_WRITE_COALESCE_DEFAULT_BYTES);
+                let stream = DownstreamStream::from_tcp_stream(stream, Some(write_coalesce_bytes));
                 if command_tx
                     .send(Command::NewStream {
                         stream,
