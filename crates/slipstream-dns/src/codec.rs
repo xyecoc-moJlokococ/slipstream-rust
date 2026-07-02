@@ -414,8 +414,33 @@ fn parse_edns_raw_payload(packet: &[u8], mut offset: usize, arcount: u16) -> Opt
 
 #[cfg(test)]
 mod tests {
-    use super::encode_response;
-    use crate::types::{Question, ResponseParams, CLASS_IN, RR_TXT};
+    use super::{encode_query, encode_response};
+    use crate::types::{
+        QueryParams, Question, ResponseParams, CLASS_IN, EDNS_UDP_PAYLOAD, RR_OPT, RR_TXT,
+    };
+
+    #[test]
+    fn encode_query_includes_edns_opt_for_udp_payload() {
+        let params = QueryParams {
+            id: 0x1234,
+            qname: "payload.example.com.",
+            qtype: RR_TXT,
+            qclass: CLASS_IN,
+            rd: true,
+            cd: false,
+            qdcount: 1,
+            is_query: true,
+        };
+
+        let packet = encode_query(&params).expect("encode query");
+
+        assert_eq!(u16::from_be_bytes([packet[10], packet[11]]), 1);
+        assert!(packet.len() >= 11);
+        let opt = &packet[packet.len() - 11..];
+        assert_eq!(opt[0], 0);
+        assert_eq!(u16::from_be_bytes([opt[1], opt[2]]), RR_OPT);
+        assert_eq!(u16::from_be_bytes([opt[3], opt[4]]), EDNS_UDP_PAYLOAD);
+    }
 
     #[test]
     fn encode_response_rejects_large_payload() {

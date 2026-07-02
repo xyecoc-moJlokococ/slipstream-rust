@@ -22,8 +22,8 @@ use crate::streams::{
     ClientState, Command,
 };
 use slipstream_dns::{
-    build_edns_raw_qname, build_qname, encode_query_compact, encode_query_edns_raw, QueryParams,
-    CLASS_IN, EDNS_UDP_PAYLOAD, RR_TXT,
+    build_edns_raw_qname, build_qname, encode_query, encode_query_compact, encode_query_edns_raw,
+    QueryParams, CLASS_IN, EDNS_UDP_PAYLOAD, RR_TXT,
 };
 use slipstream_ffi::{
     configure_quic_with_custom,
@@ -653,8 +653,11 @@ pub async fn run_client_with_control(
                             qdcount: 1,
                             is_query: true,
                         };
-                        encode_query_compact(&params)
-                            .map_err(|err| ClientError::new(err.to_string()))?
+                        match config.resolver_transport {
+                            ResolverTransport::Udp => encode_query(&params),
+                            ResolverTransport::Tcp => encode_query_compact(&params),
+                        }
+                        .map_err(|err| ClientError::new(err.to_string()))?
                     }
                     UpstreamEncoding::EdnsRaw => {
                         let qname = build_edns_raw_qname(config.domain)

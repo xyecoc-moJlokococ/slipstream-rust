@@ -8,7 +8,9 @@ This document captures the DNS codec behavior and how it is validated.
 - Inline dots: insert '.' every 57 characters from the right, never add a trailing dot.
 - QNAME format: <base32(payload) with inline dots>.<domain>.
 - Servers may be configured with multiple domains; the QNAME suffix must match one.
-- DNS query: QTYPE=TXT, QCLASS=IN, RD=1, EDNS0 OPT always included.
+- DNS query: QTYPE=TXT, QCLASS=IN, RD=1. UDP QNAME queries include EDNS0 OPT;
+  TCP QNAME queries may use compact encoding without OPT; EDNS raw queries
+  always include OPT.
 - Server decode rules:
   - QR=1 or QDCOUNT!=1 -> FORMAT_ERROR.
   - QTYPE!=TXT -> NAME_ERROR.
