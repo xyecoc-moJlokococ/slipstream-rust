@@ -6,8 +6,8 @@ use crate::picoquic::{
     picoquic_set_default_priority, picoquic_set_initial_send_mtu,
     picoquic_set_key_log_file_from_env, picoquic_set_max_data_control, picoquic_set_mtu_max,
     picoquic_set_preemptive_repeat_policy, picoquic_set_stream_data_consumption_mode,
-    picoquic_stop_sending, slipstream_take_stateless_packet_for_cid, SockaddrStorage,
-    PICOQUIC_MAX_PACKET_SIZE,
+    picoquic_stop_sending, slipstream_set_default_stream_data_control,
+    slipstream_take_stateless_packet_for_cid, SockaddrStorage, PICOQUIC_MAX_PACKET_SIZE,
 };
 use libc::{c_char, c_int, c_ulong, size_t};
 use slipstream_core::tcp::stream_write_buffer_bytes;
@@ -22,6 +22,15 @@ use winapi::shared::ws2ipdef::SOCKADDR_IN6_LH;
 pub const SLIPSTREAM_INTERNAL_ERROR: u64 = 0x101;
 pub const SLIPSTREAM_FILE_CANCEL_ERROR: u64 = 0x105;
 pub const SLIPSTREAM_MAX_DATA_CONTROL_BYTES: u64 = 64 * 1024 * 1024;
+// picoquic's stock per-stream default (initial_max_stream_data_bidi_remote, ~64KB) is what
+// actually gates upload throughput on freshly-opened streams -- far below the connection-level
+// budget above. See slipstream_set_default_stream_data_control's doc comment in slipstream_poll.c.
+// Kept modest (not e.g. 4MB): this is a per-stream ceiling, and with 10-20+ concurrent streams
+// (one per multiplexed local TCP connection) under real load, a too-generous value multiplies
+// into a large memory footprint that starved a small (~1GB RAM) production VPS into swapping,
+// which then starved co-located services (the SOCKS proxy) of CPU and caused widespread
+// connect-timeout failures. 1MB is still a ~16x improvement over the ~64KB stock default.
+pub const SLIPSTREAM_STREAM_DATA_CONTROL_BYTES: u64 = 1024 * 1024;
 
 extern "C" {
     fn ERR_error_string_n(e: c_ulong, buf: *mut c_char, len: size_t);
@@ -82,6 +91,7 @@ unsafe fn configure_quic_common(quic: *mut picoquic_quic_t, mtu: u32) {
     picoquic_set_stream_data_consumption_mode(quic, 1);
     let max_data = (stream_write_buffer_bytes() as u64).max(SLIPSTREAM_MAX_DATA_CONTROL_BYTES);
     picoquic_set_max_data_control(quic, max_data);
+    slipstream_set_default_stream_data_control(quic, SLIPSTREAM_STREAM_DATA_CONTROL_BYTES);
     picoquic_set_mtu_max(quic, mtu);
     picoquic_set_initial_send_mtu(quic, mtu, mtu);
     picoquic_set_key_log_file_from_env(quic);

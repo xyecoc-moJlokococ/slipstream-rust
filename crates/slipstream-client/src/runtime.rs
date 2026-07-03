@@ -35,8 +35,7 @@ use slipstream_ffi::{
         picoquic_prepare_next_packet_ex, picoquic_set_callback, slipstream_get_flow_debug,
         slipstream_has_ready_stream, slipstream_is_flow_blocked, slipstream_mixed_cc_algorithm,
         slipstream_set_cc_override, slipstream_set_default_path_mode,
-        PICOQUIC_CONNECTION_ID_MAX_SIZE, PICOQUIC_MAX_PACKET_SIZE, PICOQUIC_PACKET_LOOP_RECV_MAX,
-        PICOQUIC_PACKET_LOOP_SEND_MAX,
+        PICOQUIC_CONNECTION_ID_MAX_SIZE, PICOQUIC_MAX_PACKET_SIZE,
     },
     socket_addr_to_storage, take_crypto_errors, ClientConfig, QuicGuard, ResolverMode,
     ResolverTransport, UpstreamEncoding,
@@ -56,6 +55,10 @@ const SLIPSTREAM_SNI: &str = "test.example.com";
 const DNS_WAKE_DELAY_MAX_US: i64 = 10_000_000;
 const DNS_POLL_SLICE_US: u64 = 50_000;
 const DNS_IDLE_SLEEP_MIN_US: u64 = 50_000;
+// Despite the name, this now bounds the picoquic packet-loop send/recv burst for both
+// TCP and UDP resolver transports (UDP used to be pinned to picoquic's stock default of 10,
+// which throttled upload throughput much harder than download since upload rides in many
+// small outbound DNS queries while download comes back in fewer, larger responses).
 pub(crate) const DEFAULT_DNS_TCP_PACKET_LOOP_BURST: usize = 64;
 const DNS_TCP_PACKET_LOOP_BURST_MIN: usize = 1;
 const DNS_TCP_PACKET_LOOP_BURST_MAX: usize = 512;
@@ -74,7 +77,10 @@ const STALE_STREAM_MIN_ENQUEUED_BYTES: u64 = 1;
 const STALE_STREAM_MIN_IDLE_US: u64 = 4_000_000;
 const MAX_UPSTREAM_BUFFERED_BYTES: u64 = 16 * 1024 * 1024;
 const UPSTREAM_BACKPRESSURE_RECENT_US: u64 = 2_000_000;
-const STREAM_ACTIVE_POLL_GRACE_US: u64 = 2_000_000;
+// Widened from 2s: bursty-but-active uploads (reads arriving in irregular chunks, not a
+// steady stream) were falling outside a tight grace window between chunks, tripping the
+// idle-poll clamp below and looking like the transfer periodically dropped to ~0.
+const STREAM_ACTIVE_POLL_GRACE_US: u64 = 4_000_000;
 // Only applies after streams go quiet. Active transfers still use the normal burst/pacing path.
 const IDLE_STREAM_POLL_INTERVAL_US: u64 = 2_000_000;
 
@@ -179,8 +185,8 @@ pub async fn run_client_with_control(
                 DNS_TCP_RECURSIVE_POLL_SEED,
             ),
             ResolverTransport::Udp => (
-                PICOQUIC_PACKET_LOOP_SEND_MAX,
-                PICOQUIC_PACKET_LOOP_RECV_MAX,
+                dns_tcp_packet_loop_burst,
+                dns_tcp_packet_loop_burst,
                 DNS_UDP_RECURSIVE_POLL_CREDIT,
                 DNS_UDP_RECURSIVE_POLL_SEED,
             ),
@@ -438,7 +444,9 @@ pub async fn run_client_with_control(
                                 || idle_stream_poll_due_for_sleep)
                         {
                             let quality = fetch_path_quality(cnx, resolver);
-                            let max_target = if current_time < resolver.high_throughput_until {
+                            let max_target = if current_time < resolver.high_throughput_until
+                                || has_recent_stream_activity_for_sleep
+                            {
                                 MAX_ACTIVE_AUTHORITATIVE_TARGET_INFLIGHT
                             } else {
                                 0
@@ -849,7 +857,9 @@ pub async fn run_client_with_control(
                         let mut poll_deficit = if streams_len > 0 && allow_poll {
                             let quality = fetch_path_quality(cnx, resolver);
                             let snapshot = resolver.last_pacing_snapshot;
-                            let max_target = if current_time < resolver.high_throughput_until {
+                            let max_target = if current_time < resolver.high_throughput_until
+                                || has_recent_stream_activity
+                            {
                                 MAX_ACTIVE_AUTHORITATIVE_TARGET_INFLIGHT
                             } else {
                                 0

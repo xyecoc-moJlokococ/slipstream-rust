@@ -235,6 +235,7 @@ extern "C" {
         is_port_blocking_disabled: c_int,
     );
     pub fn picoquic_set_max_data_control(quic: *mut picoquic_quic_t, max_data: u64);
+    pub fn slipstream_set_default_stream_data_control(quic: *mut picoquic_quic_t, max_stream_data: u64);
     pub fn picoquic_set_mtu_max(quic: *mut picoquic_quic_t, mtu_max: u32);
     pub fn picoquic_set_initial_send_mtu(
         quic: *mut picoquic_quic_t,

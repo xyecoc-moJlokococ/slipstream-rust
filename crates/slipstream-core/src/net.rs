@@ -13,19 +13,30 @@ pub fn is_transient_udp_error(err: &Error) -> bool {
 
     #[cfg(not(windows))]
     {
+        // EPERM shows up here too: a per-destination send that a local firewall/netfilter
+        // hook (e.g. conntrack rejecting a locally-generated packet when its table is full,
+        // or an ICMP administratively-prohibited reply cached against that 5-tuple) drops on
+        // the LOCAL_OUT hook is surfaced to the caller as EPERM, not ECONNREFUSED/EHOSTUNREACH.
+        // It's scoped to one destination/packet, not the whole socket, so it must not be fatal
+        // for the whole server -- this is a fire-and-forget, poll-based protocol that already
+        // tolerates a dropped response (the client just polls again).
         matches!(
             err.raw_os_error(),
-            Some(code) if code == libc::ENETUNREACH || code == libc::EHOSTUNREACH
+            Some(code) if code == libc::ENETUNREACH
+                || code == libc::EHOSTUNREACH
+                || code == libc::EPERM
         )
     }
     #[cfg(windows)]
     {
-        // Windows uses WinSock error codes: WSAENETUNREACH = 10051, WSAEHOSTUNREACH = 10065
+        // Windows uses WinSock error codes: WSAENETUNREACH = 10051, WSAEHOSTUNREACH = 10065,
+        // WSAEACCES = 10013 (Windows' analogue of a firewall-rejected send).
         const WSAENETUNREACH: i32 = 10051;
         const WSAEHOSTUNREACH: i32 = 10065;
+        const WSAEACCES: i32 = 10013;
         matches!(
             err.raw_os_error(),
-            Some(code) if code == WSAENETUNREACH || code == WSAEHOSTUNREACH
+            Some(code) if code == WSAENETUNREACH || code == WSAEHOSTUNREACH || code == WSAEACCES
         )
     }
 }

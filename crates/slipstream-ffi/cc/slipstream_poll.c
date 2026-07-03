@@ -49,6 +49,26 @@ void slipstream_disable_ack_delay(picoquic_cnx_t *cnx) {
     cnx->no_ack_delay = 1;
 }
 
+/* picoquic_set_max_data_control() only raises the connection-level initial_max_data
+ * default (quic->default_tp.initial_max_data). It leaves the per-stream flow-control
+ * defaults (initial_max_stream_data_bidi_local/remote/uni) at picoquic's stock values,
+ * one of which (bidi_remote, ~64KB) is far smaller than the connection-level budget.
+ * Every freshly-opened stream (e.g. one per local TCP connection multiplexed through
+ * the tunnel) starts out capped at that tiny per-stream window regardless of how large
+ * the connection window is, and can only grow it via a slow MAX_STREAM_DATA round trip
+ * over the DNS poll channel -- causing bursty uploads across many concurrent streams to
+ * repeatedly stall on stream-level flow control while the connection-level window sits
+ * mostly unused. This must be called before any connection is created on `quic`, since
+ * it only affects quic->default_tp used to seed future connections' local_parameters. */
+void slipstream_set_default_stream_data_control(picoquic_quic_t *quic, uint64_t max_stream_data) {
+    if (quic == NULL) {
+        return;
+    }
+    quic->default_tp.initial_max_stream_data_bidi_local = max_stream_data;
+    quic->default_tp.initial_max_stream_data_bidi_remote = max_stream_data;
+    quic->default_tp.initial_max_stream_data_uni = max_stream_data;
+}
+
 int slipstream_find_path_id_by_addr(picoquic_cnx_t *cnx, const struct sockaddr* addr_peer) {
     if (cnx == NULL || addr_peer == NULL || addr_peer->sa_family == 0) {
         return -1;
