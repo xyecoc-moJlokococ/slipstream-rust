@@ -73,6 +73,16 @@ struct Args {
     upstream_encoding: UpstreamEncodingArg,
     #[arg(long = "qname-mtu", default_value_t = 0)]
     qname_mtu: u32,
+    /// DNS query type to send (default 16 = TXT). Server must accept the same type; non-TXT also
+    /// needs per-type answer encoding server-side (not implemented) so keep 16 in production.
+    #[arg(long = "dns-query-type", default_value_t = 16)]
+    dns_query_type: u16,
+    /// Label length (chars, 1..=63) for the encoded subdomain (default 57). Client-only fingerprint knob.
+    #[arg(long = "dns-label-length", default_value_t = 57)]
+    dns_label_length: usize,
+    /// Cap on DNS poll queries per second (0 = unlimited). Lowers the query-rate fingerprint at the cost of throughput.
+    #[arg(long = "max-poll-qps", default_value_t = 0)]
+    max_poll_qps: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -242,6 +252,9 @@ fn main() {
         qname_mtu: args.qname_mtu,
         pacing_gain_probe: args.pacing_gain_probe,
         dns_tcp_packet_loop_burst: args.dns_tcp_packet_loop_burst,
+        dns_query_type: args.dns_query_type,
+        dns_label_length: args.dns_label_length,
+        max_poll_qps: args.max_poll_qps,
         debug_poll: args.debug_poll,
         debug_streams: args.debug_streams,
     };

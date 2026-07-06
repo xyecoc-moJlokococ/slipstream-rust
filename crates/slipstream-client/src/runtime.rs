@@ -22,8 +22,8 @@ use crate::streams::{
     ClientState, Command,
 };
 use slipstream_dns::{
-    build_edns_raw_qname, build_qname, encode_query, encode_query_compact, encode_query_edns_raw,
-    QueryParams, CLASS_IN, EDNS_UDP_PAYLOAD, RR_TXT,
+    build_edns_raw_qname, build_qname_with_label_len, encode_query, encode_query_compact,
+    encode_query_edns_raw, QueryParams, CLASS_IN, EDNS_UDP_PAYLOAD,
 };
 use slipstream_ffi::{
     configure_quic_with_custom,
@@ -145,7 +145,7 @@ pub(crate) fn sanitize_dns_tcp_packet_loop_burst(value: usize) -> usize {
 fn compute_transport_mtu(config: &ClientConfig<'_>) -> Result<u32, ClientError> {
     match config.upstream_encoding {
         UpstreamEncoding::Qname => {
-            let max_mtu = compute_mtu(config.domain)?;
+            let max_mtu = compute_mtu(config.domain, config.dns_label_length)?;
             if config.qname_mtu == 0 {
                 Ok(max_mtu)
             } else {
@@ -363,6 +363,10 @@ pub async fn run_client_with_control(
         let mut last_idle_stream_poll_at = 0u64;
         let mut ready_reported = false;
         let mut fatal_no_progress: Option<String> = None;
+        // Rolling 1-second window for the optional DNS poll-rate cap (config.max_poll_qps).
+        // Only used when max_poll_qps > 0; otherwise these stay untouched and impose no limit.
+        let mut poll_window_start_us = 0u64;
+        let mut poll_window_sent: u32 = 0;
 
         loop {
             if shutdown_requested(&mut shutdown_rx) {
@@ -641,12 +645,16 @@ pub async fn run_client_with_control(
 
                 let packet = match config.upstream_encoding {
                     UpstreamEncoding::Qname => {
-                        let qname = build_qname(&send_buf[..send_length], config.domain)
-                            .map_err(|err| ClientError::new(err.to_string()))?;
+                        let qname = build_qname_with_label_len(
+                            &send_buf[..send_length],
+                            config.domain,
+                            config.dns_label_length,
+                        )
+                        .map_err(|err| ClientError::new(err.to_string()))?;
                         let params = QueryParams {
                             id: dns_id,
                             qname: &qname,
-                            qtype: RR_TXT,
+                            qtype: config.dns_query_type,
                             qclass: CLASS_IN,
                             rd: true,
                             cd: false,
@@ -886,6 +894,19 @@ pub async fn run_client_with_control(
                         if has_ready_stream && !flow_blocked {
                             poll_deficit = 0;
                         }
+                        // Optional anti-fingerprinting DNS query-rate cap. Trades throughput for a
+                        // lower/steadier query volume. No-op unless config.max_poll_qps > 0.
+                        if config.max_poll_qps > 0 && poll_deficit > 0 {
+                            if poll_window_start_us == 0
+                                || current_time.saturating_sub(poll_window_start_us) >= 1_000_000
+                            {
+                                poll_window_start_us = current_time;
+                                poll_window_sent = 0;
+                            }
+                            let budget = (config.max_poll_qps as usize)
+                                .saturating_sub(poll_window_sent as usize);
+                            poll_deficit = poll_deficit.min(budget);
+                        }
                         if poll_deficit > 0 && resolver.debug.enabled {
                             let quality = quality_for_log.unwrap_or_default();
                             debug!(
@@ -900,7 +921,8 @@ pub async fn run_client_with_control(
                         }
                         if poll_deficit > 0 {
                             let burst_max = path_poll_burst_max(resolver, packet_loop_send_base);
-                            let mut to_send = poll_deficit.min(burst_max);
+                            let requested = poll_deficit.min(burst_max);
+                            let mut to_send = requested;
                             send_poll_queries(
                                 cnx,
                                 &mut dns_transport,
@@ -913,6 +935,10 @@ pub async fn run_client_with_control(
                                 &mut send_buf,
                             )
                             .await?;
+                            if config.max_poll_qps > 0 {
+                                poll_window_sent = poll_window_sent
+                                    .saturating_add(requested.saturating_sub(to_send) as u32);
+                            }
                             if idle_stream_poll_due
                                 && !has_recent_stream_activity
                                 && !flow_blocked

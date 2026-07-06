@@ -4,7 +4,7 @@ use crate::dots;
 use crate::name::{encode_name, extract_subdomain_multi, parse_name};
 use crate::types::{
     DecodeQueryError, DecodedQuery, DnsError, QueryParams, Rcode, ResponseParams,
-    EDNS_SLIPSTREAM_PAYLOAD_OPTION, EDNS_UDP_PAYLOAD, RR_OPT, RR_TXT,
+    EDNS_SLIPSTREAM_PAYLOAD_OPTION, EDNS_UDP_PAYLOAD, RR_HTTPS, RR_OPT, RR_TXT, SVCPARAM_ECH,
 };
 use crate::wire::{
     parse_header, parse_question, parse_question_for_reply, read_u16, read_u32, write_u16,
@@ -18,6 +18,19 @@ pub fn decode_query(packet: &[u8], domain: &str) -> Result<DecodedQuery, DecodeQ
 pub fn decode_query_with_domains(
     packet: &[u8],
     domains: &[&str],
+) -> Result<DecodedQuery, DecodeQueryError> {
+    decode_query_with_domains_and_qtype(packet, domains, RR_TXT)
+}
+
+/// Like [`decode_query_with_domains`] but accepts queries whose qtype equals `accepted_qtype`
+/// (default is `RR_TXT`). This is the server-side half of the configurable query-type knob: the
+/// client sends `dns_query_type` and the server must accept the same type. NOTE: switching the type
+/// away from TXT also requires the answer RDATA to be encoded for that record type — that response
+/// encoding is not yet implemented, so `accepted_qtype` must stay `RR_TXT` in production until it is.
+pub fn decode_query_with_domains_and_qtype(
+    packet: &[u8],
+    domains: &[&str],
+    accepted_qtype: u16,
 ) -> Result<DecodedQuery, DecodeQueryError> {
     let header = match parse_header(packet) {
         Some(header) => header,
@@ -54,7 +67,10 @@ pub fn decode_query_with_domains(
         Err(_) => return Err(DecodeQueryError::Drop),
     };
 
-    if question.qtype != RR_TXT {
+    // Always accept TXT (the base protocol / backward compatibility) plus the configured alternate
+    // type, so a server can serve both legacy TXT clients and clients using the less-suspicious type
+    // during a migration. The answer is encoded to match each query's own qtype.
+    if question.qtype != RR_TXT && question.qtype != accepted_qtype {
         return Err(DecodeQueryError::Reply {
             id: header.id,
             rd,
@@ -212,7 +228,19 @@ pub fn encode_query_edns_raw(
     Ok(out)
 }
 
+/// Default answer TTL (seconds) used by [`encode_response`]. Configurable via
+/// [`encode_response_with_ttl`] so the server can vary/randomize it and avoid a constant-TTL
+/// fingerprint on the response side.
+pub const DEFAULT_RESPONSE_TTL: u32 = 60;
+
 pub fn encode_response(params: &ResponseParams<'_>) -> Result<Vec<u8>, DnsError> {
+    encode_response_with_ttl(params, DEFAULT_RESPONSE_TTL)
+}
+
+pub fn encode_response_with_ttl(
+    params: &ResponseParams<'_>,
+    answer_ttl: u32,
+) -> Result<Vec<u8>, DnsError> {
     let payload_len = params.payload.map(|payload| payload.len()).unwrap_or(0);
 
     let mut rcode = params.rcode.unwrap_or(if payload_len > 0 {
@@ -253,14 +281,31 @@ pub fn encode_response(params: &ResponseParams<'_>) -> Result<Vec<u8>, DnsError>
         out.extend_from_slice(&[0xC0, 0x0C]);
         write_u16(&mut out, params.question.qtype);
         write_u16(&mut out, params.question.qclass);
-        write_u32(&mut out, 60);
-        let chunk_count = payload_len.div_ceil(255);
-        let rdata_len = payload_len + chunk_count;
-        if rdata_len > u16::MAX as usize {
-            return Err(DnsError::new("payload too long"));
-        }
-        write_u16(&mut out, rdata_len as u16);
-        if let Some(payload) = params.payload {
+        write_u32(&mut out, answer_ttl);
+        let payload = params.payload.unwrap_or(&[]);
+        if params.question.qtype == RR_HTTPS {
+            // SVCB/HTTPS (RFC 9460) rdata carrying the tunnel payload in an opaque `ech` SvcParam:
+            //   SvcPriority(2)=1 | TargetName(1)=root 0x00 | SvcParam{ key=ech(5), len(2), value=payload }
+            // High capacity like TXT, but on the wire it reads as a normal HTTPS record with an ECH
+            // config -- clients query type 65 constantly and ECH values are legitimately opaque binary.
+            let rdata_len = 2 + 1 + 2 + 2 + payload.len();
+            if rdata_len > u16::MAX as usize {
+                return Err(DnsError::new("payload too long"));
+            }
+            write_u16(&mut out, rdata_len as u16);
+            write_u16(&mut out, 1); // SvcPriority = 1 (ServiceMode)
+            out.push(0); // TargetName = "." (root, i.e. same as owner name)
+            write_u16(&mut out, SVCPARAM_ECH); // SvcParamKey = ech (5)
+            write_u16(&mut out, payload.len() as u16); // SvcParamValue length
+            out.extend_from_slice(payload);
+        } else {
+            // TXT: payload split into 255-byte character-strings.
+            let chunk_count = payload_len.div_ceil(255);
+            let rdata_len = payload_len + chunk_count;
+            if rdata_len > u16::MAX as usize {
+                return Err(DnsError::new("payload too long"));
+            }
+            write_u16(&mut out, rdata_len as u16);
             let mut remaining = payload_len;
             let mut cursor = 0;
             while remaining > 0 {
@@ -317,28 +362,67 @@ pub fn decode_response(packet: &[u8]) -> Option<Vec<u8>> {
     if offset + rdlen > packet.len() || rdlen < 1 {
         return None;
     }
-    if qtype != RR_TXT {
+    let rdata = packet.get(offset..offset + rdlen)?;
+    match qtype {
+        RR_TXT => {
+            let mut remaining = rdlen;
+            let mut cursor = 0usize;
+            let mut out = Vec::with_capacity(rdlen);
+            while remaining > 0 {
+                let txt_len = *rdata.get(cursor)? as usize;
+                cursor += 1;
+                remaining -= 1;
+                if txt_len > remaining {
+                    return None;
+                }
+                out.extend_from_slice(rdata.get(cursor..cursor + txt_len)?);
+                cursor += txt_len;
+                remaining -= txt_len;
+            }
+            if out.is_empty() {
+                return None;
+            }
+            Some(out)
+        }
+        RR_HTTPS => decode_svcb_ech_payload(rdata),
+        _ => None,
+    }
+}
+
+/// Extract the tunnel payload carried in an SVCB/HTTPS record's `ech` SvcParam (RFC 9460).
+/// rdata layout: SvcPriority(2) | TargetName | SvcParams[ key(2) len(2) value(len) ]* .
+fn decode_svcb_ech_payload(rdata: &[u8]) -> Option<Vec<u8>> {
+    if rdata.len() < 2 {
         return None;
     }
-
-    let mut remaining = rdlen;
-    let mut cursor = offset;
-    let mut out = Vec::with_capacity(rdlen);
-    while remaining > 0 {
-        let txt_len = packet[cursor] as usize;
+    let mut cursor = 2usize; // skip SvcPriority
+    // Skip TargetName (uncompressed length-prefixed labels ending in a 0 byte).
+    loop {
+        let label_len = *rdata.get(cursor)? as usize;
         cursor += 1;
-        remaining -= 1;
-        if txt_len > remaining {
+        if label_len == 0 {
+            break;
+        }
+        if label_len >= 0xC0 {
+            return None; // SVCB target names are not compressed
+        }
+        cursor += label_len;
+        if cursor > rdata.len() {
             return None;
         }
-        out.extend_from_slice(&packet[cursor..cursor + txt_len]);
-        cursor += txt_len;
-        remaining -= txt_len;
     }
-    if out.is_empty() {
-        return None;
+    // Walk SvcParams for the ech key.
+    while cursor + 4 <= rdata.len() {
+        let key = u16::from_be_bytes([rdata[cursor], rdata[cursor + 1]]);
+        let len = u16::from_be_bytes([rdata[cursor + 2], rdata[cursor + 3]]) as usize;
+        cursor += 4;
+        let value = rdata.get(cursor..cursor + len)?;
+        if key == SVCPARAM_ECH {
+            return if value.is_empty() { None } else { Some(value.to_vec()) };
+        }
+        cursor += len;
     }
-    Some(out)
+    None
 }
 
 pub fn is_response(packet: &[u8]) -> bool {
@@ -414,10 +498,53 @@ fn parse_edns_raw_payload(packet: &[u8], mut offset: usize, arcount: u16) -> Opt
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_query, encode_response};
+    use super::{decode_response, encode_query, encode_response};
     use crate::types::{
-        QueryParams, Question, ResponseParams, CLASS_IN, EDNS_UDP_PAYLOAD, RR_OPT, RR_TXT,
+        QueryParams, Question, ResponseParams, CLASS_IN, EDNS_UDP_PAYLOAD, RR_HTTPS, RR_OPT, RR_TXT,
     };
+
+    #[test]
+    fn encode_response_https_svcb_round_trips_payload() {
+        let payload: Vec<u8> = (0u16..600).map(|i| (i % 256) as u8).collect();
+        let question = Question {
+            name: "abc.tunnel.example.com.".to_string(),
+            qtype: RR_HTTPS,
+            qclass: CLASS_IN,
+        };
+        let encoded = encode_response(&ResponseParams {
+            id: 0x4242,
+            rd: true,
+            cd: false,
+            question: &question,
+            payload: Some(&payload),
+            rcode: None,
+        })
+        .expect("encode https response");
+        // The answer RR type on the wire must be HTTPS (65).
+        let decoded = decode_response(&encoded).expect("decode https response");
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn encode_response_txt_round_trips_payload() {
+        let payload: Vec<u8> = (0u16..600).map(|i| (i % 256) as u8).collect();
+        let question = Question {
+            name: "abc.tunnel.example.com.".to_string(),
+            qtype: RR_TXT,
+            qclass: CLASS_IN,
+        };
+        let encoded = encode_response(&ResponseParams {
+            id: 0x4242,
+            rd: true,
+            cd: false,
+            question: &question,
+            payload: Some(&payload),
+            rcode: None,
+        })
+        .expect("encode txt response");
+        let decoded = decode_response(&encoded).expect("decode txt response");
+        assert_eq!(decoded, payload);
+    }
 
     #[test]
     fn encode_query_includes_edns_opt_for_udp_payload() {

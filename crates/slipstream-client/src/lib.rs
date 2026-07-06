@@ -15,7 +15,7 @@ use slipstream_ffi::{
 };
 use std::collections::HashMap;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -43,6 +43,10 @@ static PROBE_CLIENTS: OnceLock<Mutex<HashMap<u16, ProbeClientHandle>>> = OnceLoc
 static CLIENT_GENERATION: AtomicU64 = AtomicU64::new(0);
 static RUNNING: AtomicBool = AtomicBool::new(false);
 static READY: AtomicBool = AtomicBool::new(false);
+/// DNS query type (RR type) the client sends in poll queries. Default 16 = TXT (unchanged behavior).
+/// Set from Kotlin via nativeSetDnsQueryType before starting a client; applies to the main + probe
+/// clients. Used as an anti-fingerprinting knob (e.g. 65 = HTTPS/SVCB).
+static DNS_QUERY_TYPE: AtomicU16 = AtomicU16::new(16);
 static LAST_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 const STOP_JOIN_TIMEOUT: Duration = Duration::from_secs(6);
 const STOP_JOIN_POLL: Duration = Duration::from_millis(25);
@@ -102,6 +106,21 @@ pub extern "system" fn JNI_OnLoad(vm: JavaVM, _reserved: *mut std::ffi::c_void) 
     #[cfg(not(target_os = "android"))]
     let _ = vm;
     JNI_VERSION_1_6
+}
+
+#[no_mangle]
+pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeSetDnsQueryType(
+    _env: JNIEnv<'_>,
+    _this: JObject<'_>,
+    qtype: jint,
+) {
+    // Clamp to a valid RR type range; 0 or out-of-range falls back to TXT.
+    let value = if qtype > 0 && qtype <= u16::MAX as jint {
+        qtype as u16
+    } else {
+        16
+    };
+    DNS_QUERY_TYPE.store(value, Ordering::Relaxed);
 }
 
 #[no_mangle]
@@ -248,6 +267,12 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeStartSlips
                 qname_mtu: qname_mtu.max(0) as u32,
                 pacing_gain_probe,
                 dns_tcp_packet_loop_burst,
+                // Anti-fingerprinting knobs: defaults preserve historical behavior. Not yet exposed
+                // over JNI (the Android app keeps defaults); wire them into the native call
+                // signature + Kotlin when adding UI/config for them.
+                dns_query_type: DNS_QUERY_TYPE.load(Ordering::Relaxed),
+                dns_label_length: slipstream_dns::DEFAULT_LABEL_LEN,
+                max_poll_qps: 0,
                 debug_poll,
                 debug_streams,
             };
@@ -426,6 +451,12 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeStartProbe
                 qname_mtu: qname_mtu.max(0) as u32,
                 pacing_gain_probe,
                 dns_tcp_packet_loop_burst,
+                // Anti-fingerprinting knobs: defaults preserve historical behavior. Not yet exposed
+                // over JNI (the Android app keeps defaults); wire them into the native call
+                // signature + Kotlin when adding UI/config for them.
+                dns_query_type: DNS_QUERY_TYPE.load(Ordering::Relaxed),
+                dns_label_length: slipstream_dns::DEFAULT_LABEL_LEN,
+                max_poll_qps: 0,
                 debug_poll,
                 debug_streams,
             };

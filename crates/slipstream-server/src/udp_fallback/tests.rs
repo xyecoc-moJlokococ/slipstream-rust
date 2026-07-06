@@ -72,6 +72,7 @@ async fn fallback_forwards_non_dns_then_sticks() {
         quic: std::ptr::null_mut(),
         current_time: 0,
         local_addr_storage: &local_addr_storage,
+        accepted_query_type: 16,
     };
 
     let non_dns = b"nope";
@@ -149,6 +150,7 @@ async fn fallback_forwards_empty_question_query() {
         quic: std::ptr::null_mut(),
         current_time: 0,
         local_addr_storage: &local_addr_storage,
+        accepted_query_type: 16,
     };
 
     let qdcount_zero = build_empty_question_query();
@@ -207,6 +209,7 @@ async fn fallback_switches_after_non_dns_streak() {
         quic: std::ptr::null_mut(),
         current_time: 0,
         local_addr_storage: &local_addr_storage,
+        accepted_query_type: 16,
     };
 
     let dns_packet = build_dns_query("example.com");
@@ -294,6 +297,7 @@ async fn fallback_session_expires_before_forwarding() {
         quic: std::ptr::null_mut(),
         current_time: 0,
         local_addr_storage: &local_addr_storage,
+        accepted_query_type: 16,
     };
 
     let non_dns = b"nope";

@@ -7,7 +7,7 @@ use slipstream_core::{
     },
     normalize_dual_stack_addr, resolve_host_port, HostPort,
 };
-use slipstream_dns::{encode_response, Question, Rcode, ResponseParams};
+use slipstream_dns::{encode_response_with_ttl, Question, Rcode, ResponseParams};
 use slipstream_ffi::picoquic::{
     picoquic_cnx_t, picoquic_create, picoquic_current_time, picoquic_delete_cnx,
     picoquic_get_first_cnx, picoquic_get_next_cnx, picoquic_prepare_packet_ex, picoquic_quic_t,
@@ -92,6 +92,14 @@ pub struct ServerConfig {
     pub debug_commands: bool,
     pub direct_socks_target: bool,
     pub socks_proxy_target: bool,
+    // --- Anti-fingerprinting knobs (defaults preserve historical behavior) ---
+    /// Base answer TTL (seconds) in DNS responses (default 60).
+    pub response_ttl: u32,
+    /// If > 0, vary the answer TTL by `id % (jitter + 1)` so it isn't a constant (default 0).
+    pub response_ttl_jitter: u32,
+    /// DNS query type the server accepts in tunnel queries (default 16 = TXT). Must match the
+    /// client's `dns_query_type`. Non-TXT also needs per-type answer RDATA encoding (not implemented).
+    pub accepted_query_type: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -350,6 +358,7 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
                             quic,
                             current_time: loop_time,
                             local_addr_storage: &local_addr_storage,
+                            accepted_query_type: config.accepted_query_type,
                         };
                         handle_packet(
                             &mut slots,
@@ -397,6 +406,7 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
                         quic,
                         current_time: loop_time,
                         local_addr_storage: &local_addr_storage,
+                        accepted_query_type: config.accepted_query_type,
                     };
                     let slot_start = slots.len();
                     handle_packet(
@@ -514,14 +524,24 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
             } else {
                 (None, slot.rcode)
             };
-            let response = encode_response(&ResponseParams {
-                id: slot.id,
-                rd: slot.rd,
-                cd: slot.cd,
-                question: &slot.question,
-                payload,
-                rcode,
-            })
+            let answer_ttl = if config.response_ttl_jitter > 0 {
+                config
+                    .response_ttl
+                    .saturating_add((slot.id as u32) % (config.response_ttl_jitter + 1))
+            } else {
+                config.response_ttl
+            };
+            let response = encode_response_with_ttl(
+                &ResponseParams {
+                    id: slot.id,
+                    rd: slot.rd,
+                    cd: slot.cd,
+                    question: &slot.question,
+                    payload,
+                    rcode,
+                },
+                answer_ttl,
+            )
             .map_err(|err| ServerError::new(err.to_string()))?;
             if let Some(response_tx) = slot.tcp_response.take() {
                 let _ = response_tx.send(response);

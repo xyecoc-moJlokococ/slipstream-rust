@@ -3,6 +3,11 @@ use std::fmt;
 pub const RR_A: u16 = 1;
 pub const RR_TXT: u16 = 16;
 pub const RR_OPT: u16 = 41;
+/// SVCB/HTTPS resource-record type (RFC 9460). Used as an optional, less-suspicious carrier for the
+/// tunnel download payload (browsers query type 65 constantly; its ECH SvcParam is opaque binary).
+pub const RR_HTTPS: u16 = 65;
+/// `ech` SvcParamKey (RFC 9460 §14): opaque value, used to carry the tunnel payload in HTTPS mode.
+pub const SVCPARAM_ECH: u16 = 5;
 pub const CLASS_IN: u16 = 1;
 pub const EDNS_UDP_PAYLOAD: u16 = 1232;
 pub const EDNS_SLIPSTREAM_PAYLOAD_OPTION: u16 = 65001;

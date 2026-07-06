@@ -48,6 +48,17 @@ pub struct ClientConfig<'a> {
     pub pacing_gain_probe: f64,
     pub dns_tcp_packet_loop_burst: usize,
     pub keep_alive_interval: usize,
+    // --- Anti-fingerprinting / DPI-evasion knobs (defaults preserve historical behavior) ---
+    /// DNS query type sent in poll queries (default 16 = TXT). The server must accept the same type
+    /// (`ServerConfig`/`decode_query_with_domains_and_qtype`). NOTE: non-TXT also needs per-type
+    /// answer RDATA encoding on the server, which is not implemented yet — keep 16 until it is.
+    pub dns_query_type: u16,
+    /// Label length (chars) for the encoded subdomain (default 57). Client-only: the server strips
+    /// dots before decoding, so this only alters the on-the-wire label-length fingerprint.
+    pub dns_label_length: usize,
+    /// Optional cap on DNS poll queries per second (0 = unlimited, the default). Trades throughput
+    /// for a lower query-rate/volume fingerprint; only engages when set > 0.
+    pub max_poll_qps: u32,
     pub debug_poll: bool,
     pub debug_streams: bool,
 }

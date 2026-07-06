@@ -52,6 +52,16 @@ struct Args {
     direct_socks_target: bool,
     #[arg(long = "socks-proxy-target")]
     socks_proxy_target: bool,
+    /// Base answer TTL (seconds) in DNS responses (default 60). Anti-fingerprinting knob.
+    #[arg(long = "response-ttl", default_value_t = 60)]
+    response_ttl: u32,
+    /// If > 0, vary the answer TTL by id%(jitter+1) so it isn't constant (default 0).
+    #[arg(long = "response-ttl-jitter", default_value_t = 0)]
+    response_ttl_jitter: u32,
+    /// DNS query type the server accepts for tunnel queries (default 16 = TXT). Must match the
+    /// client's --dns-query-type; non-TXT also needs per-type answer encoding (not implemented).
+    #[arg(long = "accepted-query-type", default_value_t = 16)]
+    accepted_query_type: u16,
 }
 
 fn main() {
@@ -167,6 +177,9 @@ fn main() {
         debug_commands: args.debug_commands,
         direct_socks_target: args.direct_socks_target,
         socks_proxy_target: args.socks_proxy_target,
+        response_ttl: args.response_ttl,
+        response_ttl_jitter: args.response_ttl_jitter,
+        accepted_query_type: args.accepted_query_type,
     };
 
     let runtime = Builder::new_current_thread()
