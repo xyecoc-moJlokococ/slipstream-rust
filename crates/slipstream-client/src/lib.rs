@@ -55,7 +55,12 @@ static DNS_LABEL_LENGTH: AtomicU32 = AtomicU32::new(57);
 /// with no server-side counterpart. Set from Kotlin via nativeSetMaxPollQps.
 static MAX_POLL_QPS: AtomicU32 = AtomicU32::new(0);
 static LAST_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-const STOP_JOIN_TIMEOUT: Duration = Duration::from_secs(6);
+// Wait long enough for the client thread to actually finish before giving up and detaching it.
+// A detached thread keeps holding the local listen socket, so the next start fails with EADDRINUSE
+// and the tunnel wedges until the whole app is killed. With the prompt in-loop shutdown check the
+// thread normally exits in well under a second; this ceiling only matters if a single paced send is
+// stuck, and waiting a bit longer to reclaim the port beats leaking it.
+const STOP_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 const STOP_JOIN_POLL: Duration = Duration::from_millis(25);
 
 fn client_slot() -> &'static Mutex<Option<ClientHandle>> {

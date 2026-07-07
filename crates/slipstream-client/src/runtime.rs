@@ -579,6 +579,14 @@ pub async fn run_client_with_control(
             drain_path_events(cnx, &mut resolvers, state_ptr, peer_addr_mode);
 
             for _ in 0..packet_loop_send_max {
+                // Under heavy upload this loop can spend seconds grinding through paced DNS sends
+                // before control returns to the shutdown-aware `select!` below. A stop request that
+                // lands mid-burst would otherwise wait out the whole burst; if that pushes the
+                // native thread past the JNI stop-join deadline it gets detached while still holding
+                // the local listen socket, and the next start fails with EADDRINUSE. Bail promptly.
+                if shutdown_requested(&mut shutdown_rx) {
+                    return Ok(0);
+                }
                 let current_time = unsafe { picoquic_current_time() };
                 let mut send_length: libc::size_t = 0;
                 let mut addr_to: slipstream_ffi::SockaddrStorage = unsafe { std::mem::zeroed() };

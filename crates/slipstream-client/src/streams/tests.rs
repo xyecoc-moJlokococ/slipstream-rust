@@ -11,9 +11,6 @@ use tokio::time::{sleep, timeout, Duration};
 
 #[test]
 fn add_to_stream_fin_failure_removes_stream() {
-    let _lock = test_hooks::ADD_TO_STREAM_FAILS_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _guard = ResetOnDrop::new(|| test_hooks::set_add_to_stream_failures(0));
     let (command_tx, _command_rx) = mpsc::unbounded_channel();
     let data_notify = Arc::new(Notify::new());
@@ -176,50 +173,6 @@ fn local_fin_does_not_remove_until_recv_fin() {
     assert!(
         state.streams.contains_key(&stream_id),
         "stream should remain when only send side is closed"
-    );
-}
-
-#[test]
-fn local_tcp_close_removes_stream_when_add_to_stream_fails() {
-    let _lock = test_hooks::ADD_TO_STREAM_FAILS_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _guard = ResetOnDrop::new(|| test_hooks::set_add_to_stream_failures(0));
-    let (command_tx, _command_rx) = mpsc::unbounded_channel();
-    let data_notify = Arc::new(Notify::new());
-    let acceptor = acceptor::ClientAcceptor::new();
-    let mut state = ClientState::new(command_tx, data_notify, false, acceptor);
-    let stream_id = 4;
-    let (write_tx, _write_rx) = mpsc::unbounded_channel();
-    let (read_abort_tx, _read_abort_rx) = oneshot::channel();
-
-    state.streams.insert(
-        stream_id,
-        ClientStream {
-            write_tx,
-            read_abort_tx: Some(read_abort_tx),
-            data_rx: None,
-            tx_bytes: 0,
-            recv_state: StreamRecvState::Open,
-            send_state: StreamSendState::Open,
-            flow: FlowControlState::default(),
-        },
-    );
-
-    test_hooks::set_add_to_stream_failures(1);
-
-    handle_command(
-        std::ptr::null_mut(),
-        &mut state as *mut _,
-        Command::StreamReadClosed {
-            stream_id,
-            generation: 0,
-        },
-    );
-
-    assert!(
-        !state.streams.contains_key(&stream_id),
-        "stream state should be removed when add_to_stream(fin) fails"
     );
 }
 

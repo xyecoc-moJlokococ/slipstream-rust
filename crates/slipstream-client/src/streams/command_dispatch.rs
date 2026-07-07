@@ -288,67 +288,6 @@ pub(crate) fn handle_command(
             }
             unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
         }
-        Command::StreamReadClosed {
-            stream_id,
-            generation,
-        } => {
-            if !command_generation_matches(state, stream_id, generation, "StreamReadClosed") {
-                return;
-            }
-            // Local TCP EOF just means our peer is done sending; any data already queued for
-            // this stream may still be draining to the remote over the (paced) tunnel. Queue a
-            // graceful QUIC FIN here (same as Command::StreamClosed) instead of aborting, or an
-            // in-flight backlog gets discarded and the transfer is cut short.
-            let should_send_fin = state
-                .streams
-                .get(&stream_id)
-                .is_some_and(|stream| stream.send_state.can_queue_fin());
-            if !should_send_fin {
-                return;
-            }
-            #[cfg(test)]
-            let forced_failure = test_hooks::take_add_to_stream_failure();
-            #[cfg(not(test))]
-            let forced_failure = false;
-            #[cfg(test)]
-            let ret = if forced_failure {
-                test_hooks::FORCED_ADD_TO_STREAM_ERROR
-            } else {
-                assert!(
-                    !cnx.is_null(),
-                    "picoquic connection must be non-null when not forcing failures in tests"
-                );
-                unsafe { picoquic_add_to_stream(cnx, stream_id, std::ptr::null(), 0, 1) }
-            };
-            #[cfg(not(test))]
-            let ret = unsafe { picoquic_add_to_stream(cnx, stream_id, std::ptr::null(), 0, 1) };
-            state.debug_last_enqueue_at = unsafe { picoquic_current_time() };
-            if ret < 0 {
-                warn!(
-                    "stream {}: add_to_stream(fin) on local TCP close failed ret={}",
-                    stream_id, ret
-                );
-                if !forced_failure {
-                    unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
-                }
-                state.remove_stream(stream_id);
-            } else if let Some(stream) = state.streams.get_mut(&stream_id) {
-                debug!(
-                    "stream {}: local TCP closed, fin queued rx_bytes={} tx_bytes={} queued={} consumed_offset={} fin_offset={:?}",
-                    stream_id,
-                    stream.flow.rx_bytes,
-                    stream.tx_bytes,
-                    stream.flow.queued_bytes,
-                    stream.flow.consumed_offset,
-                    stream.flow.fin_offset
-                );
-                stream.send_state = StreamSendState::FinQueued;
-                if stream.recv_state.is_closed() && stream.flow.queued_bytes == 0 {
-                    state.remove_stream(stream_id);
-                }
-            }
-            check_stream_invariants(state, stream_id, "StreamReadClosed");
-        }
         Command::StreamWriteError {
             stream_id,
             generation,

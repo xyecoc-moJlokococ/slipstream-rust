@@ -292,10 +292,6 @@ pub(crate) enum Command {
         stream_id: u64,
         generation: usize,
     },
-    StreamReadClosed {
-        stream_id: u64,
-        generation: usize,
-    },
     StreamWriteError {
         stream_id: u64,
         generation: usize,
