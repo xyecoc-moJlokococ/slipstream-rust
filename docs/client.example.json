@@ -1,0 +1,19 @@
+{
+  "domain": "example.com",
+  "tcp_listen_host": "::",
+  "tcp_listen_port": 5201,
+  "resolvers": [
+    { "addr": "176.59.159.157:53", "authoritative": true },
+    { "addr": "1.1.1.1" }
+  ],
+  "resolver_transport": "udp",
+  "congestion_control": "bbr",
+  "keep_alive_interval": 400,
+  "upstream_encoding": "qname",
+  "qname_mtu": 0,
+  "pacing_gain_probe": 1.4,
+  "dns_tcp_packet_loop_burst": 32,
+  "dns_query_type": 16,
+  "dns_label_length": 57,
+  "max_poll_qps": 0
+}

@@ -489,6 +489,8 @@ dependencies = [
  "jni",
  "libc",
  "openssl",
+ "serde",
+ "serde_json",
  "slipstream-core",
  "slipstream-dns",
  "slipstream-ffi",

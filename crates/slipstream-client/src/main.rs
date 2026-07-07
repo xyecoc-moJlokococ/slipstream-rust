@@ -7,6 +7,7 @@ mod runtime;
 mod streams;
 
 use clap::{parser::ValueSource, ArgGroup, CommandFactory, FromArgMatches, Parser, ValueEnum};
+use serde::Deserialize;
 use slipstream_core::{
     cli::{exit_with_error, exit_with_message, init_logging, unwrap_or_exit},
     normalize_domain, parse_host_port, parse_host_port_parts, sip003, AddressKind, HostPort,
@@ -31,6 +32,10 @@ use runtime::DEFAULT_DNS_TCP_PACKET_LOOP_BURST;
     )
 )]
 struct Args {
+    /// Load settings from a JSON config file. Fields omitted from the file use the built-in
+    /// defaults; any CLI flag explicitly passed overrides the file. Standalone from SIP003.
+    #[arg(long = "config", value_name = "PATH")]
+    config: Option<String>,
     #[arg(long = "tcp-listen-host", default_value = "::")]
     tcp_listen_host: String,
     #[arg(long = "tcp-listen-port", short = 'l', default_value_t = 5201)]
@@ -119,6 +124,11 @@ fn main() {
     init_logging();
     let matches = Args::command().get_matches();
     let args = Args::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
+
+    if let Some(path) = args.config.clone() {
+        run_from_config_file(&path, &args, &matches);
+    }
+
     let sip003_env = unwrap_or_exit(sip003::read_sip003_env(), "SIP003 env error", 2);
     if sip003_env.is_present() {
         tracing::info!("SIP003 env detected; applying SS_* overrides with CLI precedence");
@@ -267,6 +277,252 @@ fn main() {
     match runtime.block_on(run_client_with_control(&config, None, None)) {
         Ok(code) => std::process::exit(code),
         Err(err) => exit_with_error("Client error", err, 1),
+    }
+}
+
+/// JSON config-file schema for slipstream-client. Deliberately flat and 1:1 with `ClientConfig` —
+/// the client is a single fixed tunnel, so there is no xray-style inbound/outbound/routing model.
+/// Every field is optional; omitted fields fall back to the CLI default.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ClientFileConfig {
+    tcp_listen_host: Option<String>,
+    tcp_listen_port: Option<u16>,
+    resolvers: Vec<ResolverEntry>,
+    congestion_control: Option<String>,
+    gso: Option<bool>,
+    domain: Option<String>,
+    cert: Option<String>,
+    keep_alive_interval: Option<u16>,
+    /// "udp" or "tcp".
+    resolver_transport: Option<String>,
+    /// "qname" or "edns-raw".
+    upstream_encoding: Option<String>,
+    qname_mtu: Option<u32>,
+    pacing_gain_probe: Option<f64>,
+    dns_tcp_packet_loop_burst: Option<usize>,
+    dns_query_type: Option<u16>,
+    dns_label_length: Option<usize>,
+    max_poll_qps: Option<u32>,
+    debug_poll: Option<bool>,
+    debug_streams: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolverEntry {
+    addr: String,
+    #[serde(default)]
+    authoritative: bool,
+}
+
+/// Load a JSON config file, merge it with the CLI (explicit flags win, then file, then defaults),
+/// and run the client. Runs the process to completion and never returns.
+fn run_from_config_file(path: &str, args: &Args, matches: &clap::ArgMatches) -> ! {
+    let text = unwrap_or_exit(
+        std::fs::read_to_string(path).map_err(|err| format!("{}: {}", path, err)),
+        "Failed to read config file",
+        2,
+    );
+    let file: ClientFileConfig = unwrap_or_exit(
+        serde_json::from_str(&text).map_err(|err| err.to_string()),
+        "Invalid config file",
+        2,
+    );
+
+    // Explicit CLI flag > file value > built-in default. `args.<field>` already holds the clap
+    // default when the flag was not passed, so it doubles as the default source.
+    let tcp_listen_host = if cli_provided(matches, "tcp_listen_host") {
+        args.tcp_listen_host.clone()
+    } else {
+        file.tcp_listen_host
+            .clone()
+            .unwrap_or_else(|| args.tcp_listen_host.clone())
+    };
+    let tcp_listen_port = if cli_provided(matches, "tcp_listen_port") {
+        args.tcp_listen_port
+    } else {
+        file.tcp_listen_port.unwrap_or(args.tcp_listen_port)
+    };
+    let keep_alive_interval = if cli_provided(matches, "keep_alive_interval") {
+        args.keep_alive_interval
+    } else {
+        file.keep_alive_interval.unwrap_or(args.keep_alive_interval)
+    };
+    let gso = if cli_provided(matches, "gso") {
+        args.gso
+    } else {
+        file.gso.unwrap_or(args.gso)
+    };
+    let qname_mtu = if cli_provided(matches, "qname_mtu") {
+        args.qname_mtu
+    } else {
+        file.qname_mtu.unwrap_or(args.qname_mtu)
+    };
+    let pacing_gain_probe = if cli_provided(matches, "pacing_gain_probe") {
+        args.pacing_gain_probe
+    } else {
+        file.pacing_gain_probe.unwrap_or(args.pacing_gain_probe)
+    };
+    let dns_tcp_packet_loop_burst = if cli_provided(matches, "dns_tcp_packet_loop_burst") {
+        args.dns_tcp_packet_loop_burst
+    } else {
+        file.dns_tcp_packet_loop_burst
+            .unwrap_or(args.dns_tcp_packet_loop_burst)
+    };
+    let dns_query_type = if cli_provided(matches, "dns_query_type") {
+        args.dns_query_type
+    } else {
+        file.dns_query_type.unwrap_or(args.dns_query_type)
+    };
+    let dns_label_length = if cli_provided(matches, "dns_label_length") {
+        args.dns_label_length
+    } else {
+        file.dns_label_length.unwrap_or(args.dns_label_length)
+    };
+    let max_poll_qps = if cli_provided(matches, "max_poll_qps") {
+        args.max_poll_qps
+    } else {
+        file.max_poll_qps.unwrap_or(args.max_poll_qps)
+    };
+    let debug_poll = if cli_provided(matches, "debug_poll") {
+        args.debug_poll
+    } else {
+        file.debug_poll.unwrap_or(args.debug_poll)
+    };
+    let debug_streams = if cli_provided(matches, "debug_streams") {
+        args.debug_streams
+    } else {
+        file.debug_streams.unwrap_or(args.debug_streams)
+    };
+
+    let resolver_transport = if cli_provided(matches, "resolver_transport") {
+        ResolverTransport::from(args.resolver_transport)
+    } else if let Some(value) = file.resolver_transport.as_deref() {
+        unwrap_or_exit(parse_transport_str(value), "Invalid config", 2)
+    } else {
+        ResolverTransport::from(args.resolver_transport)
+    };
+    let upstream_encoding = if cli_provided(matches, "upstream_encoding") {
+        UpstreamEncoding::from(args.upstream_encoding)
+    } else if let Some(value) = file.upstream_encoding.as_deref() {
+        unwrap_or_exit(parse_encoding_str(value), "Invalid config", 2)
+    } else {
+        UpstreamEncoding::from(args.upstream_encoding)
+    };
+
+    let domain = if let Some(domain) = args.domain.clone() {
+        domain
+    } else if let Some(domain) = file.domain.as_deref() {
+        unwrap_or_exit(
+            normalize_domain(domain).map_err(|err| err.to_string()),
+            "Invalid config domain",
+            2,
+        )
+    } else {
+        exit_with_message("A domain is required (config `domain` or --domain)", 2);
+    };
+
+    let congestion_control = if cli_provided(matches, "congestion_control") {
+        args.congestion_control.clone()
+    } else {
+        file.congestion_control.clone()
+    };
+    if let Some(value) = congestion_control.as_deref() {
+        if value != "bbr" && value != "dcubic" {
+            exit_with_message(&format!("Invalid congestion_control value: {}", value), 2);
+        }
+    }
+    let cert = if cli_provided(matches, "cert") {
+        args.cert.clone()
+    } else {
+        file.cert.clone()
+    };
+    if cert.is_none() {
+        tracing::warn!(
+            "Server certificate pinning is disabled; this allows MITM. Set `cert` (or --cert) to pin the server leaf, or dismiss this if your underlying tunnel provides authentication."
+        );
+    }
+
+    let mut resolvers = if has_cli_resolvers(matches) {
+        unwrap_or_exit(build_resolvers(matches, true), "Resolver error", 2)
+    } else {
+        let specs = unwrap_or_exit(
+            file_resolvers(&file.resolvers),
+            "Invalid config resolver",
+            2,
+        );
+        if specs.is_empty() {
+            exit_with_message(
+                "At least one resolver is required (config `resolvers` or --resolver)",
+                2,
+            );
+        }
+        specs
+    };
+    apply_resolver_transport(&mut resolvers, resolver_transport);
+
+    let config = ClientConfig {
+        tcp_listen_host: &tcp_listen_host,
+        tcp_listen_port,
+        resolvers: &resolvers,
+        congestion_control: congestion_control.as_deref(),
+        gso,
+        domain: &domain,
+        cert: cert.as_deref(),
+        keep_alive_interval: keep_alive_interval as usize,
+        resolver_transport,
+        upstream_encoding,
+        qname_mtu,
+        pacing_gain_probe,
+        dns_tcp_packet_loop_burst,
+        dns_query_type,
+        dns_label_length,
+        max_poll_qps,
+        debug_poll,
+        debug_streams,
+    };
+
+    let runtime = Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .expect("Failed to build Tokio runtime");
+    match runtime.block_on(run_client_with_control(&config, None, None)) {
+        Ok(code) => std::process::exit(code),
+        Err(err) => exit_with_error("Client error", err, 1),
+    }
+}
+
+fn file_resolvers(entries: &[ResolverEntry]) -> Result<Vec<ResolverSpec>, String> {
+    entries
+        .iter()
+        .map(|entry| {
+            let resolver = parse_host_port(&entry.addr, 53, AddressKind::Resolver)
+                .map_err(|err| err.to_string())?;
+            let mode = if entry.authoritative {
+                ResolverMode::Authoritative
+            } else {
+                ResolverMode::Recursive
+            };
+            Ok(ResolverSpec { resolver, mode })
+        })
+        .collect()
+}
+
+fn parse_transport_str(value: &str) -> Result<ResolverTransport, String> {
+    match value {
+        "udp" => Ok(ResolverTransport::Udp),
+        "tcp" => Ok(ResolverTransport::Tcp),
+        _ => Err(format!("Invalid resolver_transport value: {}", value)),
+    }
+}
+
+fn parse_encoding_str(value: &str) -> Result<UpstreamEncoding, String> {
+    match value {
+        "qname" => Ok(UpstreamEncoding::Qname),
+        "edns-raw" | "ednsraw" => Ok(UpstreamEncoding::EdnsRaw),
+        _ => Err(format!("Invalid upstream_encoding value: {}", value)),
     }
 }
 

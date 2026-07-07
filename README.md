@@ -134,6 +134,21 @@ cargo run -p slipstream-client -- \
 
 TCP resolver transport intentionally uses only the first resolver path.
 
+### JSON config file
+
+Instead of passing every setting as a flag, the client can load a JSON config
+file. Fields are flat and map 1:1 onto the CLI (there is no xray-style
+inbound/outbound/routing model — the client is a single fixed tunnel). Omitted
+fields use the built-in defaults, and any CLI flag you also pass overrides the
+corresponding file value (precedence: defaults < file < CLI):
+
+```
+cargo run -p slipstream-client -- --config client.json
+```
+
+See [docs/client.example.json](docs/client.example.json) for a full example.
+`--config` is standalone from the SIP003 environment path.
+
 Note: You can also run the client against a resolver that forwards to the server. For local testing, see the interop docs.
 
 ## Production note: conntrack for UDP/53
