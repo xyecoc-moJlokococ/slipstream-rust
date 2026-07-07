@@ -49,6 +49,7 @@ pub(crate) fn spawn_direct_socks_target(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_direct_socks(
     key: StreamKey,
     proxy_addr: Option<SocketAddr>,
@@ -134,6 +135,7 @@ async fn run_direct_socks(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connect(
     key: StreamKey,
     addr: SocketAddr,
@@ -189,6 +191,7 @@ async fn handle_connect(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_fwd_udp(
     key: StreamKey,
     proxy_addr: Option<SocketAddr>,
@@ -793,4 +796,3 @@ mod tests {
         ));
     }
 }
-

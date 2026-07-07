@@ -11,6 +11,9 @@ use tokio::time::{sleep, timeout, Duration};
 
 #[test]
 fn add_to_stream_fin_failure_removes_stream() {
+    let _lock = test_hooks::ADD_TO_STREAM_FAILS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _guard = ResetOnDrop::new(|| test_hooks::set_add_to_stream_failures(0));
     let (command_tx, _command_rx) = mpsc::unbounded_channel();
     let data_notify = Arc::new(Notify::new());
@@ -177,7 +180,11 @@ fn local_fin_does_not_remove_until_recv_fin() {
 }
 
 #[test]
-fn local_tcp_close_removes_stream_immediately() {
+fn local_tcp_close_removes_stream_when_add_to_stream_fails() {
+    let _lock = test_hooks::ADD_TO_STREAM_FAILS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = ResetOnDrop::new(|| test_hooks::set_add_to_stream_failures(0));
     let (command_tx, _command_rx) = mpsc::unbounded_channel();
     let data_notify = Arc::new(Notify::new());
     let acceptor = acceptor::ClientAcceptor::new();
@@ -199,6 +206,8 @@ fn local_tcp_close_removes_stream_immediately() {
         },
     );
 
+    test_hooks::set_add_to_stream_failures(1);
+
     handle_command(
         std::ptr::null_mut(),
         &mut state as *mut _,
@@ -210,7 +219,7 @@ fn local_tcp_close_removes_stream_immediately() {
 
     assert!(
         !state.streams.contains_key(&stream_id),
-        "local TCP close should remove the stream without waiting for remote FIN"
+        "stream state should be removed when add_to_stream(fin) fails"
     );
 }
 

@@ -396,7 +396,7 @@ fn decode_svcb_ech_payload(rdata: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let mut cursor = 2usize; // skip SvcPriority
-    // Skip TargetName (uncompressed length-prefixed labels ending in a 0 byte).
+                             // Skip TargetName (uncompressed length-prefixed labels ending in a 0 byte).
     loop {
         let label_len = *rdata.get(cursor)? as usize;
         cursor += 1;
@@ -418,7 +418,11 @@ fn decode_svcb_ech_payload(rdata: &[u8]) -> Option<Vec<u8>> {
         cursor += 4;
         let value = rdata.get(cursor..cursor + len)?;
         if key == SVCPARAM_ECH {
-            return if value.is_empty() { None } else { Some(value.to_vec()) };
+            return if value.is_empty() {
+                None
+            } else {
+                Some(value.to_vec())
+            };
         }
         cursor += len;
     }

@@ -133,7 +133,7 @@ impl ClientState {
         (self.debug_enqueued_bytes, self.debug_last_enqueue_at)
     }
 
-    pub(crate) fn remove_stream(&mut self, stream_id: u64) -> Option<ClientStream> {
+    pub(super) fn remove_stream(&mut self, stream_id: u64) -> Option<ClientStream> {
         let removed = self.streams.remove(&stream_id);
         if removed.is_some() && self.streams.is_empty() && self.multi_stream_mode {
             self.multi_stream_mode = false;

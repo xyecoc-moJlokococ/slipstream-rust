@@ -564,15 +564,10 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
 }
 
 async fn bind_tcp_listener(host: &str, port: u16) -> Result<TokioTcpListener, ServerError> {
-    bind_first_resolved_with_ipv4_fallback(
-        host,
-        port,
-        |addr| bind_tcp_listener_addr(addr),
-        "TCP listener",
-    )
-    .await
-    .map(|(listener, _)| listener)
-    .map_err(map_io)
+    bind_first_resolved_with_ipv4_fallback(host, port, bind_tcp_listener_addr, "TCP listener")
+        .await
+        .map(|(listener, _)| listener)
+        .map_err(map_io)
 }
 
 async fn bind_udp_socket(host: &str, port: u16) -> Result<TokioUdpSocket, ServerError> {

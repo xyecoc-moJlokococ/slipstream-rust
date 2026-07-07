@@ -11,6 +11,55 @@ This repository hosts the Rust rewrite of the [original C implementation](https:
 - Fully async with tokio.
 - And more! For a more up-to-date list of extra features, see the [merged PRs](https://github.com/Mygod/slipstream-rust/pulls?q=is%3Apr+is%3Amerged+label%3Aenhancement).
 
+## Differences from upstream (Mygod/slipstream-rust)
+
+This is a personal fork tracking [Mygod/slipstream-rust](https://github.com/Mygod/slipstream-rust)
+(itself a rewrite of the [original C implementation](https://github.com/EndPositive/slipstream)).
+On top of upstream, this fork adds:
+
+- **DNS-over-TCP resolver transport.** The client can speak to the resolver over
+  TCP instead of UDP (`--resolver-transport tcp`), for networks where UDP/53 is
+  shaped, blocked, or otherwise unreliable. Includes upload/download pacing tuned
+  specifically for the TCP path and a dedicated stabilization pass after early
+  flapping was observed in the field.
+- **HTTPS/SVCB (type 65) DNS carrier**, alongside the original TXT carrier. The
+  tunnel payload rides in an opaque `ech` SvcParam per RFC 9460 — a less
+  suspicious-looking record type than TXT under DPI. The server still accepts
+  legacy TXT queries at the same time, so this is a migration-safe, opt-in
+  upgrade (`--dns-query-type` / `--accepted-query-type`), not a breaking change.
+- **Configurable anti-fingerprinting knobs**: DNS label length for the encoded
+  subdomain (`--dns-label-length`), answer TTL and TTL jitter
+  (`--response-ttl` / `--response-ttl-jitter`), and a poll-rate cap
+  (`--max-poll-qps`) to soften the query-rate signature at the cost of some
+  throughput. All default to the historical behavior — nothing changes unless
+  you opt in.
+- **Runtime transport/qtype auto-selection.** On connect (and on client network
+  changes), the client can probe available transports/query types and pick the
+  fastest one automatically instead of requiring a fixed config per network.
+- **Direct SOCKS target with UDP-in-TCP relay.** The server can terminate
+  directly into a SOCKS proxy and relay UDP payloads over the TCP-based SOCKS
+  channel, instead of only forwarding to a fixed TCP target.
+- **Android integration**: a JNI client bridge (`slipstream-client` exposes
+  `extern "system" fn Java_...` entry points) so the engine embeds directly
+  into an Android VPN app without a subprocess, plus Android-specific
+  hardening — best-effort `protect()`-based socket exemption from the VPN
+  tunnel, bounded/generation-guarded stop/restart so the native engine can't
+  wedge the Android service, and tuned carrier/pacing defaults for mobile
+  radios.
+- **Stability fixes from real-world (mobile carrier) deployment**: fixed
+  backpressure-driven lifecycle stalls, local TCP streams not closing on
+  client EOF, and a significant UDP-carrier regression fix chain — these came
+  out of a long back-and-forth stabilizing the tunnel against a specific
+  ISP/mobile carrier rather than from synthetic testing.
+- **Misc protocol/perf work**: adaptive QNAME MTU override, compact QNAME
+  upstream queries, raw EDNS upstream encoding, parallel probe clients, and
+  reduced idle client poll wakeups.
+
+In short: upstream is the general-purpose engine; this fork layers on a
+second (TCP) resolver transport, DPI-resistance knobs, an Android embedding
+path, and a round of stability hardening driven by testing against a real,
+imperfect mobile network rather than a lab loopback.
+
 ## Quick start (local dev)
 
 Prereqs:

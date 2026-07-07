@@ -15,7 +15,7 @@ use slipstream_ffi::{
 };
 use std::collections::HashMap;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -47,6 +47,13 @@ static READY: AtomicBool = AtomicBool::new(false);
 /// Set from Kotlin via nativeSetDnsQueryType before starting a client; applies to the main + probe
 /// clients. Used as an anti-fingerprinting knob (e.g. 65 = HTTPS/SVCB).
 static DNS_QUERY_TYPE: AtomicU16 = AtomicU16::new(16);
+/// DNS label length (chars) for the encoded subdomain. Default = slipstream_dns::DEFAULT_LABEL_LEN
+/// (57). Client-only fingerprint knob: the server strips dots before decoding, so this never needs
+/// to match a server setting. Set from Kotlin via nativeSetDnsLabelLength.
+static DNS_LABEL_LENGTH: AtomicU32 = AtomicU32::new(57);
+/// Optional cap on DNS poll queries per second (0 = unlimited). Purely a client-side pacing choice
+/// with no server-side counterpart. Set from Kotlin via nativeSetMaxPollQps.
+static MAX_POLL_QPS: AtomicU32 = AtomicU32::new(0);
 static LAST_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 const STOP_JOIN_TIMEOUT: Duration = Duration::from_secs(6);
 const STOP_JOIN_POLL: Duration = Duration::from_millis(25);
@@ -121,6 +128,32 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeSetDnsQuer
         16
     };
     DNS_QUERY_TYPE.store(value, Ordering::Relaxed);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeSetDnsLabelLength(
+    _env: JNIEnv<'_>,
+    _this: JObject<'_>,
+    label_len: jint,
+) {
+    // Clamp to the valid DNS label range (1..=63); 0/out-of-range falls back to the default (57).
+    let value = if (1..=63).contains(&label_len) {
+        label_len as u32
+    } else {
+        57
+    };
+    DNS_LABEL_LENGTH.store(value, Ordering::Relaxed);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeSetMaxPollQps(
+    _env: JNIEnv<'_>,
+    _this: JObject<'_>,
+    qps: jint,
+) {
+    // 0 (or negative) means unlimited.
+    let value = if qps > 0 { qps as u32 } else { 0 };
+    MAX_POLL_QPS.store(value, Ordering::Relaxed);
 }
 
 #[no_mangle]
@@ -267,12 +300,11 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeStartSlips
                 qname_mtu: qname_mtu.max(0) as u32,
                 pacing_gain_probe,
                 dns_tcp_packet_loop_burst,
-                // Anti-fingerprinting knobs: defaults preserve historical behavior. Not yet exposed
-                // over JNI (the Android app keeps defaults); wire them into the native call
-                // signature + Kotlin when adding UI/config for them.
+                // Anti-fingerprinting / pacing knobs: set from Kotlin via the nativeSet* setters
+                // (called right before each native start); defaults preserve historical behavior.
                 dns_query_type: DNS_QUERY_TYPE.load(Ordering::Relaxed),
-                dns_label_length: slipstream_dns::DEFAULT_LABEL_LEN,
-                max_poll_qps: 0,
+                dns_label_length: DNS_LABEL_LENGTH.load(Ordering::Relaxed) as usize,
+                max_poll_qps: MAX_POLL_QPS.load(Ordering::Relaxed),
                 debug_poll,
                 debug_streams,
             };
@@ -451,12 +483,11 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeStartProbe
                 qname_mtu: qname_mtu.max(0) as u32,
                 pacing_gain_probe,
                 dns_tcp_packet_loop_burst,
-                // Anti-fingerprinting knobs: defaults preserve historical behavior. Not yet exposed
-                // over JNI (the Android app keeps defaults); wire them into the native call
-                // signature + Kotlin when adding UI/config for them.
+                // Anti-fingerprinting / pacing knobs: set from Kotlin via the nativeSet* setters
+                // (called right before each native start); defaults preserve historical behavior.
                 dns_query_type: DNS_QUERY_TYPE.load(Ordering::Relaxed),
-                dns_label_length: slipstream_dns::DEFAULT_LABEL_LEN,
-                max_poll_qps: 0,
+                dns_label_length: DNS_LABEL_LENGTH.load(Ordering::Relaxed) as usize,
+                max_poll_qps: MAX_POLL_QPS.load(Ordering::Relaxed),
                 debug_poll,
                 debug_streams,
             };
@@ -492,12 +523,15 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeStartProbe
     });
 
     if let Ok(mut clients) = probe_clients_slot().lock() {
-        clients.insert(listen_port_u16, ProbeClientHandle {
-            stop_tx,
-            thread,
-            running: running_flag,
-            ready: ready_flag,
-        });
+        clients.insert(
+            listen_port_u16,
+            ProbeClientHandle {
+                stop_tx,
+                thread,
+                running: running_flag,
+                ready: ready_flag,
+            },
+        );
         0
     } else {
         set_last_error("failed to lock Slipstream probe client state");
@@ -622,7 +656,7 @@ fn stop_running_client() -> Result<(), String> {
             set_last_error("Slipstream client stop timed out; detached native thread");
         }
     }
-    if generation.map_or(true, is_current_generation) {
+    if generation.is_none_or(is_current_generation) {
         RUNNING.store(false, Ordering::SeqCst);
         READY.store(false, Ordering::SeqCst);
     }
