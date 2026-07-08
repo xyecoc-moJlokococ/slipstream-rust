@@ -146,6 +146,33 @@ pub fn bind_tcp_listener_addr(addr: SocketAddr) -> Result<TokioTcpListener, Erro
     TokioTcpListener::from_std(std_listener)
 }
 
+/// Default UDP socket buffer size (8 MiB). On a busy DNS-carrier server the single-threaded packet
+/// loop can't always drain the socket before a burst of queries overflows a small kernel-default
+/// receive buffer — those drops become QUIC packet loss → retransmits → *more* datagrams → more CPU.
+/// Setting a large SO_RCVBUF/SO_SNDBUF directly on the socket makes this robust regardless of the
+/// system `rmem_default`/`wmem_default` (which a co-located manager's sysctl redeploy can reset).
+/// Override with SLIPSTREAM_UDP_SOCKET_BUFFER_BYTES. The kernel silently caps the effective value at
+/// net.core.rmem_max/wmem_max, so this is a request, not a guarantee.
+const DEFAULT_UDP_SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+
+fn udp_socket_buffer_bytes() -> usize {
+    std::env::var("SLIPSTREAM_UDP_SOCKET_BUFFER_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&v| v >= 65536)
+        .unwrap_or(DEFAULT_UDP_SOCKET_BUFFER_BYTES)
+}
+
+fn tune_udp_socket_buffers(socket: &Socket, addr: SocketAddr) {
+    let bytes = udp_socket_buffer_bytes();
+    if let Err(err) = socket.set_recv_buffer_size(bytes) {
+        tracing::warn!("Failed to set UDP SO_RCVBUF={} on {}: {}", bytes, addr, err);
+    }
+    if let Err(err) = socket.set_send_buffer_size(bytes) {
+        tracing::warn!("Failed to set UDP SO_SNDBUF={} on {}: {}", bytes, addr, err);
+    }
+}
+
 pub fn bind_udp_socket_addr(
     addr: SocketAddr,
     dual_stack_label: &str,
@@ -161,6 +188,7 @@ pub fn bind_udp_socket_addr(
             );
         }
     }
+    tune_udp_socket_buffers(&socket, addr);
     let sock_addr = SockAddr::from(addr);
     socket.bind(&sock_addr)?;
     socket.set_nonblocking(true)?;
