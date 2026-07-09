@@ -1,6 +1,7 @@
 use crate::config::{ensure_cert_key, load_or_create_reset_seed, ResetSeed};
 #[cfg(target_os = "linux")]
 use crate::mmsg::{recv_ready, send_batch, RecvMmsgBatch};
+use crate::poll_rate_limit::PollRateLimiter;
 use crate::udp_fallback::{handle_packet, FallbackManager, PacketContext, MAX_UDP_PACKET_SIZE};
 use slipstream_core::{
     net::{
@@ -109,6 +110,8 @@ pub struct ServerConfig {
     /// DNS query type the server accepts in tunnel queries (default 16 = TXT). Must match the
     /// client's `dns_query_type`. Non-TXT also needs per-type answer RDATA encoding (not implemented).
     pub accepted_query_type: u16,
+    /// Cap on fresh QUIC packets/sec prepared per connection (0 = unlimited); see poll_rate_limit.rs.
+    pub max_poll_qps_per_connection: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -339,6 +342,8 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
     let mut last_seen = HashMap::new();
     let mut last_idle_gc = Instant::now();
     let mut last_flow_block_log_at: u64 = 0;
+    let mut poll_rate_limiter = PollRateLimiter::new(config.max_poll_qps_per_connection);
+    let mut last_poll_rate_limiter_gc = Instant::now();
 
     loop {
         drain_commands(state_ptr, &mut command_rx);
@@ -507,6 +512,13 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
                 now,
             );
         }
+        // Independent of idle_timeout: prune the poll-rate-limiter's per-connection buckets
+        // so it doesn't grow forever as connections churn.
+        if poll_rate_limiter.enabled() && now.duration_since(last_poll_rate_limiter_gc) >= IDLE_GC_INTERVAL
+        {
+            poll_rate_limiter.retain_active(&collect_active_connections(quic));
+            last_poll_rate_limiter_gc = now;
+        }
 
         drain_commands(state_ptr, &mut command_rx);
         maybe_report_command_stats(state_ptr);
@@ -525,7 +537,13 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
             let mut addr_from: slipstream_ffi::SockaddrStorage = unsafe { std::mem::zeroed() };
             let mut if_index: libc::c_int = 0;
 
-            if slot.payload_override.is_none() && slot.rcode.is_none() && !slot.cnx.is_null() {
+            let eligible_for_quic_packet =
+                slot.payload_override.is_none() && slot.rcode.is_none() && !slot.cnx.is_null();
+            // Checked (and only consumes a token) when otherwise eligible, so a rate-limited
+            // round below is never confused with the "genuinely nothing ready" backlog check.
+            let rate_limited = eligible_for_quic_packet
+                && !poll_rate_limiter.allow(slot.cnx as usize, loop_time);
+            if eligible_for_quic_packet && !rate_limited {
                 let ret = unsafe {
                     picoquic_prepare_packet_ex(
                         slot.cnx,
