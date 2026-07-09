@@ -1,4 +1,6 @@
 mod config;
+#[cfg(target_os = "linux")]
+mod mmsg;
 mod server;
 mod socks_target;
 mod streams;
