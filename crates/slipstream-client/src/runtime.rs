@@ -55,6 +55,13 @@ const SLIPSTREAM_ALPN: &str = "picoquic_sample";
 const SLIPSTREAM_SNI: &str = "test.example.com";
 const DNS_WAKE_DELAY_MAX_US: i64 = 10_000_000;
 const DNS_POLL_SLICE_US: u64 = 50_000;
+// Floor for the has_work poll slice. picoquic_get_next_wake_delay can return 0 while there is still
+// "work" (a pacing/poll deficit) that cannot actually make progress yet (cwnd/pacing exhausted, or
+// the carrier is saturated under a connection burst). Sleeping 1µs there turns the loop into a
+// ~1M-iterations/s busy-wait that pegs a core at 100% CPU for no benefit. During real transfers the
+// loop is woken by recv_from (DNS responses) and data_notify (new upload bytes), not this sleep, so a
+// small floor caps the idle-spin rate without throttling throughput.
+const DNS_ACTIVE_SLEEP_MIN_US: u64 = 250;
 const DNS_IDLE_SLEEP_MIN_US: u64 = 50_000;
 pub(crate) const DEFAULT_DNS_TCP_PACKET_LOOP_BURST: usize = 64;
 const DNS_TCP_PACKET_LOOP_BURST_MIN: usize = 1;
@@ -491,7 +498,7 @@ pub async fn run_client_with_control(
             }
             // Avoid a tight poll loop when idle, but keep the short slice during active transfers.
             let timeout_us = if has_work {
-                delay_us.clamp(1, DNS_POLL_SLICE_US)
+                delay_us.clamp(DNS_ACTIVE_SLEEP_MIN_US, DNS_POLL_SLICE_US)
             } else if ready {
                 delay_us.max(DNS_IDLE_SLEEP_MIN_US)
             } else {
