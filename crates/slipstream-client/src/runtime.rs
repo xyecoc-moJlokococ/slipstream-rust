@@ -739,7 +739,7 @@ pub async fn run_client_with_control(
             if streams_len > 0
                 && now.saturating_sub(last_flow_block_log_at) >= FLOW_BLOCKED_LOG_INTERVAL_US
             {
-                let backlog = unsafe { (*state_ptr).stream_backlog_summaries(8) };
+                let backlog = unsafe { (*state_ptr).stream_backlog_summaries(cnx, 8) };
                 let flow_debug = unsafe { flow_debug_snapshot(cnx) };
                 if flow_blocked {
                     error!(

@@ -1,7 +1,7 @@
 use super::acceptor;
 use super::io_tasks::StreamWrite;
 use slipstream_core::flow_control::{FlowControlState, HasFlowControlState};
-use slipstream_ffi::picoquic::picoquic_cnx_t;
+use slipstream_ffi::picoquic::{picoquic_cnx_t, slipstream_get_stream_send_debug};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::TcpStream as TokioTcpStream;
@@ -83,6 +83,15 @@ pub(crate) struct ClientBacklogSummary {
     pub(crate) has_data_rx: bool,
     pub(crate) data_rx_len: usize,
     pub(crate) tx_bytes: u64,
+    /// How much picoquic has actually put on the wire for this stream (vs `tx_bytes`, the
+    /// cumulative amount we've handed to picoquic_add_to_stream) -- the gap is data queued
+    /// inside picoquic itself, stuck behind this stream's own flow control. None if the
+    /// stream/connection lookup failed (e.g. connection already torn down).
+    pub(crate) send_sent_offset: Option<u64>,
+    /// This stream's own send-side flow control ceiling (picoquic's `maxdata_remote` for the
+    /// stream): once `send_sent_offset` reaches this, the stream can't send more until the
+    /// peer grants a higher window via MAX_STREAM_DATA.
+    pub(crate) send_maxdata_remote: Option<u64>,
 }
 
 impl ClientState {
@@ -183,7 +192,14 @@ impl ClientState {
         metrics
     }
 
-    pub(crate) fn stream_backlog_summaries(&self, limit: usize) -> Vec<ClientBacklogSummary> {
+    /// # Safety
+    /// `cnx` must be a valid picoquic connection (or null) matching the connection these
+    /// streams belong to.
+    pub(crate) unsafe fn stream_backlog_summaries(
+        &self,
+        cnx: *mut picoquic_cnx_t,
+        limit: usize,
+    ) -> Vec<ClientBacklogSummary> {
         let mut summaries = Vec::new();
         for (stream_id, stream) in self.streams.iter() {
             let queued_bytes = stream.flow.queued_bytes as u64;
@@ -197,12 +213,28 @@ impl ClientState {
                 .flow
                 .rx_bytes
                 .saturating_sub(stream.flow.consumed_offset);
+            let mut sent_offset = 0u64;
+            let mut maxdata_remote = 0u64;
+            let send_debug_ok = !cnx.is_null()
+                && slipstream_get_stream_send_debug(
+                    cnx,
+                    *stream_id,
+                    &mut sent_offset,
+                    std::ptr::null_mut(),
+                    &mut maxdata_remote,
+                ) == 0;
+            let send_backlog = if send_debug_ok {
+                stream.tx_bytes.saturating_sub(sent_offset)
+            } else {
+                0
+            };
             if queued_bytes > 0
                 || stream.recv_state != StreamRecvState::Open
                 || stream.send_state != StreamSendState::Open
                 || stream.flow.discarding
                 || unconsumed > 0
                 || data_rx_len > 0
+                || send_backlog > 0
             {
                 summaries.push(ClientBacklogSummary {
                     stream_id: *stream_id,
@@ -217,12 +249,21 @@ impl ClientState {
                     has_data_rx,
                     data_rx_len,
                     tx_bytes: stream.tx_bytes,
+                    send_sent_offset: send_debug_ok.then_some(sent_offset),
+                    send_maxdata_remote: send_debug_ok.then_some(maxdata_remote),
                 });
             }
         }
         summaries.sort_by(|left, right| {
-            let left_backlog = left.queued_bytes.saturating_add(left.data_rx_len as u64);
-            let right_backlog = right.queued_bytes.saturating_add(right.data_rx_len as u64);
+            let left_backlog = left.queued_bytes.saturating_add(left.data_rx_len as u64).max(
+                left.tx_bytes
+                    .saturating_sub(left.send_sent_offset.unwrap_or(left.tx_bytes)),
+            );
+            let right_backlog = right.queued_bytes.saturating_add(right.data_rx_len as u64).max(
+                right
+                    .tx_bytes
+                    .saturating_sub(right.send_sent_offset.unwrap_or(right.tx_bytes)),
+            );
             right_backlog.cmp(&left_backlog)
         });
         summaries.truncate(limit);

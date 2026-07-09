@@ -241,7 +241,7 @@ fn backlog_summaries_are_sorted_by_backlog() {
         );
     }
 
-    let summaries = state.stream_backlog_summaries(2);
+    let summaries = unsafe { state.stream_backlog_summaries(std::ptr::null_mut(), 2) };
     let stream_ids: Vec<u64> = summaries.iter().map(|summary| summary.stream_id).collect();
 
     assert_eq!(stream_ids, vec![8, 12]);

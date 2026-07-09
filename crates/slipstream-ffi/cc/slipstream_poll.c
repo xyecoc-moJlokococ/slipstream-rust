@@ -117,3 +117,40 @@ void slipstream_set_default_stream_data_control(picoquic_quic_t *quic, uint64_t 
     quic->default_tp.initial_max_stream_data_bidi_remote = max_stream_data;
     quic->default_tp.initial_max_stream_data_uni = max_stream_data;
 }
+
+/* Per-stream send-side flow control state, for diagnosing "this stream can't send more"
+ * independent of the RECEIVE-side backlog already tracked in Rust (FlowControlState /
+ * ClientBacklogSummary::queued_bytes, which is about data arrived over QUIC not yet flushed
+ * to the local socket -- the opposite direction from an upload stall). `sent_offset` is how
+ * much picoquic has actually put on the wire for this stream; comparing it against the
+ * Rust-tracked cumulative bytes handed to picoquic_add_to_stream reveals how much is stuck
+ * queued inside picoquic itself, waiting on flow control. `maxdata_local`/`maxdata_remote`
+ * are exposed too so callers can tell whether the local stream flow control (`stream_blocked`,
+ * i.e. sent_offset caught up to maxdata_remote here) is actually the reason, as opposed to
+ * some other stall (target-side consumption, etc). Returns -1 (out params untouched) if the
+ * connection or stream doesn't exist. */
+int slipstream_get_stream_send_debug(
+    picoquic_cnx_t *cnx,
+    uint64_t stream_id,
+    uint64_t *sent_offset,
+    uint64_t *maxdata_local,
+    uint64_t *maxdata_remote
+) {
+    if (cnx == NULL) {
+        return -1;
+    }
+    picoquic_stream_head_t *stream = picoquic_find_stream(cnx, stream_id);
+    if (stream == NULL) {
+        return -1;
+    }
+    if (sent_offset != NULL) {
+        *sent_offset = stream->sent_offset;
+    }
+    if (maxdata_local != NULL) {
+        *maxdata_local = stream->maxdata_local;
+    }
+    if (maxdata_remote != NULL) {
+        *maxdata_remote = stream->maxdata_remote;
+    }
+    return 0;
+}
