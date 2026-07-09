@@ -658,6 +658,11 @@ fn stop_running_client() -> Result<(), String> {
         if handle.thread.is_finished() {
             let _ = handle.thread.join();
         } else {
+            tracing::error!(
+                "Slipstream client stop timed out after {:?}; detaching native thread \
+                 (its socket/transport resources will leak until the process exits)",
+                STOP_JOIN_TIMEOUT
+            );
             set_last_error("Slipstream client stop timed out; detached native thread");
         }
     }
@@ -677,6 +682,11 @@ fn stop_probe_handle(handle: ProbeClientHandle, timeout: Duration) {
     if handle.thread.is_finished() {
         let _ = handle.thread.join();
     } else {
+        tracing::error!(
+            "Slipstream probe client stop timed out after {:?}; detaching native thread \
+             (its socket/transport resources will leak until the process exits)",
+            timeout
+        );
         set_last_error("Slipstream probe client stop timed out; detached native thread");
     }
     handle.running.store(false, Ordering::SeqCst);

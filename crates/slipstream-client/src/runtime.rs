@@ -84,6 +84,14 @@ const UPSTREAM_BACKPRESSURE_RECENT_US: u64 = 2_000_000;
 const STREAM_ACTIVE_POLL_GRACE_US: u64 = 2_000_000;
 // Only applies after streams go quiet. Active transfers still use the normal burst/pacing path.
 const IDLE_STREAM_POLL_INTERVAL_US: u64 = 2_000_000;
+// A stream can look "active" (has_recent_stream_activity/has_work) indefinitely while genuinely
+// stuck (e.g. an upload that can't drain because the peer isn't acking) -- has_work only checks for
+// a pacing/poll deficit, not whether anything is actually being delivered. Without this, the loop
+// stays pinned at DNS_ACTIVE_SLEEP_MIN_US forever, pegging a core at 100% CPU with zero throughput.
+// If neither new local bytes nor new DNS-carried bytes have moved for this long, treat the loop as
+// idle for sleep-timing purposes only; this does not touch pacing, reconnection, or the separate
+// (5s) no-progress connection-reset detector below.
+const CPU_THROTTLE_NO_PROGRESS_US: u64 = 750_000;
 
 #[derive(Debug, Default, Clone, Copy)]
 struct FlowDebugSnapshot {
@@ -370,6 +378,8 @@ pub async fn run_client_with_control(
         let mut last_idle_stream_poll_at = 0u64;
         let mut ready_reported = false;
         let mut fatal_no_progress: Option<String> = None;
+        let mut cpu_throttle_since = 0u64;
+        let mut cpu_throttle_active = false;
         // Rolling 1-second window for the optional DNS poll-rate cap (config.max_poll_qps).
         // Only used when max_poll_qps > 0; otherwise these stay untouched and impose no limit.
         let mut poll_window_start_us = 0u64;
@@ -497,7 +507,9 @@ pub async fn run_client_with_control(
                 }
             }
             // Avoid a tight poll loop when idle, but keep the short slice during active transfers.
-            let timeout_us = if has_work {
+            // cpu_throttle_active means has_work has been true with no real progress for
+            // CPU_THROTTLE_NO_PROGRESS_US straight; fall back to the idle floor until progress resumes.
+            let timeout_us = if has_work && !cpu_throttle_active {
                 delay_us.clamp(DNS_ACTIVE_SLEEP_MIN_US, DNS_POLL_SLICE_US)
             } else if ready {
                 delay_us.max(DNS_IDLE_SLEEP_MIN_US)
@@ -792,6 +804,39 @@ pub async fn run_client_with_control(
                 || metrics.streams_with_data_rx_queued > 0
                 || metrics.data_rx_queued_chunks_total > 0;
             let dns_send_progress = dns_send_bytes_total > last_no_progress_dns_send_bytes;
+            if local_pressure || dns_send_progress {
+                if cpu_throttle_active {
+                    info!(
+                        "cpu_throttle: released after {}ms streams={} enqueued_bytes={} dns_send_bytes_total={}",
+                        now.saturating_sub(cpu_throttle_since) / 1_000,
+                        streams_len,
+                        enqueued_bytes,
+                        dns_send_bytes_total
+                    );
+                }
+                cpu_throttle_since = 0;
+                cpu_throttle_active = false;
+            } else {
+                if cpu_throttle_since == 0 {
+                    cpu_throttle_since = now;
+                }
+                if !cpu_throttle_active && now.saturating_sub(cpu_throttle_since) >= CPU_THROTTLE_NO_PROGRESS_US
+                {
+                    cpu_throttle_active = true;
+                    warn!(
+                        "cpu_throttle: engaged after {}ms without send/receive progress; falling back \
+                         to idle poll rate streams={} enqueued_bytes={} dns_send_bytes_total={} \
+                         flow_blocked={} has_ready_stream={} zero_send_with_streams={}",
+                        CPU_THROTTLE_NO_PROGRESS_US / 1_000,
+                        streams_len,
+                        enqueued_bytes,
+                        dns_send_bytes_total,
+                        flow_blocked,
+                        has_ready_stream,
+                        zero_send_with_streams
+                    );
+                }
+            }
             let stalled_signal = flow_blocked || !has_ready_stream || zero_send_with_streams > 0;
             let downstream_stale = metrics.data_rx_queued_chunks_total == 0
                 && metrics.streams_with_data_rx_queued == 0
