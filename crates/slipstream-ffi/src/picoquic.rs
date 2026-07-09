@@ -326,6 +326,7 @@ extern "C" {
         unique_path_id: u64,
     ) -> c_int;
     pub fn slipstream_get_max_streams_bidir_remote(cnx: *mut picoquic_cnx_t) -> u64;
+    pub fn slipstream_set_default_stream_data_control(quic: *mut picoquic_quic_t, max_stream_data: u64);
     pub fn slipstream_get_flow_debug(
         cnx: *mut picoquic_cnx_t,
         maxdata_remote: *mut u64,

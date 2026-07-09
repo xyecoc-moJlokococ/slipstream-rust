@@ -96,3 +96,24 @@ uint64_t slipstream_get_max_streams_bidir_remote(picoquic_cnx_t *cnx) {
     /* STREAM_RANK_FROM_ID is 1-based and returns stream count, not a zero-based index. */
     return STREAM_RANK_FROM_ID(cnx->max_stream_id_bidir_remote);
 }
+
+/* picoquic's stock per-stream default (initial_max_stream_data_bidi_remote = 65635, ~64KB)
+ * governs how much a PEER-opened stream may send before it needs a MAX_STREAM_DATA update
+ * from us -- independent of the much larger connection-level window set via
+ * picoquic_set_max_data_control. On this DNS-poll carrier, a MAX_STREAM_DATA update can only
+ * go out in response to a client poll, so once several streams are opened at once (e.g. an
+ * app uploading a file over many parallel connections), each one stalls at ~64KB waiting for
+ * its own poll-driven window update, even though the connection has plenty of budget left.
+ * This raises the *default* for all three per-stream directions so newly created streams
+ * start with real headroom, without touching already-negotiated streams. Mirrors
+ * picoquic_set_max_data_control's pattern of writing default_tp directly rather than going
+ * through picoquic_set_default_tp (which memcpy's the whole picoquic_tp_t and would need this
+ * shim to replicate the entire struct's layout just to touch three fields). */
+void slipstream_set_default_stream_data_control(picoquic_quic_t *quic, uint64_t max_stream_data) {
+    if (quic == NULL) {
+        return;
+    }
+    quic->default_tp.initial_max_stream_data_bidi_local = max_stream_data;
+    quic->default_tp.initial_max_stream_data_bidi_remote = max_stream_data;
+    quic->default_tp.initial_max_stream_data_uni = max_stream_data;
+}
