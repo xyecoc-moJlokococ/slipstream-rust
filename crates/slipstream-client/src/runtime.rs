@@ -575,6 +575,18 @@ pub async fn run_client_with_control(
                                 },
                             )?;
                             for _ in 1..packet_loop_recv_max {
+                                // Same hazard as the send burst below: draining a backlog of
+                                // already-buffered responses (e.g. a bloated per-stream reassembly
+                                // queue when local egress has stalled) can make handle_dns_response
+                                // expensive enough that this loop runs for seconds without yielding.
+                                // That delays the shutdown-aware select! past the JNI stop-join
+                                // deadline, so the thread gets detached while still holding the
+                                // local listen socket -- and, since detaching leaves this loop
+                                // running forever with no one left to signal it, the orphaned
+                                // thread pegs a CPU core indefinitely. Bail promptly instead.
+                                if shutdown_requested(&mut shutdown_rx) {
+                                    return Ok(0);
+                                }
                                 match dns_transport.try_recv_from(&mut recv_buf) {
                                     Ok(Some((size, peer))) => {
                                         local_addr_storage =
