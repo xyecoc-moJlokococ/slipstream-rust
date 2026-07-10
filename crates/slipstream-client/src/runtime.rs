@@ -92,6 +92,21 @@ const IDLE_STREAM_POLL_INTERVAL_US: u64 = 2_000_000;
 // idle for sleep-timing purposes only; this does not touch pacing, reconnection, or the separate
 // (5s) no-progress connection-reset detector below.
 const CPU_THROTTLE_NO_PROGRESS_US: u64 = 750_000;
+// Demand-driven poll throttle. In authoritative mode the CC is disabled (cwin = pacing_rate =
+// UINT64_MAX, see slipstream_server_cc.c), so target_inflight is pinned at its clamp maximum (384)
+// and the actual poll rate is target_inflight / RTT. On a low-RTT carrier that becomes thousands of
+// DNS queries/sec that keep flowing even when NO real data is moving (no upload bytes queued, no
+// download bytes delivered) — Telegram-style workloads keep many streams "recently active" so the
+// normal has_recent_stream_activity gate never closes. That empty-poll flood pegs the phone's CPU
+// (and hammers the single-core server), which is what shows up as "app eats 100% and never comes
+// down" after a stall. The loop-sleep CPU throttle above does NOT fix it because the poll rate is
+// governed by target_inflight, not by iteration cadence. So: when neither upload nor download has
+// made progress for UNPRODUCTIVE_POLL_BACKOFF_US, cap target_inflight to UNPRODUCTIVE_MAX_INFLIGHT.
+// This collapses the flood to a small keepalive rate while idle; the instant real data flows again
+// (enqueue grows, or download is consumed/queued) the cap lifts and full throughput resumes, so it
+// does not cap productive transfers — only the wasteful empty polling in between.
+const UNPRODUCTIVE_POLL_BACKOFF_US: u64 = 1_000_000;
+const UNPRODUCTIVE_MAX_INFLIGHT: usize = 8;
 
 #[derive(Debug, Default, Clone, Copy)]
 struct FlowDebugSnapshot {
@@ -380,6 +395,12 @@ pub async fn run_client_with_control(
         let mut fatal_no_progress: Option<String> = None;
         let mut cpu_throttle_since = 0u64;
         let mut cpu_throttle_active = false;
+        // Demand-driven poll throttle state (see UNPRODUCTIVE_POLL_BACKOFF_US). Tracks the last time
+        // real data moved in either direction so idle empty-poll storms can be capped.
+        let mut last_useful_progress_at = 0u64;
+        let mut last_useful_enqueued_bytes = 0u64;
+        let mut last_useful_data_consumed = 0u64;
+        let mut poll_backoff_active = false;
         // Rolling 1-second window for the optional DNS poll-rate cap (config.max_poll_qps).
         // Only used when max_poll_qps > 0; otherwise these stay untouched and impose no limit.
         let mut poll_window_start_us = 0u64;
@@ -480,6 +501,14 @@ pub async fn run_client_with_control(
                                         mtu,
                                     )
                                 });
+                            // Mirror the demand-driven cap from the send path (using last
+                            // iteration's decision) so has_work goes false and the loop idle-sleeps
+                            // instead of spinning while the poll flood is capped.
+                            let target = if poll_backoff_active {
+                                target.min(UNPRODUCTIVE_MAX_INFLIGHT)
+                            } else {
+                                target
+                            };
                             let inflight_packets =
                                 inflight_packet_estimate(quality.bytes_in_transit, mtu);
                             let deficit = target.saturating_sub(
@@ -725,6 +754,34 @@ pub async fn run_client_with_control(
             let metrics = unsafe { (*state_ptr).stream_debug_metrics() };
             let (enqueued_bytes, last_enqueue_at) = unsafe { (*state_ptr).debug_snapshot() };
             let now = unsafe { picoquic_current_time() };
+            // Demand-driven poll throttle: has real data moved (upload enqueued to picoquic, or
+            // download consumed/queued back to the app) since we last checked? If so, the connection
+            // is productive — keep the poll cap lifted. If nothing has moved for
+            // UNPRODUCTIVE_POLL_BACKOFF_US, engage the cap to collapse the empty-poll flood.
+            let data_consumed = unsafe { flow_debug_snapshot(cnx) }.data_consumed;
+            let useful_progress = enqueued_bytes > last_useful_enqueued_bytes
+                || data_consumed > last_useful_data_consumed
+                || metrics.data_rx_queued_chunks_total > 0;
+            last_useful_enqueued_bytes = enqueued_bytes;
+            last_useful_data_consumed = data_consumed;
+            if useful_progress || last_useful_progress_at == 0 {
+                last_useful_progress_at = now;
+            }
+            let poll_backoff = streams_len > 0
+                && now.saturating_sub(last_useful_progress_at) >= UNPRODUCTIVE_POLL_BACKOFF_US;
+            if poll_backoff != poll_backoff_active {
+                poll_backoff_active = poll_backoff;
+                if poll_backoff {
+                    info!(
+                        "poll_backoff: engaged (no up/down data for {}ms) — capping target_inflight to {} streams={}",
+                        UNPRODUCTIVE_POLL_BACKOFF_US / 1_000,
+                        UNPRODUCTIVE_MAX_INFLIGHT,
+                        streams_len
+                    );
+                } else {
+                    info!("poll_backoff: released — real data flowing again streams={}", streams_len);
+                }
+            }
             let has_recent_stream_activity = streams_len > 0
                 && (last_enqueue_at == 0
                     || now.saturating_sub(last_enqueue_at) < STREAM_ACTIVE_POLL_GRACE_US);
@@ -938,6 +995,14 @@ pub async fn run_client_with_control(
                                         )
                                     }
                                 });
+                            // Demand-driven cap: while no real data is moving, hold in-flight polls
+                            // to a small keepalive count instead of the full ~384 the disabled-CC
+                            // pacing would otherwise target. Lifts the instant data flows again.
+                            let pacing_target = if poll_backoff {
+                                pacing_target.min(UNPRODUCTIVE_MAX_INFLIGHT)
+                            } else {
+                                pacing_target
+                            };
                             let inflight_packets =
                                 inflight_packet_estimate(quality.bytes_in_transit, mtu);
                             quality_for_log = Some(quality);
