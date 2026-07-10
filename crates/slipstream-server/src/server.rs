@@ -1,7 +1,4 @@
 use crate::config::{ensure_cert_key, load_or_create_reset_seed, ResetSeed};
-#[cfg(target_os = "linux")]
-use crate::mmsg::{recv_ready, send_batch, RecvMmsgBatch};
-use crate::poll_rate_limit::PollRateLimiter;
 use crate::udp_fallback::{handle_packet, FallbackManager, PacketContext, MAX_UDP_PACKET_SIZE};
 use slipstream_core::{
     net::{
@@ -11,13 +8,11 @@ use slipstream_core::{
     normalize_dual_stack_addr, resolve_host_port, HostPort,
 };
 use slipstream_dns::{encode_response_with_ttl, Question, Rcode, ResponseParams};
-#[cfg(not(target_os = "linux"))]
-use slipstream_ffi::picoquic::PICOQUIC_PACKET_LOOP_RECV_MAX;
 use slipstream_ffi::picoquic::{
     picoquic_cnx_t, picoquic_create, picoquic_current_time, picoquic_delete_cnx,
     picoquic_get_first_cnx, picoquic_get_next_cnx, picoquic_prepare_packet_ex, picoquic_quic_t,
     slipstream_has_ready_stream, slipstream_is_flow_blocked, slipstream_server_cc_algorithm,
-    PICOQUIC_MAX_PACKET_SIZE,
+    PICOQUIC_MAX_PACKET_SIZE, PICOQUIC_PACKET_LOOP_RECV_MAX,
 };
 use slipstream_ffi::{
     configure_quic_with_custom, socket_addr_to_storage, take_crypto_errors, QuicGuard,
@@ -48,11 +43,6 @@ const DNS_TCP_MAX_QUERY_SIZE: usize = 4096;
 const DNS_TCP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const IDLE_SLEEP_MS: u64 = 10;
 const IDLE_GC_INTERVAL: Duration = Duration::from_secs(1);
-// recvmmsg batch size (Linux only; see mmsg.rs) -- one syscall can pull up to this many
-// datagrams instead of one recv_from per datagram. Well above the old
-// PICOQUIC_PACKET_LOOP_RECV_MAX=10 per-select-iteration cap.
-#[cfg(target_os = "linux")]
-const RECVMMSG_BATCH: usize = 64;
 // Default QUIC MTU for server packets; see docs/config.md for details.
 const QUIC_MTU: u32 = 900;
 pub(crate) const STREAM_READ_CHUNK_BYTES: usize = 4096;
@@ -110,8 +100,6 @@ pub struct ServerConfig {
     /// DNS query type the server accepts in tunnel queries (default 16 = TXT). Must match the
     /// client's `dns_query_type`. Non-TXT also needs per-type answer RDATA encoding (not implemented).
     pub accepted_query_type: u16,
-    /// Cap on fresh QUIC packets/sec prepared per connection (0 = unlimited); see poll_rate_limit.rs.
-    pub max_poll_qps_per_connection: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -334,16 +322,11 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
     } else {
         DNS_MAX_QUERY_SIZE
     };
-    #[cfg(target_os = "linux")]
-    let mut recv_batch = RecvMmsgBatch::new(RECVMMSG_BATCH, recv_buf_len);
-    #[cfg(not(target_os = "linux"))]
     let mut recv_buf = vec![0u8; recv_buf_len];
     let mut send_buf = vec![0u8; PICOQUIC_MAX_PACKET_SIZE];
     let mut last_seen = HashMap::new();
     let mut last_idle_gc = Instant::now();
     let mut last_flow_block_log_at: u64 = 0;
-    let mut poll_rate_limiter = PollRateLimiter::new(config.max_poll_qps_per_connection);
-    let mut last_poll_rate_limiter_gc = Instant::now();
 
     loop {
         drain_commands(state_ptr, &mut command_rx);
@@ -360,64 +343,6 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
             manager.cleanup();
         }
 
-        #[cfg(target_os = "linux")]
-        tokio::select! {
-            command = command_rx.recv() => {
-                if let Some(command) = command {
-                    handle_command(state_ptr, command);
-                }
-            }
-            recv = recv_ready(&udp, &mut recv_batch) => {
-                match recv {
-                    Ok(n) => {
-                        let loop_time = unsafe { picoquic_current_time() };
-                        let context = PacketContext {
-                            domains: &domains,
-                            quic,
-                            current_time: loop_time,
-                            local_addr_storage: &local_addr_storage,
-                            accepted_query_type: config.accepted_query_type,
-                        };
-                        for i in 0..n {
-                            let (data, peer) = recv_batch.datagram(i);
-                            handle_packet(&mut slots, data, peer, &context, &mut fallback_mgr)
-                                .await?;
-                        }
-                    }
-                    Err(err) => {
-                        if !is_transient_udp_error(&err) {
-                            return Err(map_io(err));
-                        }
-                    }
-                }
-            }
-            tcp_request = tcp_dns_rx.recv() => {
-                if let Some(request) = tcp_request {
-                    let loop_time = unsafe { picoquic_current_time() };
-                    let context = PacketContext {
-                        domains: &domains,
-                        quic,
-                        current_time: loop_time,
-                        local_addr_storage: &local_addr_storage,
-                        accepted_query_type: config.accepted_query_type,
-                    };
-                    let slot_start = slots.len();
-                    handle_packet(
-                        &mut slots,
-                        &request.packet,
-                        request.peer,
-                        &context,
-                        &mut fallback_mgr,
-                    )
-                    .await?;
-                    if let Some(slot) = slots.get_mut(slot_start) {
-                        slot.tcp_response = Some(request.response_tx);
-                    }
-                }
-            }
-            _ = sleep(Duration::from_millis(IDLE_SLEEP_MS)) => {}
-        }
-        #[cfg(not(target_os = "linux"))]
         tokio::select! {
             command = command_rx.recv() => {
                 if let Some(command) = command {
@@ -512,13 +437,6 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
                 now,
             );
         }
-        // Independent of idle_timeout: prune the poll-rate-limiter's per-connection buckets
-        // so it doesn't grow forever as connections churn.
-        if poll_rate_limiter.enabled() && now.duration_since(last_poll_rate_limiter_gc) >= IDLE_GC_INTERVAL
-        {
-            poll_rate_limiter.retain_active(&collect_active_connections(quic));
-            last_poll_rate_limiter_gc = now;
-        }
 
         drain_commands(state_ptr, &mut command_rx);
         maybe_report_command_stats(state_ptr);
@@ -528,8 +446,6 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
         }
 
         let loop_time = unsafe { picoquic_current_time() };
-        #[cfg(target_os = "linux")]
-        let mut udp_responses: Vec<(Vec<u8>, SocketAddr)> = Vec::with_capacity(slots.len());
 
         for slot in slots.iter_mut() {
             let mut send_length = 0usize;
@@ -537,13 +453,7 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
             let mut addr_from: slipstream_ffi::SockaddrStorage = unsafe { std::mem::zeroed() };
             let mut if_index: libc::c_int = 0;
 
-            let eligible_for_quic_packet =
-                slot.payload_override.is_none() && slot.rcode.is_none() && !slot.cnx.is_null();
-            // Checked (and only consumes a token) when otherwise eligible, so a rate-limited
-            // round below is never confused with the "genuinely nothing ready" backlog check.
-            let rate_limited = eligible_for_quic_packet
-                && !poll_rate_limiter.allow(slot.cnx as usize, loop_time);
-            if eligible_for_quic_packet && !rate_limited {
+            if slot.payload_override.is_none() && slot.rcode.is_none() && !slot.cnx.is_null() {
                 let ret = unsafe {
                     picoquic_prepare_packet_ex(
                         slot.cnx,
@@ -641,23 +551,12 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
                 } else {
                     slot.peer
                 };
-                #[cfg(target_os = "linux")]
-                {
-                    udp_responses.push((response, peer));
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    if let Err(err) = udp.send_to(&response, peer).await {
-                        if !is_transient_udp_error(&err) {
-                            return Err(map_io(err));
-                        }
+                if let Err(err) = udp.send_to(&response, peer).await {
+                    if !is_transient_udp_error(&err) {
+                        return Err(map_io(err));
                     }
                 }
             }
-        }
-        #[cfg(target_os = "linux")]
-        {
-            send_batch(&udp, &mut udp_responses).await.map_err(map_io)?;
         }
     }
 

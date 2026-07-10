@@ -1,7 +1,4 @@
 mod config;
-#[cfg(target_os = "linux")]
-mod mmsg;
-mod poll_rate_limit;
 mod server;
 mod socks_target;
 mod streams;
@@ -65,16 +62,6 @@ struct Args {
     /// client's --dns-query-type; non-TXT also needs per-type answer encoding (not implemented).
     #[arg(long = "accepted-query-type", default_value_t = 16)]
     accepted_query_type: u16,
-    /// Cap on how many fresh QUIC packets/sec the server will prepare per connection in
-    /// response to polls (0 = unlimited). A poll over budget still gets answered (empty
-    /// NOERROR, so a relaying resolver doesn't see a failure and retry) -- it just carries
-    /// no new QUIC content that round. Bounds a fast, low-RTT carrier's own congestion
-    /// controller from ramping a single connection's poll rate arbitrarily high. Default
-    /// (4000/s) gives ~28.8Mbps of theoretical single-connection headroom at the 900B QUIC
-    /// MTU -- well above realistic per-connection throughput -- while cutting off the
-    /// unbounded ramp a fast, low-RTT carrier's own congestion control can otherwise reach.
-    #[arg(long = "max-poll-qps-per-connection", default_value_t = 4000)]
-    max_poll_qps_per_connection: u32,
 }
 
 fn main() {
@@ -193,7 +180,6 @@ fn main() {
         response_ttl: args.response_ttl,
         response_ttl_jitter: args.response_ttl_jitter,
         accepted_query_type: args.accepted_query_type,
-        max_poll_qps_per_connection: args.max_poll_qps_per_connection,
     };
 
     let runtime = Builder::new_current_thread()
