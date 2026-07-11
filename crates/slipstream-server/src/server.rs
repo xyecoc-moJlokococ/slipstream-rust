@@ -331,8 +331,20 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
     } else {
         DNS_MAX_QUERY_SIZE
     };
+    // A/B testing / ops escape hatch: override the recvmmsg batch size at runtime
+    // without a rebuild. Unset (default) keeps the normal RECVMMSG_BATCH=64 behavior.
+    // Set to 1 to fall back to effectively one recvmmsg syscall per datagram (like the
+    // pre-recvmmsg code path) if this ever needs to be disabled in the field.
     #[cfg(target_os = "linux")]
-    let mut recv_batch = RecvMmsgBatch::new(RECVMMSG_BATCH, recv_buf_len);
+    let recvmmsg_batch = std::env::var("SLIPSTREAM_RECVMMSG_BATCH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v >= 1)
+        .unwrap_or(RECVMMSG_BATCH);
+    #[cfg(target_os = "linux")]
+    tracing::info!("recvmmsg batch size = {}", recvmmsg_batch);
+    #[cfg(target_os = "linux")]
+    let mut recv_batch = RecvMmsgBatch::new(recvmmsg_batch, recv_buf_len);
     #[cfg(not(target_os = "linux"))]
     let mut recv_buf = vec![0u8; recv_buf_len];
     let mut send_buf = vec![0u8; PICOQUIC_MAX_PACKET_SIZE];
