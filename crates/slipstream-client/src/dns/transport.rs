@@ -15,6 +15,15 @@ use tracing::warn;
 const DNS_TCP_MAX_MESSAGE_SIZE: usize = u16::MAX as usize;
 const DNS_TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DNS_TCP_WRITE_TIMEOUT: Duration = Duration::from_secs(3);
+// Unlike write_packet/connect_tcp_resolver, read_tcp_dns_message previously had no timeout at
+// all: a resolver that silently stops answering (no error, no FIN/RST -- a true black hole)
+// leaves the reader task parked in read_exact forever, with reconnect_needed never getting set
+// since only read *errors* trigger it. The runtime's resolver_silent no-progress detector already
+// catches this at the application layer (it doesn't depend on the transport noticing anything),
+// but this timeout closes the gap at the transport layer too: it surfaces the stall as a proper
+// error/reconnect instead of silent-forever, and is set above NO_PROGRESS_TIMEOUT_US (5s) so it
+// acts as a backstop rather than racing the primary detector.
+const DNS_TCP_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 enum TcpReadEvent {
     Packet(Vec<u8>),
@@ -246,7 +255,18 @@ fn spawn_tcp_reader(mut reader: OwnedReadHalf) -> mpsc::UnboundedReceiver<TcpRea
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         loop {
-            match read_tcp_dns_message(&mut reader).await {
+            let read_result = match timeout(DNS_TCP_READ_TIMEOUT, read_tcp_dns_message(&mut reader)).await
+            {
+                Ok(result) => result,
+                Err(_) => Err(Error::new(
+                    ErrorKind::TimedOut,
+                    format!(
+                        "DNS-over-TCP resolver read timed out after {}ms with no message",
+                        DNS_TCP_READ_TIMEOUT.as_millis()
+                    ),
+                )),
+            };
+            match read_result {
                 Ok(packet) => {
                     if tx.send(TcpReadEvent::Packet(packet)).is_err() {
                         break;
