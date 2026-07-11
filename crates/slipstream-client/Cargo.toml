@@ -34,3 +34,4 @@ picoquic-minimal-build = ["slipstream-ffi/picoquic-minimal-build"]
 
 [dev-dependencies]
 slipstream-core = { path = "../slipstream-core", features = ["invariant-panic", "test-support"] }
+tokio = { version = "1.37", features = ["test-util"] }

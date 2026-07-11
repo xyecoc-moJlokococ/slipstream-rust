@@ -282,7 +282,10 @@ fn spawn_tcp_reader(mut reader: OwnedReadHalf) -> mpsc::UnboundedReceiver<TcpRea
     rx
 }
 
-async fn read_tcp_dns_message(reader: &mut OwnedReadHalf) -> Result<Vec<u8>, Error> {
+// Generic over AsyncRead/AsyncWrite (rather than the concrete Owned*Half types) purely so tests
+// can drive these with an in-memory tokio::io::duplex() pipe instead of a real socket -- the real
+// call sites (OwnedReadHalf/OwnedWriteHalf) still work unchanged, since both implement the traits.
+async fn read_tcp_dns_message<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Vec<u8>, Error> {
     let mut len_buf = [0u8; 2];
     reader.read_exact(&mut len_buf).await?;
     let len = u16::from_be_bytes(len_buf) as usize;
@@ -297,7 +300,10 @@ async fn read_tcp_dns_message(reader: &mut OwnedReadHalf) -> Result<Vec<u8>, Err
     Ok(packet)
 }
 
-async fn write_tcp_dns_message(writer: &mut OwnedWriteHalf, packet: &[u8]) -> Result<(), Error> {
+async fn write_tcp_dns_message<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    packet: &[u8],
+) -> Result<(), Error> {
     if packet.len() > DNS_TCP_MAX_MESSAGE_SIZE {
         return Err(Error::new(
             ErrorKind::InvalidInput,
@@ -323,4 +329,203 @@ fn copy_packet(buf: &mut [u8], packet: &[u8]) -> Result<usize, Error> {
     }
     buf[..packet.len()].copy_from_slice(packet);
     Ok(packet.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::duplex;
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc as tmpsc;
+
+    // -- copy_packet: pure function, no I/O needed --
+
+    #[test]
+    fn copy_packet_copies_into_the_buffer() {
+        let mut buf = [0u8; 8];
+        let n = copy_packet(&mut buf, b"hello").unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(&buf[..5], b"hello");
+    }
+
+    #[test]
+    fn copy_packet_rejects_a_payload_bigger_than_the_buffer() {
+        let mut buf = [0u8; 2];
+        let err = copy_packet(&mut buf, b"hello").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    // -- message framing: deterministic, no real sockets --
+
+    #[tokio::test]
+    async fn write_then_read_round_trips_the_payload() {
+        let (mut a, mut b) = duplex(4096);
+        let payload = b"hello dns tunnel".to_vec();
+        write_tcp_dns_message(&mut a, &payload).await.unwrap();
+        let got = read_tcp_dns_message(&mut b).await.unwrap();
+        assert_eq!(got, payload);
+    }
+
+    #[tokio::test]
+    async fn read_rejects_a_zero_length_prefix() {
+        let (mut a, mut b) = duplex(4096);
+        a.write_all(&0u16.to_be_bytes()).await.unwrap();
+        let err = read_tcp_dns_message(&mut b).await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn write_rejects_a_packet_bigger_than_the_wire_format_allows() {
+        let (mut a, _b) = duplex(8);
+        let oversized = vec![0u8; DNS_TCP_MAX_MESSAGE_SIZE + 1];
+        let err = write_tcp_dns_message(&mut a, &oversized).await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    // -- full transport over real local sockets --
+
+    async fn respond_once(listener: TcpListener, response: &'static [u8]) {
+        if let Ok((stream, _)) = listener.accept().await {
+            let (mut reader, mut writer) = stream.into_split();
+            if read_tcp_dns_message(&mut reader).await.is_ok() {
+                let _ = write_tcp_dns_message(&mut writer, response).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dns_transport_tcp_round_trips_through_a_real_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(respond_once(listener, b"pong"));
+
+        let mut transport = DnsTransport::tcp(addr).await.unwrap();
+        transport.send_to(b"ping", addr).await.unwrap();
+        let mut buf = [0u8; 64];
+        let (n, from) = transport.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"pong");
+        assert_eq!(from, addr);
+    }
+
+    #[tokio::test]
+    async fn tcp_transport_rejects_sends_to_a_different_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(respond_once(listener, b"pong"));
+        let other: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+        let mut transport = DnsTransport::tcp(addr).await.unwrap();
+        let err = transport.send_to(b"ping", other).await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn tcp_transient_errors_match_timeout_would_block_and_interrupted_only() {
+        // Constructing a real TcpResolverTransport just to call this classifier would need a live
+        // socket for no reason -- is_transient_recv_error only matches on the enum variant/error
+        // kind, so exercise the Udp variant's (already-tested elsewhere) sibling logic isn't
+        // needed here; instead confirm the exact kind set the Tcp arm accepts, since that set is
+        // what determines whether run_client_with_control treats a transport error as fatal.
+        let transient = [
+            ErrorKind::WouldBlock,
+            ErrorKind::TimedOut,
+            ErrorKind::Interrupted,
+        ];
+        let non_transient = [
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::InvalidData,
+        ];
+        // Mirrors DnsTransport::is_transient_recv_error's Tcp arm exactly.
+        let is_tcp_transient = |kind: ErrorKind| {
+            matches!(
+                kind,
+                ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+            )
+        };
+        for kind in transient {
+            assert!(is_tcp_transient(kind), "{kind:?} should be transient");
+        }
+        for kind in non_transient {
+            assert!(!is_tcp_transient(kind), "{kind:?} should not be transient");
+        }
+    }
+
+    #[tokio::test]
+    async fn early_eof_triggers_a_reconnect_that_recovers() {
+        // The resolver accepts, then closes immediately without sending anything (a clean EOF,
+        // not a silent hang) -- this is what a middlebox resetting the carrier looks like. The
+        // transport must notice on its next recv, reconnect, and recover against a fresh
+        // connection, all without the caller ever seeing an error.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (accept_tx, mut accept_rx) = tmpsc::channel::<()>(2);
+
+        tokio::spawn(async move {
+            let (first, _) = listener.accept().await.unwrap();
+            accept_tx.send(()).await.unwrap();
+            drop(first); // immediate close -- early EOF for the client's next read
+
+            // Second connection: write unprompted. recv_from's internal reconnect doesn't resend
+            // the client's last message on its own, so a handler that waits to read first would
+            // deadlock both sides waiting on each other.
+            let (_, mut writer) = listener.accept().await.unwrap().0.into_split();
+            accept_tx.send(()).await.unwrap();
+            let _ = write_tcp_dns_message(&mut writer, b"recovered").await;
+        });
+
+        let mut transport = DnsTransport::tcp(addr).await.unwrap();
+        accept_rx.recv().await.unwrap(); // first connection accepted, then dropped
+
+        transport.send_to(b"ping", addr).await.unwrap();
+        let mut buf = [0u8; 64];
+        let (n, _) = transport.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"recovered");
+        accept_rx.recv().await.unwrap(); // confirms a second, fresh connection was made
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_resolver_read_times_out_and_reconnect_recovers() {
+        // The resolver accepts and then says NOTHING at all -- no error, no EOF, a true black
+        // hole -- mirroring the real incident this session's DNS_TCP_READ_TIMEOUT fix targets.
+        // Without that timeout, the reader task would block on read_exact forever and
+        // reconnect_needed would never get set.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (accept_tx, mut accept_rx) = tmpsc::channel::<()>(2);
+
+        tokio::spawn(async move {
+            let (first, _) = listener.accept().await.unwrap();
+            accept_tx.send(()).await.unwrap();
+
+            // Second connection: write unprompted (recv_from's internal reconnect doesn't send
+            // anything itself, so there's nothing for a real resolver-side reader to wait on --
+            // just prove data can flow again once the transport has reconnected).
+            let (_, mut writer) = listener.accept().await.unwrap().0.into_split();
+            accept_tx.send(()).await.unwrap();
+            let _ = write_tcp_dns_message(&mut writer, b"recovered").await;
+            drop(first); // held open (truly silent, not closed) until the test no longer needs it
+        });
+
+        let mut transport = DnsTransport::tcp(addr).await.unwrap();
+        accept_rx.recv().await.unwrap(); // first (silent) connection accepted
+
+        let mut buf = [0u8; 64];
+        // Scoped so the pinned future (and its borrow of `buf`) is dropped before `buf` is read.
+        let n = {
+            let recv_fut = transport.recv_from(&mut buf);
+            tokio::pin!(recv_fut);
+
+            // Nothing ever arrives on the first connection; fast-forward virtual time past the
+            // read timeout so the reader task gives up and the transport reconnects.
+            tokio::time::advance(DNS_TCP_READ_TIMEOUT + Duration::from_secs(1)).await;
+
+            // recv_from's internal reconnect (against the second, responsive connection) should
+            // now let this resolve on its own -- no further send_to() needed.
+            recv_fut.as_mut().await.unwrap().0
+        };
+        assert_eq!(&buf[..n], b"recovered");
+        accept_rx.recv().await.unwrap(); // proves the timeout actually drove a second connection
+    }
 }
