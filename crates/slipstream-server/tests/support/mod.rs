@@ -30,6 +30,27 @@ impl ChildGuard {
             Err(_) => true,
         }
     }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+/// Pause the process without killing it (SIGSTOP) -- simulates a resolver that goes completely
+/// silent (no error, no FIN/RST, nothing) rather than one that crashes or refuses connections.
+/// Unix only: there is no equivalent safe, dependency-free primitive on Windows.
+#[cfg(unix)]
+pub fn suspend_process(child: &ChildGuard) {
+    unsafe {
+        let _ = libc::kill(child.pid() as i32, libc::SIGSTOP);
+    }
+}
+
+#[cfg(unix)]
+pub fn resume_process(child: &ChildGuard) {
+    unsafe {
+        let _ = libc::kill(child.pid() as i32, libc::SIGCONT);
+    }
 }
 
 pub fn terminate_process(child: &mut ChildGuard, timeout: Duration) {
