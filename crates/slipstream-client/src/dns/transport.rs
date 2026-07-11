@@ -255,17 +255,17 @@ fn spawn_tcp_reader(mut reader: OwnedReadHalf) -> mpsc::UnboundedReceiver<TcpRea
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         loop {
-            let read_result = match timeout(DNS_TCP_READ_TIMEOUT, read_tcp_dns_message(&mut reader)).await
-            {
-                Ok(result) => result,
-                Err(_) => Err(Error::new(
-                    ErrorKind::TimedOut,
-                    format!(
-                        "DNS-over-TCP resolver read timed out after {}ms with no message",
-                        DNS_TCP_READ_TIMEOUT.as_millis()
-                    ),
-                )),
-            };
+            let read_result =
+                match timeout(DNS_TCP_READ_TIMEOUT, read_tcp_dns_message(&mut reader)).await {
+                    Ok(result) => result,
+                    Err(_) => Err(Error::new(
+                        ErrorKind::TimedOut,
+                        format!(
+                            "DNS-over-TCP resolver read timed out after {}ms with no message",
+                            DNS_TCP_READ_TIMEOUT.as_millis()
+                        ),
+                    )),
+                };
             match read_result {
                 Ok(packet) => {
                     if tx.send(TcpReadEvent::Packet(packet)).is_err() {

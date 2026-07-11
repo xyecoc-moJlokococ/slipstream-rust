@@ -785,8 +785,10 @@ pub async fn run_client_with_control(
             // above). received_recently uses a time window rather than a per-cycle delta so a
             // healthy connection's normal poll cadence (a response most, not every, cycle) doesn't
             // make this flap.
-            let dns_responses_total: u64 =
-                resolvers.iter().map(|resolver| resolver.debug.dns_responses).sum();
+            let dns_responses_total: u64 = resolvers
+                .iter()
+                .map(|resolver| resolver.debug.dns_responses)
+                .sum();
             if dns_responses_total > last_dns_responses_seen || last_dns_response_at == 0 {
                 last_dns_response_at = now;
             }
@@ -814,7 +816,10 @@ pub async fn run_client_with_control(
                         streams_len
                     );
                 } else {
-                    info!("poll_backoff: released — real data flowing again streams={}", streams_len);
+                    info!(
+                        "poll_backoff: released — real data flowing again streams={}",
+                        streams_len
+                    );
                 }
             }
             let has_recent_stream_activity = streams_len > 0
@@ -912,7 +917,8 @@ pub async fn run_client_with_control(
                 if cpu_throttle_since == 0 {
                     cpu_throttle_since = now;
                 }
-                if !cpu_throttle_active && now.saturating_sub(cpu_throttle_since) >= CPU_THROTTLE_NO_PROGRESS_US
+                if !cpu_throttle_active
+                    && now.saturating_sub(cpu_throttle_since) >= CPU_THROTTLE_NO_PROGRESS_US
                 {
                     cpu_throttle_active = true;
                     warn!(

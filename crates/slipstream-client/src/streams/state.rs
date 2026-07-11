@@ -255,15 +255,21 @@ impl ClientState {
             }
         }
         summaries.sort_by(|left, right| {
-            let left_backlog = left.queued_bytes.saturating_add(left.data_rx_len as u64).max(
-                left.tx_bytes
-                    .saturating_sub(left.send_sent_offset.unwrap_or(left.tx_bytes)),
-            );
-            let right_backlog = right.queued_bytes.saturating_add(right.data_rx_len as u64).max(
-                right
-                    .tx_bytes
-                    .saturating_sub(right.send_sent_offset.unwrap_or(right.tx_bytes)),
-            );
+            let left_backlog = left
+                .queued_bytes
+                .saturating_add(left.data_rx_len as u64)
+                .max(
+                    left.tx_bytes
+                        .saturating_sub(left.send_sent_offset.unwrap_or(left.tx_bytes)),
+                );
+            let right_backlog = right
+                .queued_bytes
+                .saturating_add(right.data_rx_len as u64)
+                .max(
+                    right
+                        .tx_bytes
+                        .saturating_sub(right.send_sent_offset.unwrap_or(right.tx_bytes)),
+                );
             right_backlog.cmp(&left_backlog)
         });
         summaries.truncate(limit);
