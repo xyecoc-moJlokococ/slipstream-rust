@@ -401,6 +401,14 @@ pub async fn run_client_with_control(
         let mut last_useful_enqueued_bytes = 0u64;
         let mut last_useful_data_consumed = 0u64;
         let mut poll_backoff_active = false;
+        // Tracks whether the resolver itself is still saying anything back at all (any decodable
+        // DNS response, ack-only or not), independent of enqueued_bytes/data_consumed. Those two
+        // can keep climbing purely from the app opening new (doomed) connections while the carrier
+        // is fully black-holed, which fooled both the poll_backoff/cpu_throttle "progress" check and
+        // the no-progress connection-reset detector below into thinking the link was fine. See
+        // dns_responses_total below for the real fix.
+        let mut last_dns_responses_seen = 0u64;
+        let mut last_dns_response_at = 0u64;
         // Rolling 1-second window for the optional DNS poll-rate cap (config.max_poll_qps).
         // Only used when max_poll_qps > 0; otherwise these stay untouched and impose no limit.
         let mut poll_window_start_us = 0u64;
@@ -771,9 +779,24 @@ pub async fn run_client_with_control(
             // is productive — keep the poll cap lifted. If nothing has moved for
             // UNPRODUCTIVE_POLL_BACKOFF_US, engage the cap to collapse the empty-poll flood.
             let data_consumed = unsafe { flow_debug_snapshot(cnx) }.data_consumed;
-            let useful_progress = enqueued_bytes > last_useful_enqueued_bytes
-                || data_consumed > last_useful_data_consumed
-                || metrics.data_rx_queued_chunks_total > 0;
+            // Any decodable response from any resolver, regardless of whether it carries app
+            // payload -- this is the one signal that can't be manufactured by the app retrying
+            // doomed connections, unlike enqueued_bytes (see the comment on last_dns_response_at
+            // above). received_recently uses a time window rather than a per-cycle delta so a
+            // healthy connection's normal poll cadence (a response most, not every, cycle) doesn't
+            // make this flap.
+            let dns_responses_total: u64 =
+                resolvers.iter().map(|resolver| resolver.debug.dns_responses).sum();
+            if dns_responses_total > last_dns_responses_seen || last_dns_response_at == 0 {
+                last_dns_response_at = now;
+            }
+            last_dns_responses_seen = dns_responses_total;
+            let received_recently =
+                now.saturating_sub(last_dns_response_at) < UNPRODUCTIVE_POLL_BACKOFF_US;
+            let useful_progress = received_recently
+                && (enqueued_bytes > last_useful_enqueued_bytes
+                    || data_consumed > last_useful_data_consumed
+                    || metrics.data_rx_queued_chunks_total > 0);
             last_useful_enqueued_bytes = enqueued_bytes;
             last_useful_data_consumed = data_consumed;
             if useful_progress || last_useful_progress_at == 0 {
@@ -921,10 +944,25 @@ pub async fn run_client_with_control(
                 && no_recent_enqueue
                 && !has_ready_stream
                 && (!dns_send_progress || downstream_stale);
+            // Independent of the enqueue-based heuristics above (which the app can keep refreshing
+            // by retrying doomed connections): if we are actively transmitting but the resolver has
+            // not sent back a single decodable response, of any kind, for NO_PROGRESS_TIMEOUT_US,
+            // that alone is a definitive dead-carrier signal and doesn't need stalled_signal's
+            // corroboration.
+            let resolver_silent = connection_ready
+                && streams_len > 0
+                && dns_send_progress
+                && now.saturating_sub(last_dns_response_at) >= NO_PROGRESS_TIMEOUT_US;
             let stalled_no_progress = connection_ready
                 && streams_len > 0
-                && (large_no_progress || stale_stream)
-                && stalled_signal;
+                && ((large_no_progress || stale_stream) && stalled_signal || resolver_silent);
+            let no_progress_reason = if resolver_silent {
+                "resolver_silent"
+            } else if stale_stream {
+                "stale_stream"
+            } else {
+                "large_no_progress"
+            };
             if stalled_no_progress && (local_pressure || no_progress_since != 0) {
                 if no_progress_since == 0 {
                     no_progress_since = now;
@@ -934,7 +972,7 @@ pub async fn run_client_with_control(
                         last_no_progress_arm_log_at = now;
                         warn!(
                             "no-progress detector armed: reason={} streams={} enqueued_bytes={} dns_send_bytes_total={} last_enqueue_ms={} flow_blocked={} has_ready_stream={} data_rx_queued_chunks_total={} zero_send_with_streams={}",
-                            if stale_stream { "stale_stream" } else { "large_no_progress" },
+                            no_progress_reason,
                             streams_len,
                             enqueued_bytes,
                             dns_send_bytes_total,
@@ -949,7 +987,7 @@ pub async fn run_client_with_control(
                     error!(
                         "no-progress detected for {}ms reason={}: streams={} enqueued_bytes={} dns_send_bytes_total={} last_enqueue_ms={} flow_blocked={} has_ready_stream={} data_rx_queued_chunks_total={} zero_send_with_streams={}; resetting connection",
                         now.saturating_sub(no_progress_since) / 1_000,
-                        if stale_stream { "stale_stream" } else { "large_no_progress" },
+                        no_progress_reason,
                         streams_len,
                         enqueued_bytes,
                         dns_send_bytes_total,
@@ -961,7 +999,7 @@ pub async fn run_client_with_control(
                     );
                     fatal_no_progress = Some(format!(
                         "native no-progress reason={} streams={} enqueued_bytes={} last_enqueue_ms={} zero_send_with_streams={}",
-                        if stale_stream { "stale_stream" } else { "large_no_progress" },
+                        no_progress_reason,
                         streams_len,
                         enqueued_bytes,
                         last_enqueue_ms,
