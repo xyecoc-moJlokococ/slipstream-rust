@@ -1,11 +1,13 @@
 mod path;
 mod setup;
+mod stall;
 
 use self::path::{
     apply_path_mode, drain_path_events, fetch_path_quality, find_resolver_by_addr_mut,
     loop_burst_total, path_poll_burst_max,
 };
 use self::setup::{bind_tcp_listener, bind_udp_socket, compute_mtu, map_io};
+use self::stall::{StallDetector, StallInput, UNPRODUCTIVE_MAX_INFLIGHT};
 use crate::dns::{
     add_paths, expire_inflight_polls, handle_dns_response, maybe_report_debug,
     refresh_resolver_path, resolve_resolvers, resolver_mode_to_c, send_poll_queries,
@@ -73,40 +75,13 @@ const DNS_UDP_RECURSIVE_POLL_SEED: usize = 1;
 const RECONNECT_SLEEP_MIN_MS: u64 = 250;
 const RECONNECT_SLEEP_MAX_MS: u64 = 5_000;
 const FLOW_BLOCKED_LOG_INTERVAL_US: u64 = 1_000_000;
-const NO_PROGRESS_TIMEOUT_US: u64 = 5_000_000;
-const NO_PROGRESS_MIN_ENQUEUED_BYTES: u64 = 128 * 1024;
-const NO_PROGRESS_ARM_LOG_INTERVAL_US: u64 = 2_000_000;
-const DOWNSTREAM_STALE_ZERO_SEND_MIN: u64 = 10_000;
-const STALE_STREAM_MIN_ENQUEUED_BYTES: u64 = 1;
-const STALE_STREAM_MIN_IDLE_US: u64 = 4_000_000;
 const MAX_UPSTREAM_BUFFERED_BYTES: u64 = 16 * 1024 * 1024;
 const UPSTREAM_BACKPRESSURE_RECENT_US: u64 = 2_000_000;
 const STREAM_ACTIVE_POLL_GRACE_US: u64 = 2_000_000;
 // Only applies after streams go quiet. Active transfers still use the normal burst/pacing path.
 const IDLE_STREAM_POLL_INTERVAL_US: u64 = 2_000_000;
-// A stream can look "active" (has_recent_stream_activity/has_work) indefinitely while genuinely
-// stuck (e.g. an upload that can't drain because the peer isn't acking) -- has_work only checks for
-// a pacing/poll deficit, not whether anything is actually being delivered. Without this, the loop
-// stays pinned at DNS_ACTIVE_SLEEP_MIN_US forever, pegging a core at 100% CPU with zero throughput.
-// If neither new local bytes nor new DNS-carried bytes have moved for this long, treat the loop as
-// idle for sleep-timing purposes only; this does not touch pacing, reconnection, or the separate
-// (5s) no-progress connection-reset detector below.
-const CPU_THROTTLE_NO_PROGRESS_US: u64 = 750_000;
-// Demand-driven poll throttle. In authoritative mode the CC is disabled (cwin = pacing_rate =
-// UINT64_MAX, see slipstream_server_cc.c), so target_inflight is pinned at its clamp maximum (384)
-// and the actual poll rate is target_inflight / RTT. On a low-RTT carrier that becomes thousands of
-// DNS queries/sec that keep flowing even when NO real data is moving (no upload bytes queued, no
-// download bytes delivered) — Telegram-style workloads keep many streams "recently active" so the
-// normal has_recent_stream_activity gate never closes. That empty-poll flood pegs the phone's CPU
-// (and hammers the single-core server), which is what shows up as "app eats 100% and never comes
-// down" after a stall. The loop-sleep CPU throttle above does NOT fix it because the poll rate is
-// governed by target_inflight, not by iteration cadence. So: when neither upload nor download has
-// made progress for UNPRODUCTIVE_POLL_BACKOFF_US, cap target_inflight to UNPRODUCTIVE_MAX_INFLIGHT.
-// This collapses the flood to a small keepalive rate while idle; the instant real data flows again
-// (enqueue grows, or download is consumed/queued) the cap lifts and full throughput resumes, so it
-// does not cap productive transfers — only the wasteful empty polling in between.
-const UNPRODUCTIVE_POLL_BACKOFF_US: u64 = 1_000_000;
-const UNPRODUCTIVE_MAX_INFLIGHT: usize = 8;
+// The no-progress/poll-backoff/cpu-throttle detector thresholds and decision logic live in the
+// stall module (see runtime/stall.rs) so they can be unit tested without a live connection.
 
 #[derive(Debug, Default, Clone, Copy)]
 struct FlowDebugSnapshot {
@@ -386,29 +361,10 @@ pub async fn run_client_with_control(
         let mut zero_send_with_streams = 0u64;
         let mut last_flow_block_log_at = 0u64;
         let mut dns_send_bytes_total = 0u64;
-        let mut last_no_progress_enqueued_bytes = 0u64;
-        let mut last_no_progress_dns_send_bytes = 0u64;
-        let mut no_progress_since = 0u64;
-        let mut last_no_progress_arm_log_at = 0u64;
         let mut last_idle_stream_poll_at = 0u64;
         let mut ready_reported = false;
         let mut fatal_no_progress: Option<String> = None;
-        let mut cpu_throttle_since = 0u64;
-        let mut cpu_throttle_active = false;
-        // Demand-driven poll throttle state (see UNPRODUCTIVE_POLL_BACKOFF_US). Tracks the last time
-        // real data moved in either direction so idle empty-poll storms can be capped.
-        let mut last_useful_progress_at = 0u64;
-        let mut last_useful_enqueued_bytes = 0u64;
-        let mut last_useful_data_consumed = 0u64;
-        let mut poll_backoff_active = false;
-        // Tracks whether the resolver itself is still saying anything back at all (any decodable
-        // DNS response, ack-only or not), independent of enqueued_bytes/data_consumed. Those two
-        // can keep climbing purely from the app opening new (doomed) connections while the carrier
-        // is fully black-holed, which fooled both the poll_backoff/cpu_throttle "progress" check and
-        // the no-progress connection-reset detector below into thinking the link was fine. See
-        // dns_responses_total below for the real fix.
-        let mut last_dns_responses_seen = 0u64;
-        let mut last_dns_response_at = 0u64;
+        let mut stall = StallDetector::new();
         // Rolling 1-second window for the optional DNS poll-rate cap (config.max_poll_qps).
         // Only used when max_poll_qps > 0; otherwise these stay untouched and impose no limit.
         let mut poll_window_start_us = 0u64;
@@ -512,7 +468,7 @@ pub async fn run_client_with_control(
                             // Mirror the demand-driven cap from the send path (using last
                             // iteration's decision) so has_work goes false and the loop idle-sleeps
                             // instead of spinning while the poll flood is capped.
-                            let target = if poll_backoff_active {
+                            let target = if stall.poll_backoff_active() {
                                 target.min(UNPRODUCTIVE_MAX_INFLIGHT)
                             } else {
                                 target
@@ -546,7 +502,7 @@ pub async fn run_client_with_control(
             // Avoid a tight poll loop when idle, but keep the short slice during active transfers.
             // cpu_throttle_active means has_work has been true with no real progress for
             // CPU_THROTTLE_NO_PROGRESS_US straight; fall back to the idle floor until progress resumes.
-            let timeout_us = if has_work && !cpu_throttle_active {
+            let timeout_us = if has_work && !stall.cpu_throttle_active() {
                 delay_us.clamp(DNS_ACTIVE_SLEEP_MIN_US, DNS_POLL_SLICE_US)
             } else if ready {
                 delay_us.max(DNS_IDLE_SLEEP_MIN_US)
@@ -774,54 +730,14 @@ pub async fn run_client_with_control(
             let metrics = unsafe { (*state_ptr).stream_debug_metrics() };
             let (enqueued_bytes, last_enqueue_at) = unsafe { (*state_ptr).debug_snapshot() };
             let now = unsafe { picoquic_current_time() };
-            // Demand-driven poll throttle: has real data moved (upload enqueued to picoquic, or
-            // download consumed/queued back to the app) since we last checked? If so, the connection
-            // is productive — keep the poll cap lifted. If nothing has moved for
-            // UNPRODUCTIVE_POLL_BACKOFF_US, engage the cap to collapse the empty-poll flood.
+            // Demand-driven poll throttle / cpu_throttle / no-progress detection all live in
+            // stall::StallDetector below -- see runtime/stall.rs for the decision logic and its
+            // unit tests.
             let data_consumed = unsafe { flow_debug_snapshot(cnx) }.data_consumed;
-            // Any decodable response from any resolver, regardless of whether it carries app
-            // payload -- this is the one signal that can't be manufactured by the app retrying
-            // doomed connections, unlike enqueued_bytes (see the comment on last_dns_response_at
-            // above). received_recently uses a time window rather than a per-cycle delta so a
-            // healthy connection's normal poll cadence (a response most, not every, cycle) doesn't
-            // make this flap.
             let dns_responses_total: u64 = resolvers
                 .iter()
                 .map(|resolver| resolver.debug.dns_responses)
                 .sum();
-            if dns_responses_total > last_dns_responses_seen || last_dns_response_at == 0 {
-                last_dns_response_at = now;
-            }
-            last_dns_responses_seen = dns_responses_total;
-            let received_recently =
-                now.saturating_sub(last_dns_response_at) < UNPRODUCTIVE_POLL_BACKOFF_US;
-            let useful_progress = received_recently
-                && (enqueued_bytes > last_useful_enqueued_bytes
-                    || data_consumed > last_useful_data_consumed
-                    || metrics.data_rx_queued_chunks_total > 0);
-            last_useful_enqueued_bytes = enqueued_bytes;
-            last_useful_data_consumed = data_consumed;
-            if useful_progress || last_useful_progress_at == 0 {
-                last_useful_progress_at = now;
-            }
-            let poll_backoff = streams_len > 0
-                && now.saturating_sub(last_useful_progress_at) >= UNPRODUCTIVE_POLL_BACKOFF_US;
-            if poll_backoff != poll_backoff_active {
-                poll_backoff_active = poll_backoff;
-                if poll_backoff {
-                    info!(
-                        "poll_backoff: engaged (no up/down data for {}ms) — capping target_inflight to {} streams={}",
-                        UNPRODUCTIVE_POLL_BACKOFF_US / 1_000,
-                        UNPRODUCTIVE_MAX_INFLIGHT,
-                        streams_len
-                    );
-                } else {
-                    info!(
-                        "poll_backoff: released — real data flowing again streams={}",
-                        streams_len
-                    );
-                }
-            }
             let has_recent_stream_activity = streams_len > 0
                 && (last_enqueue_at == 0
                     || now.saturating_sub(last_enqueue_at) < STREAM_ACTIVE_POLL_GRACE_US);
@@ -897,127 +813,24 @@ pub async fn run_client_with_control(
             }
 
             let connection_ready = unsafe { (*state_ptr).is_ready() };
-            let local_pressure = enqueued_bytes > last_no_progress_enqueued_bytes
-                || metrics.streams_with_data_rx_queued > 0
-                || metrics.data_rx_queued_chunks_total > 0;
-            let dns_send_progress = dns_send_bytes_total > last_no_progress_dns_send_bytes;
-            if local_pressure || dns_send_progress {
-                if cpu_throttle_active {
-                    info!(
-                        "cpu_throttle: released after {}ms streams={} enqueued_bytes={} dns_send_bytes_total={}",
-                        now.saturating_sub(cpu_throttle_since) / 1_000,
-                        streams_len,
-                        enqueued_bytes,
-                        dns_send_bytes_total
-                    );
-                }
-                cpu_throttle_since = 0;
-                cpu_throttle_active = false;
-            } else {
-                if cpu_throttle_since == 0 {
-                    cpu_throttle_since = now;
-                }
-                if !cpu_throttle_active
-                    && now.saturating_sub(cpu_throttle_since) >= CPU_THROTTLE_NO_PROGRESS_US
-                {
-                    cpu_throttle_active = true;
-                    warn!(
-                        "cpu_throttle: engaged after {}ms without send/receive progress; falling back \
-                         to idle poll rate streams={} enqueued_bytes={} dns_send_bytes_total={} \
-                         flow_blocked={} has_ready_stream={} zero_send_with_streams={}",
-                        CPU_THROTTLE_NO_PROGRESS_US / 1_000,
-                        streams_len,
-                        enqueued_bytes,
-                        dns_send_bytes_total,
-                        flow_blocked,
-                        has_ready_stream,
-                        zero_send_with_streams
-                    );
-                }
+            if let Some(reason) = stall.tick(StallInput {
+                now,
+                streams_len,
+                enqueued_bytes,
+                data_consumed,
+                data_rx_queued_chunks_total: metrics.data_rx_queued_chunks_total,
+                streams_with_data_rx_queued: metrics.streams_with_data_rx_queued,
+                dns_send_bytes_total,
+                dns_responses_total,
+                has_ready_stream,
+                flow_blocked,
+                zero_send_with_streams,
+                last_enqueue_at,
+                connection_ready,
+            }) {
+                fatal_no_progress = Some(reason);
+                break;
             }
-            let stalled_signal = flow_blocked || !has_ready_stream || zero_send_with_streams > 0;
-            let downstream_stale = metrics.data_rx_queued_chunks_total == 0
-                && metrics.streams_with_data_rx_queued == 0
-                && zero_send_with_streams >= DOWNSTREAM_STALE_ZERO_SEND_MIN;
-            let stale_stream = enqueued_bytes >= STALE_STREAM_MIN_ENQUEUED_BYTES
-                && last_enqueue_at != 0
-                && now.saturating_sub(last_enqueue_at) >= STALE_STREAM_MIN_IDLE_US
-                && downstream_stale
-                && !has_ready_stream;
-            let no_recent_enqueue = last_enqueue_at != 0
-                && now.saturating_sub(last_enqueue_at) >= NO_PROGRESS_TIMEOUT_US;
-            let large_no_progress = enqueued_bytes >= NO_PROGRESS_MIN_ENQUEUED_BYTES
-                && no_recent_enqueue
-                && !has_ready_stream
-                && (!dns_send_progress || downstream_stale);
-            // Independent of the enqueue-based heuristics above (which the app can keep refreshing
-            // by retrying doomed connections): if we are actively transmitting but the resolver has
-            // not sent back a single decodable response, of any kind, for NO_PROGRESS_TIMEOUT_US,
-            // that alone is a definitive dead-carrier signal and doesn't need stalled_signal's
-            // corroboration.
-            let resolver_silent = connection_ready
-                && streams_len > 0
-                && dns_send_progress
-                && now.saturating_sub(last_dns_response_at) >= NO_PROGRESS_TIMEOUT_US;
-            let stalled_no_progress = connection_ready
-                && streams_len > 0
-                && ((large_no_progress || stale_stream) && stalled_signal || resolver_silent);
-            let no_progress_reason = if resolver_silent {
-                "resolver_silent"
-            } else if stale_stream {
-                "stale_stream"
-            } else {
-                "large_no_progress"
-            };
-            if stalled_no_progress && (local_pressure || no_progress_since != 0) {
-                if no_progress_since == 0 {
-                    no_progress_since = now;
-                    if now.saturating_sub(last_no_progress_arm_log_at)
-                        >= NO_PROGRESS_ARM_LOG_INTERVAL_US
-                    {
-                        last_no_progress_arm_log_at = now;
-                        warn!(
-                            "no-progress detector armed: reason={} streams={} enqueued_bytes={} dns_send_bytes_total={} last_enqueue_ms={} flow_blocked={} has_ready_stream={} data_rx_queued_chunks_total={} zero_send_with_streams={}",
-                            no_progress_reason,
-                            streams_len,
-                            enqueued_bytes,
-                            dns_send_bytes_total,
-                            last_enqueue_ms,
-                            flow_blocked,
-                            has_ready_stream,
-                            metrics.data_rx_queued_chunks_total,
-                            zero_send_with_streams
-                        );
-                    }
-                } else if now.saturating_sub(no_progress_since) >= NO_PROGRESS_TIMEOUT_US {
-                    error!(
-                        "no-progress detected for {}ms reason={}: streams={} enqueued_bytes={} dns_send_bytes_total={} last_enqueue_ms={} flow_blocked={} has_ready_stream={} data_rx_queued_chunks_total={} zero_send_with_streams={}; resetting connection",
-                        now.saturating_sub(no_progress_since) / 1_000,
-                        no_progress_reason,
-                        streams_len,
-                        enqueued_bytes,
-                        dns_send_bytes_total,
-                        last_enqueue_ms,
-                        flow_blocked,
-                        has_ready_stream,
-                        metrics.data_rx_queued_chunks_total,
-                        zero_send_with_streams
-                    );
-                    fatal_no_progress = Some(format!(
-                        "native no-progress reason={} streams={} enqueued_bytes={} last_enqueue_ms={} zero_send_with_streams={}",
-                        no_progress_reason,
-                        streams_len,
-                        enqueued_bytes,
-                        last_enqueue_ms,
-                        zero_send_with_streams
-                    ));
-                    break;
-                }
-            } else {
-                no_progress_since = 0;
-            }
-            last_no_progress_enqueued_bytes = enqueued_bytes;
-            last_no_progress_dns_send_bytes = dns_send_bytes_total;
             for resolver in resolvers.iter_mut() {
                 if !refresh_resolver_path(cnx, resolver) {
                     continue;
@@ -1054,7 +867,7 @@ pub async fn run_client_with_control(
                             // Demand-driven cap: while no real data is moving, hold in-flight polls
                             // to a small keepalive count instead of the full ~384 the disabled-CC
                             // pacing would otherwise target. Lifts the instant data flows again.
-                            let pacing_target = if poll_backoff {
+                            let pacing_target = if stall.poll_backoff_active() {
                                 pacing_target.min(UNPRODUCTIVE_MAX_INFLIGHT)
                             } else {
                                 pacing_target
