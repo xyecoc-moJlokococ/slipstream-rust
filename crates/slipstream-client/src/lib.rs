@@ -643,25 +643,50 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeGetLastErr
     }
 }
 
+// Send the stop signal and wait up to `timeout` for the thread to finish on its own; if it does,
+// join it and return true. If not, the thread is left running (its socket/transport resources
+// leak until process exit) and this returns false so the caller can log/report accordingly. This
+// is the exact mechanism behind the incident where a slow-to-stop client got detached and then
+// span forever pegging a CPU core: the timeout here doesn't prevent that on its own (that needed
+// the shutdown-check fixes in runtime.rs's poll loop), it only decides whether this call gets to
+// reclaim the thread's resources (like the local listen port) or has to give up and leak them.
+fn join_or_detach(
+    stop_tx: mpsc::UnboundedSender<()>,
+    thread: JoinHandle<()>,
+    timeout: Duration,
+) -> bool {
+    let _ = stop_tx.send(());
+    let deadline = Instant::now() + timeout;
+    while !thread.is_finished() && Instant::now() < deadline {
+        thread::sleep(STOP_JOIN_POLL);
+    }
+    if thread.is_finished() {
+        let _ = thread.join();
+        true
+    } else {
+        false
+    }
+}
+
 fn stop_running_client() -> Result<(), String> {
+    stop_running_client_with_timeout(STOP_JOIN_TIMEOUT)
+}
+
+// Timeout is a parameter (rather than always using STOP_JOIN_TIMEOUT directly) purely so tests
+// can exercise this function's real logic -- global RUNNING/READY/CLIENT_GENERATION handling
+// included -- without waiting out the real 10s production timeout.
+fn stop_running_client_with_timeout(timeout: Duration) -> Result<(), String> {
     let handle = client_slot()
         .lock()
         .map_err(|_| "failed to lock Slipstream client state".to_string())?
         .take();
     let generation = handle.as_ref().map(|handle| handle.generation);
     if let Some(handle) = handle {
-        let _ = handle.stop_tx.send(());
-        let deadline = Instant::now() + STOP_JOIN_TIMEOUT;
-        while !handle.thread.is_finished() && Instant::now() < deadline {
-            thread::sleep(STOP_JOIN_POLL);
-        }
-        if handle.thread.is_finished() {
-            let _ = handle.thread.join();
-        } else {
+        if !join_or_detach(handle.stop_tx, handle.thread, timeout) {
             tracing::error!(
                 "Slipstream client stop timed out after {:?}; detaching native thread \
                  (its socket/transport resources will leak until the process exits)",
-                STOP_JOIN_TIMEOUT
+                timeout
             );
             set_last_error("Slipstream client stop timed out; detached native thread");
         }
@@ -674,14 +699,7 @@ fn stop_running_client() -> Result<(), String> {
 }
 
 fn stop_probe_handle(handle: ProbeClientHandle, timeout: Duration) {
-    let _ = handle.stop_tx.send(());
-    let deadline = Instant::now() + timeout;
-    while !handle.thread.is_finished() && Instant::now() < deadline {
-        thread::sleep(STOP_JOIN_POLL);
-    }
-    if handle.thread.is_finished() {
-        let _ = handle.thread.join();
-    } else {
+    if !join_or_detach(handle.stop_tx, handle.thread, timeout) {
         tracing::error!(
             "Slipstream probe client stop timed out after {:?}; detaching native thread \
              (its socket/transport resources will leak until the process exits)",
@@ -781,4 +799,133 @@ fn read_resolvers(
         resolvers.push(ResolverSpec { resolver, mode });
     }
     Ok(resolvers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // join_or_detach doesn't touch any global state (unlike stop_running_client, which owns the
+    // process-wide CLIENT/RUNNING/READY statics) so it's safe to exercise directly and repeatedly.
+
+    #[test]
+    fn join_or_detach_joins_a_thread_that_honors_the_stop_signal() {
+        let (stop_tx, mut stop_rx) = mpsc::unbounded_channel::<()>();
+        let thread = thread::spawn(move || {
+            let _ = stop_rx.blocking_recv();
+        });
+        let joined = join_or_detach(stop_tx, thread, Duration::from_secs(2));
+        assert!(
+            joined,
+            "a thread that exits promptly on stop must be joined, not detached"
+        );
+    }
+
+    #[test]
+    fn join_or_detach_gives_up_and_detaches_a_stuck_thread() {
+        // Mirrors the real incident: the thread never checks the stop signal and just keeps
+        // running. join_or_detach must not block past `timeout` waiting for it.
+        let (stop_tx, _stop_rx) = mpsc::unbounded_channel::<()>();
+        let thread = thread::spawn(|| {
+            thread::sleep(Duration::from_secs(5));
+        });
+        let started = Instant::now();
+        let joined = join_or_detach(stop_tx, thread, Duration::from_millis(200));
+        assert!(
+            !joined,
+            "a thread that ignores the stop signal must be reported as detached"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "must give up at ~timeout, not wait for the stuck thread: took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn stop_probe_handle_clears_state_on_a_clean_stop() {
+        clear_last_error();
+        let (stop_tx, mut stop_rx) = mpsc::unbounded_channel::<()>();
+        let thread = thread::spawn(move || {
+            let _ = stop_rx.blocking_recv();
+        });
+        let handle = ProbeClientHandle {
+            stop_tx,
+            thread,
+            running: Arc::new(AtomicBool::new(true)),
+            ready: Arc::new(AtomicBool::new(true)),
+        };
+        let running = handle.running.clone();
+        let ready = handle.ready.clone();
+        stop_probe_handle(handle, Duration::from_secs(2));
+
+        assert!(!running.load(Ordering::SeqCst));
+        assert!(!ready.load(Ordering::SeqCst));
+        assert!(
+            last_error_slot().lock().unwrap().is_none(),
+            "a clean stop must not set an error"
+        );
+    }
+
+    #[test]
+    fn stop_probe_handle_reports_an_error_and_clears_state_on_timeout() {
+        clear_last_error();
+        let (stop_tx, _stop_rx) = mpsc::unbounded_channel::<()>();
+        let thread = thread::spawn(|| {
+            thread::sleep(Duration::from_secs(5));
+        });
+        let handle = ProbeClientHandle {
+            stop_tx,
+            thread,
+            running: Arc::new(AtomicBool::new(true)),
+            ready: Arc::new(AtomicBool::new(true)),
+        };
+        let running = handle.running.clone();
+        let ready = handle.ready.clone();
+        stop_probe_handle(handle, Duration::from_millis(200));
+
+        // Even though the thread is left detached (leaked), the handle's own state must still
+        // reflect "stopped" -- the caller (Kotlin) has already moved on and must not keep waiting
+        // on a probe that will never report ready again.
+        assert!(!running.load(Ordering::SeqCst));
+        assert!(!ready.load(Ordering::SeqCst));
+        let last_error = last_error_slot().lock().unwrap().clone();
+        assert_eq!(
+            last_error.as_deref(),
+            Some("Slipstream probe client stop timed out; detached native thread")
+        );
+    }
+
+    #[test]
+    fn stop_running_client_reports_an_error_on_timeout_and_still_clears_running() {
+        // This is the exact end-to-end path behind the original incident: stop_running_client
+        // gives up on a stuck client thread, and RUNNING must still flip false so the app doesn't
+        // think a (now-leaked) client is still usable.
+        clear_last_error();
+        RUNNING.store(true, Ordering::SeqCst);
+        READY.store(true, Ordering::SeqCst);
+        let generation = CLIENT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+
+        let (stop_tx, _stop_rx) = mpsc::unbounded_channel::<()>();
+        let thread = thread::spawn(|| {
+            thread::sleep(Duration::from_secs(5)); // ignores the stop signal
+        });
+        *client_slot().lock().unwrap() = Some(ClientHandle {
+            stop_tx,
+            thread,
+            generation,
+        });
+
+        // A short timeout here (real callers always use STOP_JOIN_TIMEOUT) keeps this test fast
+        // while still exercising stop_running_client's real RUNNING/READY/generation handling.
+        stop_running_client_with_timeout(Duration::from_millis(200)).unwrap();
+
+        assert!(!RUNNING.load(Ordering::SeqCst));
+        assert!(!READY.load(Ordering::SeqCst));
+        let last_error = last_error_slot().lock().unwrap().clone();
+        assert_eq!(
+            last_error.as_deref(),
+            Some("Slipstream client stop timed out; detached native thread")
+        );
+    }
 }
