@@ -313,10 +313,15 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeStartSlips
                 debug_poll,
                 debug_streams,
             };
-            if let Err(err) = runtime.block_on(runtime::run_client_with_control(
+            if let Err(err) = runtime.block_on(runtime::run_client_with_control_and_liveness(
                 &config,
                 Some(stop_rx),
                 Some(ready_tx),
+                // Self-terminate if this generation is superseded. A recovery restart (stop+start)
+                // bumps CLIENT_GENERATION, and stop_running_client bumps it too, so a thread that
+                // missed its mpsc stop signal (busy-spinning) still exits instead of orphaning at
+                // 100% CPU until the app is force-killed.
+                Some(Box::new(move || !is_current_generation(generation))),
             )) {
                 set_last_error(err.to_string());
             }
@@ -681,7 +686,15 @@ fn stop_running_client_with_timeout(timeout: Duration) -> Result<(), String> {
         .map_err(|_| "failed to lock Slipstream client state".to_string())?
         .take();
     let generation = handle.as_ref().map(|handle| handle.generation);
+    let was_current = generation.is_none_or(is_current_generation);
     if let Some(handle) = handle {
+        // Invalidate this generation BEFORE joining so a thread that missed its mpsc stop signal
+        // (busy-spinning) sees its generation is no longer current and self-terminates, letting the
+        // join succeed instead of detaching into a 100%-CPU orphan. Only bump when this is still the
+        // current generation, so a concurrently-started newer client isn't killed.
+        if was_current {
+            CLIENT_GENERATION.fetch_add(1, Ordering::SeqCst);
+        }
         if !join_or_detach(handle.stop_tx, handle.thread, timeout) {
             tracing::error!(
                 "Slipstream client stop timed out after {:?}; detaching native thread \
@@ -691,7 +704,7 @@ fn stop_running_client_with_timeout(timeout: Duration) -> Result<(), String> {
             set_last_error("Slipstream client stop timed out; detached native thread");
         }
     }
-    if generation.is_none_or(is_current_generation) {
+    if was_current {
         RUNNING.store(false, Ordering::SeqCst);
         READY.store(false, Ordering::SeqCst);
     }

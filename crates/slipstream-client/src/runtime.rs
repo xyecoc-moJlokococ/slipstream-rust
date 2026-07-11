@@ -166,6 +166,24 @@ pub async fn run_client_with_control(
     mut shutdown_rx: Option<mpsc::UnboundedReceiver<()>>,
     ready_tx: Option<std_mpsc::Sender<bool>>,
 ) -> Result<i32, ClientError> {
+    run_client_with_control_and_liveness(config, shutdown_rx.take(), ready_tx, None).await
+}
+
+/// Same as [`run_client_with_control`], plus an optional `stale` predicate. When `stale()` returns
+/// true the loop returns promptly from EVERY hot spot (outer loop, inner recv/send bursts, reconnect
+/// sleep), even if the mpsc stop signal is never observed. This is the belt-and-suspenders reap for
+/// the "detached native thread spins at 100% CPU forever" wedge: the JNI stop path only sends a
+/// per-thread mpsc `stop_tx` and then *detaches* the thread if it doesn't join within the 10s
+/// timeout; a thread stuck busy-processing packets never sees that signal, so it orphans and pegs a
+/// core until the whole app is killed. Wiring `stale` to a global generation counter (bumped on
+/// every start AND stop) means any client whose generation is no longer current terminates itself.
+pub async fn run_client_with_control_and_liveness(
+    config: &ClientConfig<'_>,
+    mut shutdown_rx: Option<mpsc::UnboundedReceiver<()>>,
+    ready_tx: Option<std_mpsc::Sender<bool>>,
+    stale: Option<Box<dyn Fn() -> bool + Send>>,
+) -> Result<i32, ClientError> {
+    let is_stale = || stale.as_ref().is_some_and(|f| f());
     report_ready(&ready_tx, false);
     let mtu = compute_transport_mtu(config)?;
     info!(
@@ -250,7 +268,7 @@ pub async fn run_client_with_control(
     let mut reconnect_delay = Duration::from_millis(RECONNECT_SLEEP_MIN_MS);
 
     loop {
-        if shutdown_requested(&mut shutdown_rx) {
+        if shutdown_requested(&mut shutdown_rx) || is_stale() {
             return Ok(0);
         }
         let mut resolvers = resolve_resolvers(
@@ -371,7 +389,7 @@ pub async fn run_client_with_control(
         let mut poll_window_sent: u32 = 0;
 
         loop {
-            if shutdown_requested(&mut shutdown_rx) {
+            if shutdown_requested(&mut shutdown_rx) || is_stale() {
                 return Ok(0);
             }
             let current_time = unsafe { picoquic_current_time() };
@@ -548,7 +566,7 @@ pub async fn run_client_with_control(
                                 // local listen socket -- and, since detaching leaves this loop
                                 // running forever with no one left to signal it, the orphaned
                                 // thread pegs a CPU core indefinitely. Bail promptly instead.
-                                if shutdown_requested(&mut shutdown_rx) {
+                                if shutdown_requested(&mut shutdown_rx) || is_stale() {
                                     return Ok(0);
                                 }
                                 match dns_transport.try_recv_from(&mut recv_buf) {
@@ -608,7 +626,7 @@ pub async fn run_client_with_control(
                 // lands mid-burst would otherwise wait out the whole burst; if that pushes the
                 // native thread past the JNI stop-join deadline it gets detached while still holding
                 // the local listen socket, and the next start fails with EADDRINUSE. Bail promptly.
-                if shutdown_requested(&mut shutdown_rx) {
+                if shutdown_requested(&mut shutdown_rx) || is_stale() {
                     return Ok(0);
                 }
                 let current_time = unsafe { picoquic_current_time() };
@@ -1045,7 +1063,7 @@ pub async fn run_client_with_control(
         // Sleep in small chunks and drop commands that arrive while disconnected.
         let mut remaining_sleep = reconnect_delay;
         while remaining_sleep > Duration::ZERO {
-            if shutdown_requested(&mut shutdown_rx) {
+            if shutdown_requested(&mut shutdown_rx) || is_stale() {
                 return Ok(0);
             }
             let chunk = remaining_sleep.min(Duration::from_millis(100));
