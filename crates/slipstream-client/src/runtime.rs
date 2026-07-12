@@ -37,8 +37,7 @@ use slipstream_ffi::{
         picoquic_prepare_next_packet_ex, picoquic_set_callback, slipstream_get_flow_debug,
         slipstream_has_ready_stream, slipstream_is_flow_blocked, slipstream_mixed_cc_algorithm,
         slipstream_set_cc_override, slipstream_set_default_path_mode,
-        PICOQUIC_CONNECTION_ID_MAX_SIZE, PICOQUIC_MAX_PACKET_SIZE, PICOQUIC_PACKET_LOOP_RECV_MAX,
-        PICOQUIC_PACKET_LOOP_SEND_MAX,
+        PICOQUIC_CONNECTION_ID_MAX_SIZE, PICOQUIC_MAX_PACKET_SIZE,
     },
     socket_addr_to_storage, take_crypto_errors, ClientConfig, QuicGuard, ResolverMode,
     ResolverTransport, UpstreamEncoding,
@@ -202,8 +201,16 @@ pub async fn run_client_with_control_and_liveness(
                 DNS_TCP_RECURSIVE_POLL_SEED,
             ),
             ResolverTransport::Udp => (
-                PICOQUIC_PACKET_LOOP_SEND_MAX,
-                PICOQUIC_PACKET_LOOP_RECV_MAX,
+                // Historically capped at picoquic's stock PICOQUIC_PACKET_LOOP_SEND/RECV_MAX=10
+                // per loop iteration, while TCP already got the full dns_tcp_packet_loop_burst
+                // (default 64). That 10 was never a UDP-specific tuning choice, just the
+                // untouched picoquic default -- reusing the same burst TCP already gets lets a
+                // fresh/idle connection ramp up to its target inflight in ~1 loop iteration
+                // instead of ~7, which otherwise adds real wall-clock latency to every
+                // request that starts from idle (measured: ~555-615ms steady-state ping on
+                // UDP/Beeline before this change, dominated by this ramp-up, not raw RTT).
+                dns_tcp_packet_loop_burst,
+                dns_tcp_packet_loop_burst,
                 DNS_UDP_RECURSIVE_POLL_CREDIT,
                 DNS_UDP_RECURSIVE_POLL_SEED,
             ),
@@ -456,13 +463,29 @@ pub async fn run_client_with_control_and_liveness(
                 }
                 let pending_for_sleep = match resolver.mode {
                     ResolverMode::Authoritative => {
+                        // See the send-path copy: in rate-limited mode (max_poll_qps>0) keep the
+                        // loop awake and polling at the budget whenever streams are open, so streams
+                        // awaiting downlink don't fall to the idle 1-poll/2s path and deadlock.
+                        let rate_limited = config.max_poll_qps > 0;
                         if ready
                             && streams_len_for_sleep > 0
                             && (has_recent_stream_activity_for_sleep
-                                || idle_stream_poll_due_for_sleep)
+                                || idle_stream_poll_due_for_sleep
+                                || rate_limited)
                         {
                             let quality = fetch_path_quality(cnx, resolver);
-                            let max_target = if current_time < resolver.high_throughput_until {
+                            // Unlock the full inflight budget on active upload too, not just a
+                            // recent big download -- previously only an inbound response
+                            // >=512B extended high_throughput_until, so a pure-upload burst
+                            // (e.g. Telegram opening many parallel streams) stayed capped at 64
+                            // inflight even though the streams were actively sending, starving
+                            // MAX_STREAM_DATA grants across all of them and stalling the whole
+                            // connection (each stream stuck at exactly its per-stream flow
+                            // control ceiling with flow_blocked=true).
+                            let max_target = if current_time < resolver.high_throughput_until
+                                || has_recent_stream_activity_for_sleep
+                                || rate_limited
+                            {
                                 MAX_ACTIVE_AUTHORITATIVE_TARGET_INFLIGHT
                             } else {
                                 0
@@ -486,7 +509,7 @@ pub async fn run_client_with_control_and_liveness(
                             // Mirror the demand-driven cap from the send path (using last
                             // iteration's decision) so has_work goes false and the loop idle-sleeps
                             // instead of spinning while the poll flood is capped.
-                            let target = if stall.poll_backoff_active() {
+                            let target = if stall.poll_backoff_active() && !rate_limited {
                                 target.min(UNPRODUCTIVE_MAX_INFLIGHT)
                             } else {
                                 target
@@ -496,7 +519,7 @@ pub async fn run_client_with_control_and_liveness(
                             let deficit = target.saturating_sub(
                                 inflight_packets.saturating_add(resolver.inflight_poll_ids.len()),
                             );
-                            if has_recent_stream_activity_for_sleep {
+                            if has_recent_stream_activity_for_sleep || rate_limited {
                                 deficit
                             } else {
                                 deficit.min(1)
@@ -856,12 +879,31 @@ pub async fn run_client_with_control_and_liveness(
                 match resolver.mode {
                     ResolverMode::Authoritative => {
                         let mut quality_for_log = None;
-                        let allow_poll =
-                            has_recent_stream_activity || flow_blocked || idle_stream_poll_due;
+                        // Rate-limited mode (config.max_poll_qps > 0): the operator hard-limits DNS
+                        // queries/sec (e.g. Megafon ~50 q/s per client), so the max_poll_qps window
+                        // cap below is the real rate bound. In that mode, poll STEADILY at the budget
+                        // whenever streams are open -- including streams only awaiting DOWNLINK (a TLS
+                        // ServerHello / HTTP response) with no recent upload enqueue. Otherwise those
+                        // fall to the idle 1-poll/2s path, never fetch their downlink, and the
+                        // connection deadlocks (observed dead on Megafon). Fully gated on
+                        // max_poll_qps>0, so the default (uncapped) path is unchanged.
+                        let rate_limited = config.max_poll_qps > 0;
+                        let allow_poll = has_recent_stream_activity
+                            || flow_blocked
+                            || idle_stream_poll_due
+                            || (rate_limited && streams_len > 0);
                         let mut poll_deficit = if streams_len > 0 && allow_poll {
                             let quality = fetch_path_quality(cnx, resolver);
                             let snapshot = resolver.last_pacing_snapshot;
-                            let max_target = if current_time < resolver.high_throughput_until {
+                            // See the matching comment on the sleep-path copy of this check above:
+                            // active upload (or being flow-blocked while streams are open, which is
+                            // exactly the "need more per-stream window" signal) also unlocks the full
+                            // inflight budget, not just a recent big download.
+                            let max_target = if current_time < resolver.high_throughput_until
+                                || has_recent_stream_activity
+                                || flow_blocked
+                                || (rate_limited && streams_len > 0)
+                            {
                                 MAX_ACTIVE_AUTHORITATIVE_TARGET_INFLIGHT
                             } else {
                                 0
@@ -885,7 +927,11 @@ pub async fn run_client_with_control_and_liveness(
                             // Demand-driven cap: while no real data is moving, hold in-flight polls
                             // to a small keepalive count instead of the full ~384 the disabled-CC
                             // pacing would otherwise target. Lifts the instant data flows again.
-                            let pacing_target = if stall.poll_backoff_active() {
+                            // Skip it in rate-limited mode: the max_poll_qps window is already the
+                            // rate bound, and clamping to the ~8 keepalive floor would stop the
+                            // client from using its full (already-tiny) budget to fetch pending
+                            // downlink -- the exact deadlock that made Megafon unusable.
+                            let pacing_target = if stall.poll_backoff_active() && !rate_limited {
                                 pacing_target.min(UNPRODUCTIVE_MAX_INFLIGHT)
                             } else {
                                 pacing_target
@@ -900,7 +946,11 @@ pub async fn run_client_with_control_and_liveness(
                             resolver.last_pacing_snapshot = None;
                             0
                         };
-                        if idle_stream_poll_due && !has_recent_stream_activity && !flow_blocked {
+                        if idle_stream_poll_due
+                            && !has_recent_stream_activity
+                            && !flow_blocked
+                            && !rate_limited
+                        {
                             poll_deficit = poll_deficit.min(1);
                         }
                         if has_ready_stream && !flow_blocked {

@@ -102,7 +102,13 @@ pub fn decode_query_with_domains_and_qtype(
                     rd,
                     cd,
                     question: Some(question),
-                    rcode: Rcode::ServerFailure,
+                    // NXDOMAIN, not SERVFAIL: an undecodable/garbage query (e.g. corrupted in
+                    // transit) must not make us look like a failing authoritative server.
+                    // Recursive resolvers retry SERVFAIL ~3x (amplifying load against per-client
+                    // query-rate limits, e.g. Megafon ~50 q/s) and may damp/blacklist the domain;
+                    // NXDOMAIN is cacheable and handled gently. Valid tunnel queries still decode
+                    // and get their TXT, so this only changes the error path.
+                    rcode: Rcode::NameError,
                 })
             }
         };
@@ -134,7 +140,10 @@ pub fn decode_query_with_domains_and_qtype(
                 rd,
                 cd,
                 question: Some(question),
-                rcode: Rcode::ServerFailure,
+                // NXDOMAIN, not SERVFAIL (see the `_s` branch above): a base32-undecodable qname
+                // is just a bogus name, not a server failure. Avoids resolver retry-amplification
+                // and domain damping under per-client query-rate limits.
+                rcode: Rcode::NameError,
             })
         }
     };
