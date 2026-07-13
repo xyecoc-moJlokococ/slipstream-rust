@@ -4,6 +4,8 @@ mod pacing;
 mod pinning;
 mod platform;
 mod runtime;
+#[cfg(test)]
+mod stall_shutdown_tests;
 mod streams;
 
 use jni::objects::{JBooleanArray, JIntArray, JObject, JObjectArray, JString};

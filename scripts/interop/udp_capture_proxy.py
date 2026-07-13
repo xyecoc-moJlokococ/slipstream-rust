@@ -280,6 +280,21 @@ def main() -> int:
         default=20000,
         help="Expected packets per transfer (controls delay sampling stride)",
     )
+    parser.add_argument(
+        "--blackout-interval-s",
+        type=float,
+        default=0.0,
+        help="Every N seconds (measured from proxy start), stop forwarding all packets in both "
+        "directions for --blackout-duration-s -- simulates a resolver that goes completely "
+        "silent (no error, no FIN/RST) rather than one that errors or refuses. 0 disables "
+        "(default, preserves prior behavior).",
+    )
+    parser.add_argument(
+        "--blackout-duration-s",
+        type=float,
+        default=5.0,
+        help="Duration of each blackout window started by --blackout-interval-s.",
+    )
 
     # Compatibility flags retained for callers; currently ignored.
     parser.add_argument("--min-gap-ms", type=float, default=0.1)
@@ -308,6 +323,27 @@ def main() -> int:
         seed=args.seed,
     )
     reorder_ctrl = ReorderController(reorder_rate=reorder_rate, min_gap_ms=args.min_gap_ms)
+
+    proxy_start = time.monotonic()
+    blackout_interval = max(0.0, args.blackout_interval_s)
+    blackout_duration = max(0.0, args.blackout_duration_s)
+    blackout_active = False
+    dropped_in_blackout = 0
+
+    def in_blackout(now: float) -> bool:
+        """True if `now` falls inside a periodic blackout window (all packets dropped)."""
+        if blackout_interval <= 0.0 or blackout_duration <= 0.0:
+            return False
+        elapsed = now - proxy_start
+        # No blackout during the first interval: the naive `elapsed % blackout_interval`
+        # phase is 0 (and thus "in blackout") right as the proxy starts, which reliably
+        # black-holes the client's very first handshake attempt before it ever connects once
+        # -- starving startup rather than interrupting an established session, which is what
+        # this is meant to simulate. Give the client a full interval to get established first.
+        if elapsed < blackout_interval:
+            return False
+        phase = elapsed % blackout_interval
+        return phase < blackout_duration
 
     last_client: Optional[Tuple[str, int]] = None
     packet_count = 0
@@ -349,6 +385,15 @@ def main() -> int:
     try:
         while True:
             now = time.monotonic()
+            currently_blacked_out = in_blackout(now)
+            if currently_blacked_out != blackout_active:
+                blackout_active = currently_blacked_out
+                state = "started" if blackout_active else "ended"
+                print(
+                    f"[blackout] {state} at t={now - proxy_start:.1f}s "
+                    f"(dropped_so_far={dropped_in_blackout})",
+                    file=sys.stderr,
+                )
             # Release any pending packets that have been waiting without traffic.
             for direction, entry in reorder_ctrl.release_idle(now):
                 log_and_enqueue(direction, entry)
@@ -380,6 +425,12 @@ def main() -> int:
             if dst is None:
                 continue
 
+            if blackout_active:
+                # Simulate a resolver gone completely silent: no forward, no error, no
+                # FIN/RST -- the packet is simply never seen again.
+                dropped_in_blackout += 1
+                continue
+
             natural_delay_ms = delay_model.sample(direction)
             scheduled = reorder_ctrl.process(
                 direction, recv_time, natural_delay_ms, data, addr, dst
@@ -407,6 +458,9 @@ def main() -> int:
             if wait > 0:
                 time.sleep(wait)
             sock.sendto(data, dst)
+
+        if blackout_interval > 0.0:
+            print(f"Dropped in blackout windows: {dropped_in_blackout}", file=sys.stderr)
 
         stats = reorder_ctrl.get_stats()
         print(f"\n=== Reorder Statistics ===", file=sys.stderr)
