@@ -21,7 +21,7 @@ use crate::pacing::{
 use crate::pinning::configure_pinned_certificate;
 use crate::streams::{
     acceptor::ClientAcceptor, client_callback, drain_commands, drain_stream_data, handle_command,
-    ClientState, Command,
+    reap_half_closed_tcp_streams, ClientState, Command,
 };
 use slipstream_dns::{
     build_edns_raw_qname, build_qname_with_label_len, encode_query, encode_query_compact,
@@ -411,6 +411,8 @@ pub async fn run_client_with_control_and_liveness(
             } else {
                 drain_stream_data(cnx, state_ptr);
             }
+            // Bound CLOSE-WAIT on the local SOCKS accept port when peer FINed but QUIC never does.
+            reap_half_closed_tcp_streams(cnx, state_ptr, current_time);
             let closing = unsafe { (*state_ptr).is_closing() };
             if closing {
                 break;
@@ -641,6 +643,7 @@ pub async fn run_client_with_control_and_liveness(
             } else {
                 drain_stream_data(cnx, state_ptr);
             }
+            reap_half_closed_tcp_streams(cnx, state_ptr, current_time);
             drain_path_events(cnx, &mut resolvers, state_ptr, peer_addr_mode);
 
             for _ in 0..packet_loop_send_max {

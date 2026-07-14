@@ -2,7 +2,7 @@ use super::invariants::check_stream_invariants;
 use super::io_tasks::{spawn_client_reader, spawn_client_writer, STREAM_READ_CHUNK_BYTES};
 use super::state::{
     ClientState, ClientStream, Command, StreamRecvState, StreamSendState,
-    CLIENT_WRITE_COALESCE_DEFAULT_BYTES, DEFAULT_TCP_RCVBUF_BYTES,
+    CLIENT_WRITE_COALESCE_DEFAULT_BYTES, DEFAULT_TCP_RCVBUF_BYTES, TCP_HALF_CLOSED_MAX_US,
 };
 #[cfg(test)]
 use super::test_hooks;
@@ -48,6 +48,7 @@ pub(crate) fn drain_commands(
 pub(crate) fn drain_stream_data(cnx: *mut picoquic_cnx_t, state_ptr: *mut ClientState) {
     let mut pending = Vec::new();
     let mut closed_streams = Vec::new();
+    let now_us = unsafe { picoquic_current_time() };
     {
         let state = unsafe { &mut *state_ptr };
         slipstream_core::drain_stream_data!(state.streams, data_rx, pending, closed_streams);
@@ -55,6 +56,10 @@ pub(crate) fn drain_stream_data(cnx: *mut picoquic_cnx_t, state_ptr: *mut Client
             if let Some(stream) = state.streams.get_mut(stream_id) {
                 if stream.send_state == StreamSendState::Open {
                     stream.send_state = StreamSendState::Closing;
+                }
+                // Local SOCKS peer FINed: arm the CLOSE-WAIT reaper clock.
+                if stream.tcp_local_eof_at_us.is_none() {
+                    stream.tcp_local_eof_at_us = Some(now_us);
                 }
             }
         }
@@ -64,6 +69,39 @@ pub(crate) fn drain_stream_data(cnx: *mut picoquic_cnx_t, state_ptr: *mut Client
     }
     for stream_id in closed_streams {
         handle_command(cnx, state_ptr, Command::StreamClosed { stream_id });
+    }
+}
+
+/// Force-close accepted TCP sockets that have been half-closed (peer FIN) longer than
+/// [TCP_HALF_CLOSED_MAX_US] without the QUIC half finishing. Without this, CLOSE-WAIT fds
+/// accumulate on the native SOCKS listen port under a slow/dead DNS carrier.
+pub(crate) fn reap_half_closed_tcp_streams(
+    cnx: *mut picoquic_cnx_t,
+    state_ptr: *mut ClientState,
+    now_us: u64,
+) {
+    let stale = {
+        let state = unsafe { &*state_ptr };
+        state.stale_half_closed_tcp_streams(now_us, TCP_HALF_CLOSED_MAX_US)
+    };
+    if stale.is_empty() {
+        return;
+    }
+    warn!(
+        "reaping {} half-closed TCP stream(s) past {}ms (CLOSE-WAIT guard)",
+        stale.len(),
+        TCP_HALF_CLOSED_MAX_US / 1_000
+    );
+    for stream_id in stale {
+        warn!(
+            "stream {}: reaping half-closed TCP (local peer FIN, remote QUIC still open)",
+            stream_id
+        );
+        if !cnx.is_null() {
+            unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
+        }
+        let state = unsafe { &mut *state_ptr };
+        state.remove_stream(stream_id);
     }
 }
 
@@ -153,6 +191,7 @@ pub(crate) fn handle_command(
                     recv_state: StreamRecvState::Open,
                     send_state: StreamSendState::Open,
                     flow: FlowControlState::default(),
+                    tcp_local_eof_at_us: None,
                 },
             );
             state.debug_last_enqueue_at = unsafe { picoquic_current_time() };
@@ -224,6 +263,23 @@ pub(crate) fn handle_command(
             }
             check_stream_invariants(state, stream_id, "StreamData");
         }
+        Command::StreamLocalTcpEof {
+            stream_id,
+            generation,
+        } => {
+            if !command_generation_matches(state, stream_id, generation, "StreamLocalTcpEof") {
+                return;
+            }
+            if let Some(stream) = state.streams.get_mut(&stream_id) {
+                // Only arm the clock here. Do NOT flip send_state to Closing while data_rx is
+                // still live -- that violates the "closed send with data_rx" invariant. Closing
+                // is applied when drain_stream_data sees data_tx drop (Disconnected).
+                if stream.tcp_local_eof_at_us.is_none() {
+                    stream.tcp_local_eof_at_us = Some(unsafe { picoquic_current_time() });
+                }
+            }
+            check_stream_invariants(state, stream_id, "StreamLocalTcpEof");
+        }
         Command::StreamClosed { stream_id } => {
             let should_send_fin = state
                 .streams
@@ -260,6 +316,9 @@ pub(crate) fn handle_command(
                 state.remove_stream(stream_id);
             } else if let Some(stream) = state.streams.get_mut(&stream_id) {
                 stream.send_state = StreamSendState::FinQueued;
+                if stream.tcp_local_eof_at_us.is_none() {
+                    stream.tcp_local_eof_at_us = Some(unsafe { picoquic_current_time() });
+                }
                 if stream.recv_state.is_closed() && stream.flow.queued_bytes == 0 {
                     state.remove_stream(stream_id);
                 }

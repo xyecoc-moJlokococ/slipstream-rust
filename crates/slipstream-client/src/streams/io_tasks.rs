@@ -31,13 +31,18 @@ pub(super) fn spawn_client_reader(
                 read_result = read_half.read(&mut buf) => {
                     match read_result {
                         Ok(0) => {
-                            // Local TCP EOF: just stop reading and drop `data_tx` below. That
-                            // disconnects the data channel, which `drain_stream_data` detects and
+                            // Local TCP EOF: arm the CLOSE-WAIT reaper clock immediately (so a
+                            // paused `drain_stream_data` under upstream backpressure can't leave
+                            // the accepted socket in CLOSE-WAIT forever), then drop `data_tx`
+                            // below. That disconnects the data channel, which `drain_stream_data`
                             // turns into a graceful `Command::StreamClosed` (queues a QUIC FIN)
-                            // AFTER draining any buffered upload bytes. Sending an explicit close
-                            // command here instead would either discard that backlog (data loss)
-                            // or mark the send side closed while `data_rx` is still live (invariant
-                            // violation), so leave the graceful path to handle it.
+                            // AFTER draining any buffered upload bytes. We deliberately do NOT
+                            // send StreamClosed here -- that would discard backlog or mark send
+                            // closed while `data_rx` is still live.
+                            let _ = command_tx.send(Command::StreamLocalTcpEof {
+                                stream_id,
+                                generation,
+                            });
                             break;
                         }
                         Ok(n) => {

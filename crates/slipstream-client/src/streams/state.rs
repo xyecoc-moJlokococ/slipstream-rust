@@ -10,6 +10,11 @@ use tracing::{debug, info};
 
 pub(super) const DEFAULT_TCP_RCVBUF_BYTES: usize = 256 * 1024;
 pub(super) const CLIENT_WRITE_COALESCE_DEFAULT_BYTES: usize = 256 * 1024;
+/// After the local SOCKS peer FINs (TCP read EOF), the write half is kept open so a slow QUIC
+/// download can still finish. On a degraded DNS carrier the remote FIN may never arrive, so the
+/// accepted TCP socket stays in CLOSE-WAIT forever (field: 100+ fds on :1081 with empty queues).
+/// Cap that wait; aligned with the Java bridge HALF_MAX_MS.
+pub(crate) const TCP_HALF_CLOSED_MAX_US: u64 = 45_000_000;
 
 pub(crate) struct ClientState {
     pub(super) ready: bool,
@@ -143,14 +148,36 @@ impl ClientState {
     }
 
     pub(super) fn remove_stream(&mut self, stream_id: u64) -> Option<ClientStream> {
-        let removed = self.streams.remove(&stream_id);
-        if removed.is_some() && self.streams.is_empty() && self.multi_stream_mode {
+        let mut removed = self.streams.remove(&stream_id)?;
+        // Release the accepted TCP socket promptly: abort the reader and FIN the writer so the
+        // kernel leaves CLOSE-WAIT instead of holding the fd until task drop races settle.
+        if let Some(read_abort_tx) = removed.read_abort_tx.take() {
+            let _ = read_abort_tx.send(());
+        }
+        let _ = removed.write_tx.send(StreamWrite::Fin);
+        if self.streams.is_empty() && self.multi_stream_mode {
             self.multi_stream_mode = false;
             if self.debug_streams {
                 debug!("stream {}: leaving multi-stream mode", stream_id);
             }
         }
-        removed
+        Some(removed)
+    }
+
+    /// Streams whose local SOCKS peer already FINed but whose QUIC half is still open past
+    /// [TCP_HALF_CLOSED_MAX_US]. Returns their ids for the caller to abort+remove.
+    pub(crate) fn stale_half_closed_tcp_streams(&self, now_us: u64, max_us: u64) -> Vec<u64> {
+        self.streams
+            .iter()
+            .filter_map(|(stream_id, stream)| {
+                let eof_at = stream.tcp_local_eof_at_us?;
+                if now_us.saturating_sub(eof_at) >= max_us {
+                    Some(*stream_id)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     pub(crate) fn stream_debug_metrics(&self) -> ClientStreamMetrics {
@@ -311,6 +338,9 @@ pub(super) struct ClientStream {
     pub(super) recv_state: StreamRecvState,
     pub(super) send_state: StreamSendState,
     pub(super) flow: FlowControlState,
+    /// `picoquic_current_time()` when local TCP read hit EOF (peer FIN). `None` while fully open.
+    /// Used to reap CLOSE-WAIT sockets whose remote QUIC half never completes.
+    pub(super) tcp_local_eof_at_us: Option<u64>,
 }
 
 impl HasFlowControlState for ClientStream {
@@ -334,6 +364,13 @@ pub(crate) enum Command {
     },
     StreamClosed {
         stream_id: u64,
+    },
+    /// Local SOCKS peer FINed (TCP read returned 0). Armed immediately from the reader task so the
+    /// CLOSE-WAIT reaper clock starts even when `drain_stream_data` is paused under upstream
+    /// backpressure (which would otherwise leave `tcp_local_eof_at_us` unset forever).
+    StreamLocalTcpEof {
+        stream_id: u64,
+        generation: usize,
     },
     StreamReadError {
         stream_id: u64,

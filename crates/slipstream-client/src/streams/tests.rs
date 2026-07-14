@@ -30,6 +30,7 @@ fn add_to_stream_fin_failure_removes_stream() {
             recv_state: StreamRecvState::Open,
             send_state: StreamSendState::Open,
             flow: FlowControlState::default(),
+            tcp_local_eof_at_us: None,
         },
     );
 
@@ -68,6 +69,7 @@ fn remote_fin_keeps_local_read_open() {
             recv_state: StreamRecvState::Open,
             send_state: StreamSendState::Open,
             flow: FlowControlState::default(),
+            tcp_local_eof_at_us: None,
         },
     );
 
@@ -110,6 +112,7 @@ fn stream_removal_requires_both_halves_closed() {
             recv_state: StreamRecvState::Open,
             send_state: StreamSendState::Open,
             flow: FlowControlState::default(),
+            tcp_local_eof_at_us: None,
         },
     );
 
@@ -157,6 +160,7 @@ fn local_fin_does_not_remove_until_recv_fin() {
             recv_state: StreamRecvState::Open,
             send_state: StreamSendState::FinQueued,
             flow: FlowControlState::default(),
+            tcp_local_eof_at_us: None,
         },
     );
 
@@ -196,6 +200,7 @@ fn multi_stream_mode_resets_when_last_stream_is_removed() {
                 recv_state: StreamRecvState::Open,
                 send_state: StreamSendState::Open,
                 flow: FlowControlState::default(),
+                tcp_local_eof_at_us: None,
             },
         );
     }
@@ -237,6 +242,7 @@ fn backlog_summaries_are_sorted_by_backlog() {
                     queued_bytes,
                     ..FlowControlState::default()
                 },
+                tcp_local_eof_at_us: None,
             },
         );
     }
@@ -312,6 +318,7 @@ fn stale_task_command_is_ignored_after_reconnect() {
             recv_state: StreamRecvState::Open,
             send_state: StreamSendState::Open,
             flow: FlowControlState::default(),
+            tcp_local_eof_at_us: None,
         },
     );
     state.connection_generation = 1;
@@ -369,4 +376,150 @@ fn acceptor_backpressure_blocks_new_connections() {
 
         drop(clients);
     });
+}
+
+#[test]
+fn stream_local_tcp_eof_arms_reaper_clock() {
+    let (command_tx, _command_rx) = mpsc::unbounded_channel();
+    let data_notify = Arc::new(Notify::new());
+    let acceptor = acceptor::ClientAcceptor::new();
+    let mut state = ClientState::new(command_tx, data_notify, false, acceptor);
+    let stream_id = 4;
+    let (write_tx, _write_rx) = mpsc::unbounded_channel();
+    let (read_abort_tx, _read_abort_rx) = oneshot::channel();
+    let (_data_tx, data_rx) = mpsc::channel(1);
+    state.streams.insert(
+        stream_id,
+        ClientStream {
+            write_tx,
+            read_abort_tx: Some(read_abort_tx),
+            data_rx: Some(data_rx),
+            tx_bytes: 0,
+            recv_state: StreamRecvState::Open,
+            send_state: StreamSendState::Open,
+            flow: FlowControlState::default(),
+            tcp_local_eof_at_us: None,
+        },
+    );
+
+    handle_command(
+        std::ptr::null_mut(),
+        &mut state as *mut _,
+        Command::StreamLocalTcpEof {
+            stream_id,
+            generation: 0,
+        },
+    );
+
+    let stream = state.streams.get(&stream_id).expect("stream remains");
+    assert!(
+        stream.tcp_local_eof_at_us.is_some(),
+        "StreamLocalTcpEof must arm CLOSE-WAIT clock without waiting for drain_stream_data"
+    );
+    assert_eq!(
+        stream.send_state,
+        StreamSendState::Open,
+        "send_state stays Open until data_rx is dropped by drain_stream_data"
+    );
+}
+
+#[test]
+fn fully_open_streams_are_not_half_closed_stale() {
+    let (command_tx, _command_rx) = mpsc::unbounded_channel();
+    let data_notify = Arc::new(Notify::new());
+    let acceptor = acceptor::ClientAcceptor::new();
+    let mut state = ClientState::new(command_tx, data_notify, false, acceptor);
+    let (write_tx, _write_rx) = mpsc::unbounded_channel();
+    let (read_abort_tx, _read_abort_rx) = oneshot::channel();
+    state.streams.insert(
+        4,
+        ClientStream {
+            write_tx,
+            read_abort_tx: Some(read_abort_tx),
+            data_rx: None,
+            tx_bytes: 0,
+            recv_state: StreamRecvState::Open,
+            send_state: StreamSendState::Open,
+            flow: FlowControlState::default(),
+            tcp_local_eof_at_us: None,
+        },
+    );
+    assert!(
+        state
+            .stale_half_closed_tcp_streams(50_000_000, TCP_HALF_CLOSED_MAX_US)
+            .is_empty(),
+        "fully-open streams must not be reaped by the CLOSE-WAIT guard"
+    );
+}
+
+#[test]
+fn stale_half_closed_tcp_selector_respects_deadline() {
+    let (command_tx, _command_rx) = mpsc::unbounded_channel();
+    let data_notify = Arc::new(Notify::new());
+    let acceptor = acceptor::ClientAcceptor::new();
+    let mut state = ClientState::new(command_tx, data_notify, false, acceptor);
+
+    for (stream_id, eof_at) in [(4u64, Some(1_000u64)), (8u64, Some(40_000_000u64)), (12u64, None)] {
+        let (write_tx, _write_rx) = mpsc::unbounded_channel();
+        let (read_abort_tx, _read_abort_rx) = oneshot::channel();
+        state.streams.insert(
+            stream_id,
+            ClientStream {
+                write_tx,
+                read_abort_tx: Some(read_abort_tx),
+                data_rx: None,
+                tx_bytes: 0,
+                recv_state: StreamRecvState::Open,
+                send_state: StreamSendState::FinQueued,
+                flow: FlowControlState::default(),
+                tcp_local_eof_at_us: eof_at,
+            },
+        );
+    }
+
+    let now = 50_000_000u64; // 50s
+    let stale = state.stale_half_closed_tcp_streams(now, TCP_HALF_CLOSED_MAX_US);
+    assert_eq!(
+        stale,
+        vec![4],
+        "only the stream past 45s half-closed window should be stale (eof_at=1ms)"
+    );
+}
+
+#[test]
+fn reap_half_closed_tcp_streams_removes_stale() {
+    let (command_tx, _command_rx) = mpsc::unbounded_channel();
+    let data_notify = Arc::new(Notify::new());
+    let acceptor = acceptor::ClientAcceptor::new();
+    let mut state = ClientState::new(command_tx, data_notify, false, acceptor);
+    let stream_id = 4;
+    let (write_tx, mut write_rx) = mpsc::unbounded_channel();
+    let (read_abort_tx, _read_abort_rx) = oneshot::channel();
+
+    state.streams.insert(
+        stream_id,
+        ClientStream {
+            write_tx,
+            read_abort_tx: Some(read_abort_tx),
+            data_rx: None,
+            tx_bytes: 0,
+            recv_state: StreamRecvState::Open,
+            send_state: StreamSendState::FinQueued,
+            flow: FlowControlState::default(),
+            // Far in the past relative to now below.
+            tcp_local_eof_at_us: Some(1_000),
+        },
+    );
+
+    let now = 50_000_000u64;
+    reap_half_closed_tcp_streams(std::ptr::null_mut(), &mut state as *mut _, now);
+
+    assert!(
+        !state.streams.contains_key(&stream_id),
+        "stale half-closed stream must be removed to release CLOSE-WAIT fd"
+    );
+    assert!(
+        matches!(write_rx.try_recv(), Ok(super::io_tasks::StreamWrite::Fin)),
+        "remove_stream should FIN the local TCP writer"
+    );
 }
