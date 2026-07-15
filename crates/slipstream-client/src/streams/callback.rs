@@ -207,7 +207,23 @@ pub(super) fn handle_stream_data(
 
         if fin {
             if stream.flow.discarding {
-                remove_stream = true;
+                // Inbound (download) FIN while we are discarding inbound data -- either the
+                // issue #60 write-error half-close or the queue-overflow path. The download
+                // direction is now finished (and we are dropping it anyway), but the local peer
+                // may still be UPLOADING, so we must NOT tear the whole stream down here: doing so
+                // would abort the send/upload half that the half-close is specifically meant to
+                // keep alive. Record the FIN as received (we can't and needn't forward it to the
+                // dead/replaced local write channel; setting fin_offset keeps the
+                // recv-FinReceived => fin_offset-Some invariant intact) and let the normal
+                // StreamClosed / StreamWriteDrained path remove the stream once the upload side
+                // also closes. Only remove immediately if the upload is already done.
+                if stream.flow.fin_offset.is_none() {
+                    stream.flow.fin_offset = Some(stream.flow.rx_bytes);
+                }
+                stream.recv_state = StreamRecvState::FinReceived;
+                if stream.send_state.is_closed() {
+                    remove_stream = true;
+                }
             } else {
                 if stream.flow.fin_offset.is_none() {
                     stream.flow.fin_offset = Some(stream.flow.rx_bytes);

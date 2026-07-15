@@ -343,6 +343,28 @@ pub(super) struct ClientStream {
     pub(super) tcp_local_eof_at_us: Option<u64>,
 }
 
+impl ClientStream {
+    /// EPIPE-class local write failure: we can no longer deliver inbound QUIC data to the local
+    /// peer, but the local peer may still be sending data upstream (`send_state` may still be
+    /// `Open`). This is a true half-close, not a full bidi abort (issue #60, STOP_SENDING vs
+    /// RESET_STREAM): mark this stream as discarding future inbound data -- mirroring the
+    /// queue-overflow discarding path in `flow_control::handle_stream_receive`, so subsequent
+    /// inbound QUIC data is silently consumed instead of routed to the now-dead local write
+    /// channel -- and report whether the caller still needs to invoke `picoquic_stop_sending`
+    /// (i.e. it was not already sent).
+    ///
+    /// Pure state mutation with no FFI/unsafe, so it is unit-testable without a live picoquic
+    /// connection (calling `picoquic_stop_sending`/`picoquic_reset_stream` with a null cnx is
+    /// undefined behavior).
+    pub(super) fn mark_write_error_half_closed(&mut self) -> bool {
+        let should_stop_sending = !self.flow.stop_sending_sent;
+        self.flow.discarding = true;
+        self.flow.queued_bytes = 0;
+        self.flow.stop_sending_sent = true;
+        should_stop_sending
+    }
+}
+
 impl HasFlowControlState for ClientStream {
     fn flow_control(&self) -> &FlowControlState {
         &self.flow

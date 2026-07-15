@@ -13,7 +13,8 @@ use slipstream_core::flow_control::{
 use slipstream_core::tcp::{stream_read_limit_chunks, tcp_send_buffer_bytes};
 use slipstream_ffi::picoquic::{
     picoquic_add_to_stream, picoquic_cnx_t, picoquic_current_time,
-    picoquic_get_next_local_stream_id, picoquic_mark_active_stream, picoquic_stream_data_consumed,
+    picoquic_get_next_local_stream_id, picoquic_mark_active_stream, picoquic_stop_sending,
+    picoquic_stream_data_consumed,
 };
 use slipstream_ffi::{abort_stream_bidi, SLIPSTREAM_INTERNAL_ERROR};
 use tokio::sync::{mpsc, oneshot};
@@ -354,7 +355,16 @@ pub(crate) fn handle_command(
             if !command_generation_matches(state, stream_id, generation, "StreamWriteError") {
                 return;
             }
-            if let Some(stream) = state.remove_stream(stream_id) {
+            // Issue #60 (STOP_SENDING vs RESET_STREAM): an EPIPE-class local write failure only
+            // means we can no longer deliver INBOUND (remote->local) data to the local peer. It
+            // does NOT mean the local peer has stopped SENDING upstream, so this is a half-close,
+            // not a full bidi abort. Keep the stream alive (do NOT remove_stream) so the
+            // local->remote upload direction can finish via the normal StreamClosed /
+            // StreamLocalTcpEof path; mark it discarding so further inbound QUIC data is dropped
+            // instead of re-delivered to the dead write channel; and send picoquic_stop_sending
+            // (receiver-side abort) -- NOT picoquic_reset_stream, which would also kill our own
+            // send direction.
+            if let Some(stream) = state.streams.get_mut(&stream_id) {
                 warn!(
                     "stream {}: tcp write error rx_bytes={} tx_bytes={} queued={} consumed_offset={} fin_offset={:?}",
                     stream_id,
@@ -364,10 +374,13 @@ pub(crate) fn handle_command(
                     stream.flow.consumed_offset,
                     stream.flow.fin_offset
                 );
+                if stream.mark_write_error_half_closed() {
+                    unsafe { picoquic_stop_sending(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
+                }
             } else {
                 warn!("stream {}: tcp write error (unknown stream)", stream_id);
             }
-            unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
+            check_stream_invariants(state, stream_id, "StreamWriteError");
         }
         Command::StreamWriteDrained {
             stream_id,

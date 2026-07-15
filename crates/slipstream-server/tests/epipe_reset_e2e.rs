@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use socket2::SockRef;
 use support::{
     ensure_client_bin, log_snapshot, pick_tcp_port, pick_udp_port, server_bin_path,
-    spawn_server_client_ready, spawn_single_target, test_cert_and_key, wait_for_any_log,
-    wait_for_log, workspace_root, ClientArgs, ServerArgs,
+    spawn_server_client_ready, spawn_single_target, test_cert_and_key, wait_for_log,
+    workspace_root, ClientArgs, ServerArgs,
 };
 
 const DOMAIN: &str = "test.example.com";
@@ -181,6 +181,20 @@ fn epipe_triggers_quic_reset() {
         );
     }
 
+    // Issue #60 (STOP_SENDING vs RESET_STREAM half-close): deterministically exercise the local
+    // WRITE-error path rather than racing a read error. First send a clean FIN (Shutdown::Write)
+    // so the client's reader task sees a graceful EOF (Command::StreamLocalTcpEof -- an unrelated,
+    // unchanged path that does NOT abort the stream) instead of ECONNRESET on a pending read. The
+    // client's reader then exits and will not observe the subsequent RST. Only then do we fully
+    // drop the socket with SO_LINGER=0 (forcing an RST): when the client's WRITER later tries to
+    // deliver the delayed response it hits a genuine EPIPE/ECONNRESET write error
+    // (Command::StreamWriteError) against a socket that is already gone.
+    app.shutdown(Shutdown::Write)
+        .expect("half-close app write side (clean FIN)");
+    // No client-side log is emitted on local TCP EOF, so wait a short fixed interval for the
+    // reader task to process the clean EOF before forcing the RST. This is a test-only timing aid,
+    // acceptable here because it is not production code.
+    thread::sleep(Duration::from_millis(300));
     let _ = SockRef::from(&app).set_linger(Some(Duration::from_secs(0)));
     drop(app);
     let _ = app_closed_tx.send(());
@@ -203,22 +217,52 @@ fn epipe_triggers_quic_reset() {
         panic!("target did not attempt response\n{}", snapshot);
     }
 
-    let saw_local_error = wait_for_any_log(
-        &client_logs,
-        &["tcp write error", "tcp read error"],
-        Duration::from_secs(2),
-    );
-    if saw_local_error.is_none() {
+    // Necessary (but on its own NOT sufficient) precondition: the client must take the
+    // WRITE-error path specifically ("tcp write error"), not a read-error abort. NOTE: this exact
+    // log line is emitted by BOTH the old full-bidi-abort code and the new half-close code, so it
+    // only proves the write path was hit -- it does NOT by itself discriminate the fix from a
+    // revert. The discriminating proof is the server-side STOP_SENDING/no-RESET_STREAM assertion
+    // below.
+    if !wait_for_log(&client_logs, "tcp write error", Duration::from_secs(5)) {
         let snapshot = log_snapshot(&client_logs);
-        panic!("expected client tcp read/write error\n{}", snapshot);
-    }
-
-    if !wait_for_log(&server_logs, "reset event=", Duration::from_secs(2)) {
-        let client_snapshot = log_snapshot(&client_logs);
-        let server_snapshot = log_snapshot(&server_logs);
         panic!(
-            "expected server reset event\nclient logs:\n{}\nserver logs:\n{}",
-            client_snapshot, server_snapshot
+            "expected client 'tcp write error' (issue #60 write-error path)\n{}",
+            snapshot
         );
     }
+
+    // Hard, DISCRIMINATING regression proof for issue #60 (STOP_SENDING vs RESET_STREAM). The
+    // half-close fix issues `picoquic_stop_sending` ONLY, so the server observes a `stop_sending`
+    // reset-event and MUST NOT observe a `stream_reset` (RESET_STREAM) reset-event for this
+    // stream. The OLD full-bidi-abort code (`abort_stream_bidi` = STOP_SENDING + RESET_STREAM)
+    // would make the server log a `stream_reset` event, so this pair of checks fails on a revert.
+    //
+    // First wait for positive proof the STOP_SENDING reached the server (this is the fix's own
+    // signal). Absence of this is itself a failure -- unlike the previous version, which demoted
+    // it to a non-failing note and thereby provided no positive evidence at all.
+    if !wait_for_log(
+        &server_logs,
+        "reset event=stop_sending",
+        Duration::from_secs(8),
+    ) {
+        let snapshot = log_snapshot(&server_logs);
+        panic!(
+            "expected server 'reset event=stop_sending' (issue #60 STOP_SENDING half-close reached \
+             the server)\n{}",
+            snapshot
+        );
+    }
+    // The old full abort would additionally emit RESET_STREAM (sent together with STOP_SENDING by
+    // abort_stream_bidi). Give any such frame time to arrive and be logged, then assert the server
+    // never saw a stream_reset for this stream. Under the fix this holds; a revert to
+    // abort_stream_bidi fails here. log_snapshot reads the retained line buffer, so it still sees
+    // every server line even though wait_for_log above drained the channel.
+    thread::sleep(Duration::from_millis(300));
+    let server_snapshot = log_snapshot(&server_logs);
+    assert!(
+        !server_snapshot.contains("reset event=stream_reset"),
+        "issue #60 regression: server observed a RESET_STREAM (full bidi abort) rather than a \
+         STOP_SENDING-only half-close -- the fix has been reverted or broken\nserver logs:\n{}",
+        server_snapshot
+    );
 }

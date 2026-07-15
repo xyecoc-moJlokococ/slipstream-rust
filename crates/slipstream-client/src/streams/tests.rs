@@ -523,3 +523,316 @@ fn reap_half_closed_tcp_streams_removes_stale() {
         "remove_stream should FIN the local TCP writer"
     );
 }
+
+#[test]
+fn write_error_half_close_marks_discarding_and_is_idempotent() {
+    // Issue #60: the pure half-close helper is a state-only mutation (no FFI), so it is
+    // testable without a live picoquic connection.
+    let (write_tx, _write_rx) = mpsc::unbounded_channel();
+    let (read_abort_tx, _read_abort_rx) = oneshot::channel();
+    let (_data_tx, data_rx) = mpsc::channel(1);
+    let mut stream = ClientStream {
+        write_tx,
+        read_abort_tx: Some(read_abort_tx),
+        data_rx: Some(data_rx),
+        tx_bytes: 0,
+        recv_state: StreamRecvState::Open,
+        send_state: StreamSendState::Open,
+        flow: FlowControlState {
+            queued_bytes: 4096,
+            ..FlowControlState::default()
+        },
+        tcp_local_eof_at_us: None,
+    };
+
+    // First write failure: caller must send STOP_SENDING, and the stream flips to discarding
+    // with its inbound queue accounting zeroed.
+    assert!(
+        stream.mark_write_error_half_closed(),
+        "first write-error half-close must request STOP_SENDING"
+    );
+    assert!(stream.flow.discarding, "stream must be marked discarding");
+    assert_eq!(stream.flow.queued_bytes, 0, "queued bytes must be zeroed");
+    assert!(
+        stream.flow.stop_sending_sent,
+        "stop_sending_sent must latch true"
+    );
+    // Half-close must not touch the send side or the local read channel.
+    assert_eq!(
+        stream.send_state,
+        StreamSendState::Open,
+        "half-close must not touch the send side"
+    );
+    assert!(
+        stream.data_rx.is_some(),
+        "half-close must not drop the local read channel"
+    );
+
+    // Idempotent: a second write failure must not re-request STOP_SENDING.
+    assert!(
+        !stream.mark_write_error_half_closed(),
+        "second write-error half-close must not re-request STOP_SENDING"
+    );
+    assert!(stream.flow.discarding);
+    assert_eq!(stream.flow.queued_bytes, 0);
+}
+
+#[test]
+fn stream_write_error_preserves_half_close() {
+    // Issue #60: dispatching StreamWriteError must NOT remove the stream and must leave the
+    // send side / local read channel intact (half-close, not a full bidi abort). We pre-set
+    // stop_sending_sent so the dispatch path's helper returns false and never reaches the
+    // null-cnx picoquic_stop_sending FFI call in this unit test.
+    let (command_tx, _command_rx) = mpsc::unbounded_channel();
+    let data_notify = Arc::new(Notify::new());
+    let acceptor = acceptor::ClientAcceptor::new();
+    let mut state = ClientState::new(command_tx, data_notify, false, acceptor);
+    let stream_id = 4;
+    let (write_tx, _write_rx) = mpsc::unbounded_channel();
+    let (read_abort_tx, _read_abort_rx) = oneshot::channel();
+    let (_data_tx, data_rx) = mpsc::channel(1);
+
+    state.streams.insert(
+        stream_id,
+        ClientStream {
+            write_tx,
+            read_abort_tx: Some(read_abort_tx),
+            data_rx: Some(data_rx),
+            tx_bytes: 0,
+            recv_state: StreamRecvState::Open,
+            send_state: StreamSendState::Open,
+            flow: FlowControlState {
+                queued_bytes: 8192,
+                stop_sending_sent: true,
+                ..FlowControlState::default()
+            },
+            tcp_local_eof_at_us: None,
+        },
+    );
+
+    handle_command(
+        std::ptr::null_mut(),
+        &mut state as *mut _,
+        Command::StreamWriteError {
+            stream_id,
+            generation: 0,
+        },
+    );
+
+    let stream = state
+        .streams
+        .get(&stream_id)
+        .expect("write error must NOT remove the stream (half-close keeps upload alive)");
+    assert_eq!(
+        stream.send_state,
+        StreamSendState::Open,
+        "write error must not touch the send side"
+    );
+    assert!(
+        stream.data_rx.is_some(),
+        "write error must not drop the local read channel"
+    );
+    assert_eq!(stream.recv_state, StreamRecvState::Open);
+    assert!(
+        stream.flow.discarding,
+        "write error must mark the stream discarding"
+    );
+    assert_eq!(
+        stream.flow.queued_bytes, 0,
+        "write error must zero the inbound queue accounting"
+    );
+}
+
+#[test]
+fn stream_write_error_discards_subsequent_inbound_data() {
+    // Issue #60: after the write-error half-close marks the stream discarding, a later inbound
+    // QUIC data event must be silently dropped by the discarding short-circuit in
+    // flow_control::handle_stream_receive -- NOT enqueued to the (now-dead) local write channel,
+    // and NOT resetting/removing the stream (the upload half stays alive).
+    let (command_tx, _command_rx) = mpsc::unbounded_channel();
+    let data_notify = Arc::new(Notify::new());
+    let acceptor = acceptor::ClientAcceptor::new();
+    let mut state = ClientState::new(command_tx, data_notify, false, acceptor);
+    let stream_id = 4;
+    let (write_tx, mut write_rx) = mpsc::unbounded_channel();
+    let (read_abort_tx, _read_abort_rx) = oneshot::channel();
+    let (_data_tx, data_rx) = mpsc::channel(1);
+
+    state.streams.insert(
+        stream_id,
+        ClientStream {
+            write_tx,
+            read_abort_tx: Some(read_abort_tx),
+            data_rx: Some(data_rx),
+            tx_bytes: 0,
+            recv_state: StreamRecvState::Open,
+            send_state: StreamSendState::Open,
+            // consumed_offset pre-set past any inbound bytes so the discarding-branch consume in
+            // handle_stream_receive short-circuits (target <= consumed_offset) and never invokes
+            // picoquic_stream_data_consumed with the null cnx passed below.
+            flow: FlowControlState {
+                consumed_offset: u64::MAX,
+                ..FlowControlState::default()
+            },
+            tcp_local_eof_at_us: None,
+        },
+    );
+
+    // Half-close via the write-error path (call the pure helper directly to set up discarding
+    // without touching the null-cnx FFI).
+    assert!(state
+        .streams
+        .get_mut(&stream_id)
+        .expect("stream present")
+        .mark_write_error_half_closed());
+
+    handle_stream_data(
+        std::ptr::null_mut(),
+        &mut state,
+        stream_id,
+        false,
+        &[1, 2, 3, 4],
+    );
+
+    assert!(
+        state.streams.contains_key(&stream_id),
+        "discarded inbound data must not reset/remove the half-closed stream"
+    );
+    let stream = state.streams.get(&stream_id).expect("stream present");
+    assert!(stream.flow.discarding, "stream must remain discarding");
+    assert_eq!(
+        stream.send_state,
+        StreamSendState::Open,
+        "discarding inbound data must not touch the send side"
+    );
+    assert!(
+        stream.data_rx.is_some(),
+        "discarding inbound data must not drop the local read channel"
+    );
+    assert!(
+        matches!(write_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+        "inbound data must NOT be enqueued to the dead local write channel"
+    );
+}
+
+#[test]
+fn write_error_half_close_survives_inbound_fin() {
+    // Issue #60: after the write-error half-close marks the stream discarding, an inbound
+    // (download) FIN must NOT tear the stream down while the local upload side is still open --
+    // doing so would abort the send/upload half the half-close exists to preserve. The FIN is
+    // recorded (recv_state -> FinReceived, fin_offset set) but the stream stays alive so the
+    // upload can finish later via the normal StreamClosed path. (Before the fix, discarding + FIN
+    // unconditionally removed the stream, so this test fails on a revert.)
+    let (command_tx, _command_rx) = mpsc::unbounded_channel();
+    let data_notify = Arc::new(Notify::new());
+    let acceptor = acceptor::ClientAcceptor::new();
+    let mut state = ClientState::new(command_tx, data_notify, false, acceptor);
+    let stream_id = 4;
+    let (write_tx, mut write_rx) = mpsc::unbounded_channel();
+    let (read_abort_tx, _read_abort_rx) = oneshot::channel();
+    let (_data_tx, data_rx) = mpsc::channel(1);
+
+    state.streams.insert(
+        stream_id,
+        ClientStream {
+            write_tx,
+            read_abort_tx: Some(read_abort_tx),
+            data_rx: Some(data_rx),
+            tx_bytes: 0,
+            recv_state: StreamRecvState::Open,
+            send_state: StreamSendState::Open,
+            // consumed_offset past any inbound bytes so the discarding-branch consume in
+            // handle_stream_receive short-circuits (target <= consumed_offset) and never invokes
+            // picoquic_stream_data_consumed with the null cnx passed below.
+            flow: FlowControlState {
+                consumed_offset: u64::MAX,
+                ..FlowControlState::default()
+            },
+            tcp_local_eof_at_us: None,
+        },
+    );
+
+    assert!(state
+        .streams
+        .get_mut(&stream_id)
+        .expect("stream present")
+        .mark_write_error_half_closed());
+
+    // Inbound data carrying a FIN while discarding, with the upload/send side still open.
+    handle_stream_data(
+        std::ptr::null_mut(),
+        &mut state,
+        stream_id,
+        true,
+        &[1, 2, 3, 4],
+    );
+
+    let stream = state
+        .streams
+        .get(&stream_id)
+        .expect("inbound FIN while discarding must NOT remove a stream whose upload is still open");
+    assert_eq!(
+        stream.send_state,
+        StreamSendState::Open,
+        "upload/send half must stay alive across the inbound FIN"
+    );
+    assert_eq!(
+        stream.recv_state,
+        StreamRecvState::FinReceived,
+        "inbound FIN must be recorded as received"
+    );
+    assert!(
+        stream.flow.fin_offset.is_some(),
+        "recv FinReceived requires fin_offset (invariant)"
+    );
+    assert!(stream.flow.discarding, "stream must remain discarding");
+    assert!(
+        stream.data_rx.is_some(),
+        "inbound FIN must not drop the local read channel while send is open"
+    );
+    assert!(
+        matches!(write_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+        "discarded inbound data/FIN must NOT be forwarded to the dead local write channel"
+    );
+}
+
+#[test]
+fn write_error_half_close_removed_on_inbound_fin_after_upload_closed() {
+    // Issue #60 (complement of the above): once the upload side has already closed (FinQueued),
+    // an inbound FIN while discarding removes the stream -- both directions are now done, so the
+    // immediate teardown is the correct outcome.
+    let (command_tx, _command_rx) = mpsc::unbounded_channel();
+    let data_notify = Arc::new(Notify::new());
+    let acceptor = acceptor::ClientAcceptor::new();
+    let mut state = ClientState::new(command_tx, data_notify, false, acceptor);
+    let stream_id = 4;
+    let (write_tx, _write_rx) = mpsc::unbounded_channel();
+
+    state.streams.insert(
+        stream_id,
+        ClientStream {
+            write_tx,
+            read_abort_tx: None,
+            // send closed => data_rx must be None (invariant).
+            data_rx: None,
+            tx_bytes: 0,
+            recv_state: StreamRecvState::Open,
+            send_state: StreamSendState::FinQueued,
+            flow: FlowControlState {
+                discarding: true,
+                stop_sending_sent: true,
+                consumed_offset: u64::MAX,
+                ..FlowControlState::default()
+            },
+            tcp_local_eof_at_us: Some(1),
+        },
+    );
+
+    // Pure-FIN event (length 0) while discarding and the upload already FinQueued.
+    handle_stream_data(std::ptr::null_mut(), &mut state, stream_id, true, &[]);
+
+    assert!(
+        !state.streams.contains_key(&stream_id),
+        "inbound FIN while discarding must remove the stream once the upload side is closed"
+    );
+}
