@@ -126,6 +126,7 @@ pub struct ServerArgs<'a> {
     pub reset_seed_path: Option<&'a Path>,
     pub fallback_addr: Option<SocketAddr>,
     pub idle_timeout_seconds: Option<u64>,
+    pub max_half_open_connections: Option<u32>,
     pub envs: &'a [(&'a str, &'a str)],
     pub rust_log: &'a str,
     pub capture_logs: bool,
@@ -218,6 +219,10 @@ pub fn spawn_server(args: ServerArgs<'_>) -> (ChildGuard, Option<LogCapture>) {
     if let Some(idle_timeout) = args.idle_timeout_seconds {
         cmd.arg("--idle-timeout-seconds")
             .arg(idle_timeout.to_string());
+    }
+    if let Some(max_half_open) = args.max_half_open_connections {
+        cmd.arg("--max-half-open-connections")
+            .arg(max_half_open.to_string());
     }
     for (key, value) in args.envs {
         cmd.env(key, value);

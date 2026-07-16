@@ -124,6 +124,7 @@ fn epipe_triggers_quic_reset() {
             reset_seed_path: None,
             fallback_addr: None,
             idle_timeout_seconds: None,
+            max_half_open_connections: None,
             envs: &[],
             rust_log: "info",
             capture_logs: true,

@@ -19,7 +19,8 @@ use slipstream_ffi::picoquic::{
     PICOQUIC_MAX_PACKET_SIZE,
 };
 use slipstream_ffi::{
-    configure_quic_with_custom, socket_addr_to_storage, take_crypto_errors, QuicGuard,
+    configure_quic_with_custom, set_server_half_open_retry_threshold, socket_addr_to_storage,
+    take_crypto_errors, QuicGuard,
 };
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -96,6 +97,12 @@ pub struct ServerConfig {
     pub reset_seed_path: Option<String>,
     pub domains: Vec<String>,
     pub max_connections: u32,
+    /// Concurrent half-open (unvalidated) connections tolerated before picoquic starts requiring a
+    /// cheap Retry-token round-trip instead of a full crypto handshake for new connections. Guards
+    /// the single-threaded runtime against handshake-crypto bursts starving the accept loop
+    /// (upstream issues #71/#37). See `--max-half-open-connections` in main.rs for the default's
+    /// rationale.
+    pub max_half_open_connections: u32,
     pub idle_timeout_seconds: u64,
     pub debug_streams: bool,
     pub debug_commands: bool,
@@ -288,6 +295,12 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
             ));
         }
         configure_quic_with_custom(quic, slipstream_server_cc_algorithm, QUIC_MTU);
+        // Server-only: lower picoquic's half-open retry threshold from its default of 64 so the
+        // adaptive Retry-token defense engages at realistic burst sizes on this single-threaded
+        // runtime, instead of letting concurrent full handshakes starve the accept loop
+        // (upstream issues #71/#37). Not applied to the client, which only ever opens one
+        // connection. Configurable via --max-half-open-connections.
+        set_server_half_open_retry_threshold(quic, config.max_half_open_connections);
     }
 
     let udp = Arc::new(bind_udp_socket(&config.dns_listen_host, config.dns_listen_port).await?);

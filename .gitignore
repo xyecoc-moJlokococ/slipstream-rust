@@ -7,7 +7,12 @@
 /.worktrees/
 .idea/
 __pycache__/
+/.picoquic-build-debug/
+.picoquic-build-*
+target-gdb-*
 
 # Rust workspace artifacts
 /target/
 **/*.rs.bk
+
+

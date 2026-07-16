@@ -62,6 +62,7 @@ fn idle_gc_closes_connection() {
         reset_seed_path: None,
         fallback_addr: None,
         idle_timeout_seconds: Some(1),
+        max_half_open_connections: None,
         envs: &[],
         rust_log: "debug",
         capture_logs: true,

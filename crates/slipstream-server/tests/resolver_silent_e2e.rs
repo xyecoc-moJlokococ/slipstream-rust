@@ -55,6 +55,7 @@ fn resolver_silent_detector_resets_and_recovers() {
             reset_seed_path: None,
             fallback_addr: None,
             idle_timeout_seconds: None,
+            max_half_open_connections: None,
             envs: &[],
             rust_log: "info",
             capture_logs: true,

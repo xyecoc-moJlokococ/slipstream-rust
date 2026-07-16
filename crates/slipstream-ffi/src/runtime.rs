@@ -4,7 +4,8 @@ use crate::picoquic::{
     picoquic_reset_stream, picoquic_set_cookie_mode, picoquic_set_default_congestion_algorithm,
     picoquic_set_default_congestion_algorithm_by_name, picoquic_set_default_multipath_option,
     picoquic_set_default_priority, picoquic_set_initial_send_mtu,
-    picoquic_set_key_log_file_from_env, picoquic_set_max_data_control, picoquic_set_mtu_max,
+    picoquic_set_key_log_file_from_env, picoquic_set_max_data_control,
+    picoquic_set_max_half_open_retry_threshold, picoquic_set_mtu_max,
     picoquic_set_preemptive_repeat_policy, picoquic_set_stream_data_consumption_mode,
     picoquic_stop_sending, slipstream_take_stateless_packet_for_cid, SockaddrStorage,
     PICOQUIC_MAX_PACKET_SIZE,
@@ -86,6 +87,27 @@ unsafe fn configure_quic_common(quic: *mut picoquic_quic_t, mtu: u32) {
     picoquic_set_mtu_max(quic, mtu);
     picoquic_set_initial_send_mtu(quic, mtu, mtu);
     picoquic_set_key_log_file_from_env(quic);
+}
+
+/// Lower picoquic's half-open (unvalidated) connection threshold on a **server** QUIC context.
+///
+/// Once the number of concurrent half-open connections reaches `threshold`, picoquic requires a
+/// cheap Retry-token round-trip for new connections instead of running a full, CPU-heavy crypto
+/// handshake for each one (it self-adjusts back down as load drops). picoquic's default threshold
+/// is 64 (`PICOQUIC_DEFAULT_HALF_OPEN_RETRY_THRESHOLD`), which is far too high to help on a
+/// single-threaded server where a small burst of simultaneous handshakes can starve the accept
+/// loop -- see upstream issues #71/#37 ("server unresponsive after a burst of connection
+/// establishment requests").
+///
+/// This is intentionally **not** part of [`configure_quic_common`] (which is shared with the
+/// client). A client only ever initiates one connection, so this knob is meaningless there; wiring
+/// it into the shared helper would needlessly change client behavior. Call this only from the
+/// server, on the server's own QUIC context, right after `configure_quic*` runs.
+///
+/// # Safety
+/// `quic` must be a valid picoquic context returned by `picoquic_create`.
+pub unsafe fn set_server_half_open_retry_threshold(quic: *mut picoquic_quic_t, threshold: u32) {
+    picoquic_set_max_half_open_retry_threshold(quic, threshold);
 }
 
 pub fn take_crypto_errors() -> Vec<String> {
@@ -397,5 +419,61 @@ mod tests {
         let storage = socket_addr_to_storage(addr);
 
         assert_eq!(sockaddr_storage_to_socket_addr(&storage).unwrap(), addr);
+    }
+
+    /// Discriminating regression coverage for #71/#37: prove that
+    /// [`set_server_half_open_retry_threshold`] actually writes the half-open retry threshold onto a
+    /// real picoquic context, rather than the loopback burst e2e test (which reaches "Connection
+    /// ready" for every client regardless of whether the knob was applied, so it passes even if the
+    /// FFI plumbing is a no-op). A fresh context must report picoquic's built-in default; after the
+    /// setter it must report our value.
+    #[test]
+    fn server_half_open_retry_threshold_is_applied_to_context() {
+        use crate::picoquic::{
+            picoquic_create, picoquic_current_time, picoquic_get_max_half_open_retry_threshold,
+        };
+        use std::ffi::CString;
+
+        // ALPN only needs to be a valid C string; this context never runs a handshake.
+        let alpn = CString::new("slipstream-halfopen-test").expect("alpn cstring");
+        // SAFETY: build a minimal context the same way the client does (null cert/key/callbacks),
+        // read/mutate one struct field, then free it via QuicGuard on scope exit.
+        unsafe {
+            let quic = picoquic_create(
+                8,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                alpn.as_ptr(),
+                None,
+                std::ptr::null_mut(),
+                None,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                picoquic_current_time(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+            );
+            assert!(!quic.is_null(), "picoquic_create returned null");
+            let _guard = QuicGuard::new(quic);
+
+            // A fresh context sits at picoquic's built-in default (64). If the FFI binding were
+            // mis-wired or a no-op, the post-set read below would still be this default and the
+            // test would fail -- which is exactly the discrimination the e2e burst test lacks.
+            let before = picoquic_get_max_half_open_retry_threshold(quic);
+            assert_eq!(
+                before, 64,
+                "unexpected picoquic default half-open retry threshold"
+            );
+
+            set_server_half_open_retry_threshold(quic, 4);
+            assert_eq!(
+                picoquic_get_max_half_open_retry_threshold(quic),
+                4,
+                "setter did not apply the half-open retry threshold to the context"
+            );
+        }
     }
 }

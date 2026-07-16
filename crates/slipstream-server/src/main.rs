@@ -44,6 +44,25 @@ struct Args {
     domains: Vec<String>,
     #[arg(long = "max-connections", default_value_t = 256, value_parser = parse_max_connections)]
     max_connections: u32,
+    /// Concurrent half-open (unvalidated) connections tolerated before picoquic starts requiring a
+    /// cheap Retry-token round-trip instead of a full crypto handshake for new connections (an
+    /// adaptive, self-adjusting DoS defense). picoquic's built-in default is 64, which is far too
+    /// high to help on this single-threaded server: a small burst of simultaneous handshakes can
+    /// monopolize the one runtime thread and starve the TCP accept loop, dropping/refusing
+    /// concurrent connection attempts (upstream issues #71/#37).
+    ///
+    /// picoquic starts demanding a Retry for a new initial once `current_number_half_open >=
+    /// threshold` (vendor/picoquic packet.c), so to actually engage at the empirically reproduced
+    /// ~5-concurrent failure point the default must be <= 5. 4 makes the defense kick in on the 5th
+    /// simultaneous handshake (4 already half-open) while still clearing ordinary legitimate
+    /// concurrency -- a couple of users reconnecting at once or a client's multipath resolver-path
+    /// probes (~2-3 connections) -- so those don't pay an extra retry RTT. A default of 8 (or any
+    /// value > 5) would leave the defense inert at exactly the load that triggered the bug. It is
+    /// configurable (CLI --max-half-open-connections or the SIP003 `max-half-open-connections`
+    /// plugin option) so ops can raise it if legitimate concurrency is higher, or lower it further,
+    /// without a rebuild.
+    #[arg(long = "max-half-open-connections", default_value_t = 4, value_parser = parse_max_half_open_connections)]
+    max_half_open_connections: u32,
     #[arg(long = "idle-timeout-seconds", default_value_t = 60)]
     idle_timeout_seconds: u64,
     #[arg(long = "debug-streams")]
@@ -163,6 +182,23 @@ fn main() {
     } else {
         args.max_connections
     };
+    // Threaded through the SIP003 plugin-options path just like max-connections above: under a
+    // SIP003 plugin manager the operator has no CLI, so without this branch the half-open retry
+    // threshold would be stuck at its default in exactly the deployment mode where production
+    // tuning happens (see #71/#37 review).
+    let max_half_open_connections = if cli_provided(&matches, "max_half_open_connections") {
+        args.max_half_open_connections
+    } else if let Some(value) =
+        sip003::last_option_value(&sip003_env.plugin_options, "max-half-open-connections")
+    {
+        unwrap_or_exit(
+            parse_max_half_open_connections(&value),
+            "SIP003 env error",
+            2,
+        )
+    } else {
+        args.max_half_open_connections
+    };
 
     let config = ServerConfig {
         dns_listen_host,
@@ -174,6 +210,7 @@ fn main() {
         reset_seed_path,
         domains,
         max_connections,
+        max_half_open_connections,
         idle_timeout_seconds: args.idle_timeout_seconds,
         debug_streams: args.debug_streams,
         debug_commands: args.debug_commands,
@@ -222,6 +259,20 @@ fn parse_max_connections(input: &str) -> Result<u32, String> {
     Ok(value)
 }
 
+fn parse_max_half_open_connections(input: &str) -> Result<u32, String> {
+    let trimmed = input.trim();
+    let value = trimmed
+        .parse::<u32>()
+        .map_err(|_| format!("Invalid max-half-open-connections value: {}", trimmed))?;
+    // 0 would force a Retry-token round-trip on every single connection (adding an RTT even to the
+    // common isolated-client case), which is what cookie_mode's force-retry bit is for; require at
+    // least 1 so this knob only ever engages once concurrency actually appears.
+    if value == 0 {
+        return Err("max-half-open-connections must be at least 1".to_string());
+    }
+    Ok(value)
+}
+
 fn cli_provided(matches: &clap::ArgMatches, id: &str) -> bool {
     matches.value_source(id) == Some(ValueSource::CommandLine)
 }
@@ -243,4 +294,58 @@ fn parse_domains_from_options(options: &[sip003::Sip003Option]) -> Result<Vec<St
         }
     }
     Ok(domains.unwrap_or_default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The production default for the half-open retry threshold. If this changes, revisit the
+    /// rationale documented on the `--max-half-open-connections` flag in `Args`.
+    const EXPECTED_DEFAULT_MAX_HALF_OPEN: u32 = 4;
+
+    fn parse_args(extra: &[&str]) -> Result<Args, clap::Error> {
+        let mut argv = vec!["slipstream-server"];
+        argv.extend_from_slice(extra);
+        Args::try_parse_from(argv)
+    }
+
+    #[test]
+    fn max_half_open_connections_defaults_to_expected() {
+        let args = parse_args(&[]).expect("defaults parse");
+        assert_eq!(
+            args.max_half_open_connections,
+            EXPECTED_DEFAULT_MAX_HALF_OPEN
+        );
+    }
+
+    #[test]
+    fn max_half_open_connections_flag_overrides_default() {
+        let args = parse_args(&["--max-half-open-connections", "2"]).expect("flag parses");
+        assert_eq!(args.max_half_open_connections, 2);
+    }
+
+    #[test]
+    fn max_half_open_connections_rejects_zero() {
+        let err =
+            parse_args(&["--max-half-open-connections", "0"]).expect_err("zero must be rejected");
+        assert!(
+            err.to_string().contains("at least 1"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn max_half_open_connections_rejects_non_numeric() {
+        assert!(parse_args(&["--max-half-open-connections", "abc"]).is_err());
+    }
+
+    #[test]
+    fn parse_max_half_open_connections_validates_bounds() {
+        assert_eq!(parse_max_half_open_connections("1"), Ok(1));
+        assert_eq!(parse_max_half_open_connections("  16 "), Ok(16));
+        assert!(parse_max_half_open_connections("0").is_err());
+        assert!(parse_max_half_open_connections("nope").is_err());
+    }
 }

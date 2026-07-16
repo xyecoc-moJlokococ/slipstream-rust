@@ -13,8 +13,8 @@
 //! Linux-only (recvmmsg/sendmmsg are Linux syscalls); non-Linux builds keep the plain
 //! per-packet path in `server.rs`.
 
-use slipstream_ffi::{sockaddr_storage_to_socket_addr, socket_addr_to_storage};
 use slipstream_core::net::is_transient_udp_error;
+use slipstream_ffi::{sockaddr_storage_to_socket_addr, socket_addr_to_storage};
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
@@ -162,7 +162,12 @@ pub(crate) async fn send_batch(
         let remaining = &mut msgs[sent..];
         match socket.try_io(Interest::WRITABLE, || {
             let n = unsafe {
-                libc::sendmmsg(fd, remaining.as_mut_ptr(), remaining.len() as libc::c_uint, 0)
+                libc::sendmmsg(
+                    fd,
+                    remaining.as_mut_ptr(),
+                    remaining.len() as libc::c_uint,
+                    0,
+                )
             };
             if n < 0 {
                 Err(io::Error::last_os_error())

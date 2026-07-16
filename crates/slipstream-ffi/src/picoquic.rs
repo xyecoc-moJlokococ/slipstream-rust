@@ -207,6 +207,20 @@ extern "C" {
     pub fn picoquic_free(quic: *mut picoquic_quic_t);
 
     pub fn picoquic_set_cookie_mode(quic: *mut picoquic_quic_t, cookie_mode: c_int);
+    // Adaptive DoS defense: once `current_number_half_open` reaches this threshold, picoquic
+    // requires a cheap Retry-token round-trip instead of a full crypto handshake for new
+    // connections, self-adjusting back down as load drops. C signature (vendor/picoquic/
+    // picoquic/picoquic.h:515, defined quicctx.c:1122):
+    //   void picoquic_set_max_half_open_retry_threshold(picoquic_quic_t*, uint32_t);
+    // Distinct from `picoquic_set_cookie_mode` (a blunter force-retry bit); server-only knob.
+    pub fn picoquic_set_max_half_open_retry_threshold(
+        quic: *mut picoquic_quic_t,
+        max_half_open_before_retry: u32,
+    );
+    // Getter counterpart (picoquic.h:516, defined quicctx.c:1127). Used to assert the setter above
+    // actually applied the threshold to the context (regression coverage for #71/#37); reading a
+    // fresh context also reports picoquic's built-in default.
+    pub fn picoquic_get_max_half_open_retry_threshold(quic: *mut picoquic_quic_t) -> u32;
     pub fn picoquic_set_default_priority(quic: *mut picoquic_quic_t, default_stream_priority: u8);
     pub fn picoquic_set_default_direct_receive_callback(
         quic: *mut picoquic_quic_t,
