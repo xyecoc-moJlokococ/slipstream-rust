@@ -40,6 +40,11 @@ pub struct ClientConfig<'a> {
     pub resolvers: &'a [ResolverSpec],
     pub domain: &'a str,
     pub cert: Option<&'a str>,
+    /// Verify the server's certificate chain against the OS's default CA bundle, like a normal
+    /// HTTPS client (full chain + hostname check, via picotls/OpenSSL) -- as opposed to `cert`
+    /// (pin one exact leaf) or neither (no verification at all). Mutually exclusive with `cert`;
+    /// callers are expected to enforce that (see `slipstream-client`'s CLI).
+    pub verify_system_ca: bool,
     pub congestion_control: Option<&'a str>,
     pub gso: bool,
     pub resolver_transport: ResolverTransport,

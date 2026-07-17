@@ -19,6 +19,7 @@ use crate::pacing::{
     inflight_packet_estimate, sanitize_pacing_gain_probe, MAX_ACTIVE_AUTHORITATIVE_TARGET_INFLIGHT,
 };
 use crate::pinning::configure_pinned_certificate;
+use crate::system_ca::find_system_ca_bundle;
 use crate::streams::{
     acceptor::ClientAcceptor, client_callback, drain_commands, drain_stream_data, handle_command,
     reap_half_closed_tcp_streams, ClientState, Command,
@@ -292,13 +293,22 @@ pub async fn run_client_with_control_and_liveness(
         let mut local_addr_storage =
             socket_addr_to_storage(dns_transport.local_addr().map_err(map_io)?);
 
+        let system_ca_bundle = if config.verify_system_ca {
+            Some(find_system_ca_bundle().map_err(ClientError::new)?)
+        } else {
+            None
+        };
+
         let current_time = unsafe { picoquic_current_time() };
         let quic = unsafe {
             picoquic_create(
                 8,
                 std::ptr::null(),
                 std::ptr::null(),
-                std::ptr::null(),
+                system_ca_bundle
+                    .as_ref()
+                    .map(|cstr| cstr.as_ptr())
+                    .unwrap_or(std::ptr::null()),
                 alpn.as_ptr(),
                 Some(client_callback),
                 state_ptr as *mut _,

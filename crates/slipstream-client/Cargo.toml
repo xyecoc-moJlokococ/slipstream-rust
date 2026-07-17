@@ -16,6 +16,7 @@ clap = { workspace = true }
 jni = "0.21"
 libc = "0.2"
 openssl = "0.10"
+openssl-probe = "0.1"
 socket2 = "0.6"
 slipstream-core = { path = "../slipstream-core" }
 slipstream-dns = { path = "../slipstream-dns" }

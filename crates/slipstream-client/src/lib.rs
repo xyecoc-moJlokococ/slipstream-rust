@@ -7,6 +7,7 @@ mod runtime;
 #[cfg(test)]
 mod stall_shutdown_tests;
 mod streams;
+mod system_ca;
 
 use jni::objects::{JBooleanArray, JIntArray, JObject, JObjectArray, JString};
 use jni::sys::{jdouble, jint, jstring, JNI_VERSION_1_6};
@@ -310,6 +311,7 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeStartSlips
                 gso: gso_enabled,
                 domain: &domain,
                 cert: None,
+                verify_system_ca: false,
                 keep_alive_interval: keep_alive_interval.max(0) as usize,
                 resolver_transport,
                 upstream_encoding: if qname_compatibility_mode {
@@ -499,6 +501,7 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeStartProbe
                 gso: gso_enabled,
                 domain: &domain,
                 cert: None,
+                verify_system_ca: false,
                 keep_alive_interval: keep_alive_interval.max(0) as usize,
                 resolver_transport,
                 upstream_encoding: if qname_compatibility_mode {

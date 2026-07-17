@@ -21,9 +21,13 @@ requires explicit `--cert` and `--key` paths; provide your own cert/key pair
 for real deployments. If the configured cert/key paths do not exist, the
 server auto-generates an ECDSA P-256 self-signed certificate (1000-year
 validity) and writes the key with 0600 permissions. The client can pass
-`--cert` to pin the server leaf certificate (PEM); CA bundles are not
-supported and the PEM must contain a single certificate. If omitted, server
-certificates are not verified.
+`--cert` to pin the server leaf certificate (PEM); the PEM must contain a
+single certificate, and a CA bundle is not accepted there. Alternatively,
+`--verify-system-ca` verifies the server's certificate chain against the
+OS's default CA bundle (full chain + hostname check), like a normal HTTPS
+client -- useful for a server certificate issued by a real CA rather than
+pinned or self-signed. `--cert` and `--verify-system-ca` are mutually
+exclusive. If neither is given, server certificates are not verified.
 
 ## Logging and debug knobs
 

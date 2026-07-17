@@ -165,6 +165,7 @@ fn stop_returns_promptly_when_resolver_goes_silent_under_heavy_backlog() {
                 resolvers: &resolvers,
                 domain: &domain_owned,
                 cert: Some(&cert_str),
+                verify_system_ca: false,
                 congestion_control: None,
                 gso: false,
                 resolver_transport: ResolverTransport::Tcp,

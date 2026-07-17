@@ -5,6 +5,7 @@ mod pinning;
 mod platform;
 mod runtime;
 mod streams;
+mod system_ca;
 
 use clap::{parser::ValueSource, ArgGroup, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use serde::Deserialize;
@@ -62,6 +63,10 @@ struct Args {
     domain: Option<String>,
     #[arg(long = "cert", value_name = "PATH")]
     cert: Option<String>,
+    /// Verify the server's certificate against the OS's default CA bundle (full chain + hostname
+    /// check), like a normal HTTPS client. Mutually exclusive with --cert (leaf pinning).
+    #[arg(long = "verify-system-ca")]
+    verify_system_ca: bool,
     #[arg(long = "keep-alive-interval", short = 't', default_value_t = 400)]
     keep_alive_interval: u16,
     #[arg(long = "debug-poll")]
@@ -236,9 +241,15 @@ fn main() {
     } else {
         sip003::last_option_value(&sip003_env.plugin_options, "cert")
     };
-    if cert.is_none() {
+    if cert.is_some() && args.verify_system_ca {
+        exit_with_message(
+            "--cert (leaf pinning) and --verify-system-ca are mutually exclusive; pick one",
+            2,
+        );
+    }
+    if cert.is_none() && !args.verify_system_ca {
         tracing::warn!(
-            "Server certificate pinning is disabled; this allows MITM. Provide --cert to pin the server leaf, or dismiss this if your underlying tunnel provides authentication."
+            "Server certificate pinning is disabled; this allows MITM. Provide --cert to pin the server leaf, --verify-system-ca to verify against the OS trust store, or dismiss this if your underlying tunnel provides authentication."
         );
     }
 
@@ -261,6 +272,7 @@ fn main() {
         gso: args.gso,
         domain: &domain,
         cert: cert.as_deref(),
+        verify_system_ca: args.verify_system_ca,
         keep_alive_interval: keep_alive_interval as usize,
         resolver_transport,
         upstream_encoding: UpstreamEncoding::from(args.upstream_encoding),
@@ -299,6 +311,7 @@ struct ClientFileConfig {
     gso: Option<bool>,
     domain: Option<String>,
     cert: Option<String>,
+    verify_system_ca: Option<bool>,
     keep_alive_interval: Option<u16>,
     /// "udp" or "tcp".
     resolver_transport: Option<String>,
@@ -407,6 +420,11 @@ fn run_from_config_file(path: &str, args: &Args, matches: &clap::ArgMatches) -> 
     } else {
         file.base64u_encoding.unwrap_or(args.base64u_encoding)
     };
+    let verify_system_ca = if cli_provided(matches, "verify_system_ca") {
+        args.verify_system_ca
+    } else {
+        file.verify_system_ca.unwrap_or(args.verify_system_ca)
+    };
 
     let resolver_transport = if cli_provided(matches, "resolver_transport") {
         ResolverTransport::from(args.resolver_transport)
@@ -450,9 +468,15 @@ fn run_from_config_file(path: &str, args: &Args, matches: &clap::ArgMatches) -> 
     } else {
         file.cert.clone()
     };
-    if cert.is_none() {
+    if cert.is_some() && verify_system_ca {
+        exit_with_message(
+            "cert (leaf pinning) and verify_system_ca are mutually exclusive; pick one",
+            2,
+        );
+    }
+    if cert.is_none() && !verify_system_ca {
         tracing::warn!(
-            "Server certificate pinning is disabled; this allows MITM. Set `cert` (or --cert) to pin the server leaf, or dismiss this if your underlying tunnel provides authentication."
+            "Server certificate pinning is disabled; this allows MITM. Set `cert` (or --cert) to pin the server leaf, `verify_system_ca` (or --verify-system-ca) to verify against the OS trust store, or dismiss this if your underlying tunnel provides authentication."
         );
     }
 
@@ -482,6 +506,7 @@ fn run_from_config_file(path: &str, args: &Args, matches: &clap::ArgMatches) -> 
         gso,
         domain: &domain,
         cert: cert.as_deref(),
+        verify_system_ca,
         keep_alive_interval: keep_alive_interval as usize,
         resolver_transport,
         upstream_encoding,
