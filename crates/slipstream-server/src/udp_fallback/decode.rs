@@ -1,6 +1,6 @@
 use super::{dummy_sockaddr_storage, FallbackManager, PacketContext};
 use crate::server::{ServerError, Slot};
-use slipstream_dns::{decode_query_with_domains_and_qtype, DecodeQueryError};
+use slipstream_dns::{decode_query_with_domains_and_qtype, DataEncoding, DecodeQueryError};
 use slipstream_ffi::picoquic::{
     picoquic_cnx_t, picoquic_incoming_packet_ex, picoquic_quic_t, slipstream_disable_ack_delay,
 };
@@ -106,6 +106,7 @@ fn decode_slot(
                             cnx: std::ptr::null_mut(),
                             path_id: -1,
                             payload_override: Some(payload),
+                            encoding: query.encoding,
                         }));
                     }
                 }
@@ -125,6 +126,7 @@ fn decode_slot(
                 cnx: first_cnx,
                 path_id: first_path,
                 payload_override: None,
+                encoding: query.encoding,
             }))
         }
         Err(DecodeQueryError::Drop) => Ok(DecodeSlotOutcome::Drop),
@@ -150,6 +152,8 @@ fn decode_slot(
                 cnx: std::ptr::null_mut(),
                 path_id: -1,
                 payload_override: None,
+                // No payload will be encoded for an error reply, so the choice here is moot.
+                encoding: DataEncoding::default(),
             }))
         }
     }

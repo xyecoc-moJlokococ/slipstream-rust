@@ -2,11 +2,15 @@ use crate::error::ClientError;
 use slipstream_core::net::{
     bind_first_resolved_with_ipv4_fallback, bind_tcp_listener_addr, bind_udp_socket_addr,
 };
-use slipstream_dns::max_payload_len_for_domain_with_label_len;
+use slipstream_dns::{max_payload_len_for_domain_with_encoding, DataEncoding};
 use tokio::net::{TcpListener as TokioTcpListener, UdpSocket as TokioUdpSocket};
 
-pub(crate) fn compute_mtu(domain: &str, label_len: usize) -> Result<u32, ClientError> {
-    let mtu = max_payload_len_for_domain_with_label_len(domain, label_len)
+pub(crate) fn compute_mtu(
+    domain: &str,
+    label_len: usize,
+    encoding: DataEncoding,
+) -> Result<u32, ClientError> {
+    let mtu = max_payload_len_for_domain_with_encoding(domain, label_len, encoding)
         .map_err(|err| ClientError::new(err.to_string()))? as u32;
     if mtu == 0 {
         return Err(ClientError::new(

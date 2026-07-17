@@ -1,5 +1,5 @@
 use crate::error::ClientError;
-use slipstream_dns::decode_response;
+use slipstream_dns::{decode_response_with_encoding, DataEncoding};
 use slipstream_ffi::picoquic::{
     picoquic_cnx_t, picoquic_current_time, picoquic_incoming_packet_ex, picoquic_quic_t,
 };
@@ -18,6 +18,9 @@ pub(crate) struct DnsResponseContext<'a> {
     pub(crate) resolvers: &'a mut [ResolverState],
     pub(crate) recursive_poll_credit: usize,
     pub(crate) recursive_poll_burst_max: usize,
+    /// Must match whatever encoding this client's own queries used (see
+    /// [`crate::dns::data_encoding`]) so CNAME/MX/SRV answers decode correctly.
+    pub(crate) encoding: DataEncoding,
 }
 
 pub(crate) fn handle_dns_response(
@@ -27,7 +30,7 @@ pub(crate) fn handle_dns_response(
 ) -> Result<(), ClientError> {
     let peer = ctx.peer_addr_mode.canonicalize(peer);
     let response_id = dns_response_id(buf);
-    if let Some(payload) = decode_response(buf) {
+    if let Some(payload) = decode_response_with_encoding(buf, ctx.encoding) {
         let resolver_index = ctx
             .resolvers
             .iter()

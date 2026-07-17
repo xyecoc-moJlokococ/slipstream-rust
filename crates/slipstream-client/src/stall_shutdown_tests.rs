@@ -178,6 +178,7 @@ fn stop_returns_promptly_when_resolver_goes_silent_under_heavy_backlog() {
                 max_poll_qps: 0,
                 debug_poll: false,
                 debug_streams: false,
+                base64u_encoding: false,
             };
             let _ = runtime.block_on(run_client_with_control_and_liveness(
                 &config,

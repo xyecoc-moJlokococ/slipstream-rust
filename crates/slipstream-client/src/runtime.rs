@@ -9,7 +9,7 @@ use self::path::{
 use self::setup::{bind_tcp_listener, bind_udp_socket, compute_mtu, map_io};
 use self::stall::{StallDetector, StallInput, UNPRODUCTIVE_MAX_INFLIGHT};
 use crate::dns::{
-    add_paths, expire_inflight_polls, handle_dns_response, maybe_report_debug,
+    add_paths, data_encoding, expire_inflight_polls, handle_dns_response, maybe_report_debug,
     refresh_resolver_path, resolve_resolvers, resolver_mode_to_c, send_poll_queries,
     sockaddr_storage_to_socket_addr, DnsResponseContext, DnsTransport, PeerAddrMode,
 };
@@ -24,7 +24,7 @@ use crate::streams::{
     reap_half_closed_tcp_streams, ClientState, Command,
 };
 use slipstream_dns::{
-    build_edns_raw_qname, build_qname_with_label_len, encode_query, encode_query_compact,
+    build_edns_raw_qname, build_qname_with_encoding, encode_query, encode_query_compact,
     encode_query_edns_raw, QueryParams, CLASS_IN, EDNS_UDP_PAYLOAD,
 };
 use slipstream_ffi::{
@@ -149,7 +149,7 @@ pub(crate) fn sanitize_dns_tcp_packet_loop_burst(value: usize) -> usize {
 fn compute_transport_mtu(config: &ClientConfig<'_>) -> Result<u32, ClientError> {
     match config.upstream_encoding {
         UpstreamEncoding::Qname => {
-            let max_mtu = compute_mtu(config.domain, config.dns_label_length)?;
+            let max_mtu = compute_mtu(config.domain, config.dns_label_length, data_encoding(config))?;
             if config.qname_mtu == 0 {
                 Ok(max_mtu)
             } else {
@@ -579,6 +579,7 @@ pub async fn run_client_with_control_and_liveness(
                                     resolvers: &mut resolvers,
                                     recursive_poll_credit,
                                     recursive_poll_burst_max,
+                                    encoding: data_encoding(config),
                                 },
                             )?;
                             for _ in 1..packet_loop_recv_max {
@@ -608,6 +609,7 @@ pub async fn run_client_with_control_and_liveness(
                                                 resolvers: &mut resolvers,
                                                 recursive_poll_credit,
                                                 recursive_poll_burst_max,
+                                                encoding: data_encoding(config),
                                             },
                                         )?;
                                     }
@@ -721,10 +723,11 @@ pub async fn run_client_with_control_and_liveness(
 
                 let packet = match config.upstream_encoding {
                     UpstreamEncoding::Qname => {
-                        let qname = build_qname_with_label_len(
+                        let qname = build_qname_with_encoding(
                             &send_buf[..send_length],
                             config.domain,
                             config.dns_label_length,
+                            data_encoding(config),
                         )
                         .map_err(|err| ClientError::new(err.to_string()))?;
                         let params = QueryParams {

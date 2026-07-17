@@ -9,7 +9,7 @@ use slipstream_core::{
     },
     normalize_dual_stack_addr, resolve_host_port, HostPort,
 };
-use slipstream_dns::{encode_response_with_ttl, Question, Rcode, ResponseParams};
+use slipstream_dns::{encode_response_with_ttl, DataEncoding, Question, Rcode, ResponseParams};
 #[cfg(not(target_os = "linux"))]
 use slipstream_ffi::picoquic::PICOQUIC_PACKET_LOOP_RECV_MAX;
 use slipstream_ffi::picoquic::{
@@ -59,6 +59,11 @@ pub(crate) const STREAM_READ_CHUNK_BYTES: usize = 4096;
 pub(crate) const DEFAULT_TCP_RCVBUF_BYTES: usize = 256 * 1024;
 pub(crate) const TARGET_WRITE_COALESCE_DEFAULT_BYTES: usize = 256 * 1024;
 const FLOW_BLOCKED_LOG_INTERVAL_US: u64 = 1_000_000;
+// How long a per-connection last-sent-payload stays eligible for replay. Covers picoquic's own
+// client-side retransmission of an already-answered poll (observed ~215ms apart over a real
+// recursive-resolver relay with under-estimated RTT) without holding onto data long enough to
+// replay it into a later, genuinely-new empty poll.
+const RETRANSMIT_REPLAY_WINDOW: Duration = Duration::from_secs(2);
 
 static SHOULD_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
@@ -176,6 +181,9 @@ pub(crate) struct Slot {
     pub(crate) cnx: *mut picoquic_cnx_t,
     pub(crate) path_id: libc::c_int,
     pub(crate) payload_override: Option<Vec<u8>>,
+    /// Encoding the query used (see [`DataEncoding`]); mirrored back for CNAME/MX/SRV answers so
+    /// the client's own choice round-trips with no server-side coordination.
+    pub(crate) encoding: DataEncoding,
 }
 
 struct TcpDnsRequest {
@@ -362,6 +370,7 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
     let mut recv_buf = vec![0u8; recv_buf_len];
     let mut send_buf = vec![0u8; PICOQUIC_MAX_PACKET_SIZE];
     let mut last_seen = HashMap::new();
+    let mut last_response: HashMap<usize, (Instant, Vec<u8>)> = HashMap::new();
     let mut last_idle_gc = Instant::now();
     let mut last_flow_block_log_at: u64 = 0;
 
@@ -527,6 +536,7 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
                 quic,
                 state_ptr,
                 &mut last_seen,
+                &mut last_response,
                 idle_timeout,
                 &mut last_idle_gc,
                 now,
@@ -611,13 +621,25 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
             }
 
             let payload_override = slot.payload_override.as_deref();
+            let cnx_id = slot.cnx as usize;
             let (payload, rcode) = if let Some(payload) = payload_override {
                 (Some(payload), slot.rcode)
             } else if send_length > 0 {
-                (Some(&send_buf[..send_length]), slot.rcode)
+                let bytes = &send_buf[..send_length];
+                last_response.insert(cnx_id, (Instant::now(), bytes.to_vec()));
+                (Some(bytes), slot.rcode)
             } else if slot.rcode.is_none() {
-                // No QUIC payload ready; still answer the poll with NOERROR and empty payload to clear it.
-                (None, Some(slipstream_dns::Rcode::Ok))
+                // picoquic had nothing new to prepare. Usually a genuinely idle poll, but if this
+                // incoming query was an exact retransmission of one picoquic already answered (it
+                // recognizes the duplicate and queues nothing new), the client is still waiting on
+                // the same data -- replay the last real response instead of clearing the poll with
+                // an empty NOERROR, which would otherwise silently drop the retransmitted query.
+                match last_response.get(&cnx_id) {
+                    Some((sent_at, cached)) if sent_at.elapsed() < RETRANSMIT_REPLAY_WINDOW => {
+                        (Some(cached.as_slice()), Some(slipstream_dns::Rcode::Ok))
+                    }
+                    _ => (None, Some(slipstream_dns::Rcode::Ok)),
+                }
             } else {
                 (None, slot.rcode)
             };
@@ -636,6 +658,7 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
                     question: &slot.question,
                     payload,
                     rcode,
+                    encoding: slot.encoding,
                 },
                 answer_ttl,
             )
@@ -814,6 +837,7 @@ fn maybe_gc_idle_connections(
     quic: *mut picoquic_quic_t,
     state_ptr: *mut ServerState,
     last_seen: &mut HashMap<usize, Instant>,
+    last_response: &mut HashMap<usize, (Instant, Vec<u8>)>,
     idle_timeout: Duration,
     last_gc: &mut Instant,
     now: Instant,
@@ -828,6 +852,7 @@ fn maybe_gc_idle_connections(
     let active = collect_active_connections(quic);
     if active.is_empty() {
         last_seen.clear();
+        last_response.clear();
         *last_gc = now;
         return;
     }
@@ -838,6 +863,7 @@ fn maybe_gc_idle_connections(
     }
 
     let idle = prune_and_collect_idle(last_seen, &active, idle_timeout, now);
+    last_response.retain(|cnx_id, _| active.contains_key(cnx_id));
 
     if idle.is_empty() {
         *last_gc = now;
@@ -859,6 +885,7 @@ fn maybe_gc_idle_connections(
                 picoquic_delete_cnx(cnx);
             }
             last_seen.remove(&cnx_id);
+            last_response.remove(&cnx_id);
         }
     }
     *last_gc = now;

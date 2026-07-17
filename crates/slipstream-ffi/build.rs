@@ -13,8 +13,8 @@ use android::maybe_link_android_builtins;
 use cc::{compile_cc, compile_cc_with_includes, create_archive, resolve_ar, resolve_cc};
 use openssl::resolve_openssl_paths;
 use picoquic::{
-    build_picoquic, locate_picoquic_include_dir, locate_picoquic_lib_dir,
-    locate_picotls_include_dir, resolve_picoquic_libs,
+    build_picoquic, is_picoquic_lib_dir_stale, locate_picoquic_include_dir,
+    locate_picoquic_lib_dir, locate_picotls_include_dir, resolve_picoquic_libs,
 };
 use std::env;
 use std::path::{Path, PathBuf};
@@ -96,6 +96,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut picoquic_include_dir = locate_picoquic_include_dir();
     let mut picoquic_lib_dir = locate_picoquic_lib_dir(is_windows, &target);
     let mut picotls_include_dir = locate_picotls_include_dir();
+
+    // A prebuilt picoquic_lib_dir that predates the current vendor/picoquic
+    // source is worse than a missing one: our own cc/*.c shims always
+    // recompile against the current picoquic_internal.h (see
+    // rerun-if-changed below), so a stale prebuilt library silently links
+    // mismatched struct layouts instead of failing to build. Treat it as
+    // absent so the auto-build path below regenerates it. Auto-discovered
+    // only -- an explicit PICOQUIC_INCLUDE_DIR/PICOQUIC_LIB_DIR pairing is
+    // trusted as-is, since the caller is asserting they already match.
+    if !explicit_picoquic_include_lib {
+        if let (Some(include_dir), Some(lib_dir)) = (&picoquic_include_dir, &picoquic_lib_dir) {
+            if is_picoquic_lib_dir_stale(lib_dir, include_dir) {
+                picoquic_lib_dir = None;
+            }
+        }
+    }
 
     if is_windows
         && auto_build

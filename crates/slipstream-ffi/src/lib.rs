@@ -49,13 +49,20 @@ pub struct ClientConfig<'a> {
     pub dns_tcp_packet_loop_burst: usize,
     pub keep_alive_interval: usize,
     // --- Anti-fingerprinting / DPI-evasion knobs (defaults preserve historical behavior) ---
-    /// DNS query type sent in poll queries (default 16 = TXT). The server must accept the same type
-    /// (`ServerConfig`/`decode_query_with_domains_and_qtype`). NOTE: non-TXT also needs per-type
-    /// answer RDATA encoding on the server, which is not implemented yet — keep 16 until it is.
+    /// DNS query type sent in poll queries (default 16 = TXT). Purely a client choice: the server
+    /// (`decode_query_with_domains_and_qtype`) accepts every type it knows how to answer
+    /// unconditionally, no matching server config needed.
     pub dns_query_type: u16,
     /// Label length (chars) for the encoded subdomain (default 57). Client-only: the server strips
     /// dots before decoding, so this only alters the on-the-wire label-length fingerprint.
     pub dns_label_length: usize,
+    /// Encode the tunnel payload with base64u instead of base32 in DNS query/answer names (default
+    /// false = base32). Purely a client choice: the server detects it per-query via a marker
+    /// prefix (`slipstream_dns::DataEncoding`), no server config needed. ~20% denser than base32,
+    /// but case-sensitive -- only safe once the exact resolver path is confirmed to preserve label
+    /// case end to end (a resolver/cache that normalizes case would silently corrupt the payload
+    /// rather than fail cleanly).
+    pub base64u_encoding: bool,
     /// Optional cap on DNS poll queries per second (0 = unlimited, the default). Trades throughput
     /// for a lower query-rate/volume fingerprint; only engages when set > 0.
     pub max_poll_qps: u32,

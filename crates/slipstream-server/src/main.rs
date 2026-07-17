@@ -79,8 +79,10 @@ struct Args {
     /// If > 0, vary the answer TTL by id%(jitter+1) so it isn't constant (default 0).
     #[arg(long = "response-ttl-jitter", default_value_t = 0)]
     response_ttl_jitter: u32,
-    /// DNS query type the server accepts for tunnel queries (default 16 = TXT). Must match the
-    /// client's --dns-query-type; non-TXT also needs per-type answer encoding (not implemented).
+    /// Extra DNS query type to accept for tunnel queries, beyond the types already supported
+    /// unconditionally (TXT/HTTPS/A/AAAA/CNAME/MX/SRV/NULL -- the client's --dns-query-type just
+    /// needs to be one of those, no server config needed). Only useful for allowing some other,
+    /// not-yet-implemented type without a code change.
     #[arg(long = "accepted-query-type", default_value_t = 16)]
     accepted_query_type: u16,
 }

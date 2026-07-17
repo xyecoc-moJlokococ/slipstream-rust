@@ -1,6 +1,6 @@
 use crate::error::ClientError;
 use slipstream_dns::{
-    build_edns_raw_qname, build_qname_with_label_len, encode_query, encode_query_compact,
+    build_edns_raw_qname, build_qname_with_encoding, encode_query, encode_query_compact,
     encode_query_edns_raw, QueryParams, CLASS_IN,
 };
 use slipstream_ffi::picoquic::{
@@ -91,10 +91,11 @@ pub(crate) async fn send_poll_queries(
         let poll_id = *dns_id;
         let packet = match config.upstream_encoding {
             UpstreamEncoding::Qname => {
-                let qname = build_qname_with_label_len(
+                let qname = build_qname_with_encoding(
                     &send_buf[..send_length],
                     config.domain,
                     config.dns_label_length,
+                    super::data_encoding(config),
                 )
                 .map_err(|err| ClientError::new(err.to_string()))?;
                 let params = QueryParams {

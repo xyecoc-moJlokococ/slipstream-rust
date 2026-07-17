@@ -56,6 +56,10 @@ static DNS_LABEL_LENGTH: AtomicU32 = AtomicU32::new(57);
 /// Optional cap on DNS poll queries per second (0 = unlimited). Purely a client-side pacing choice
 /// with no server-side counterpart. Set from Kotlin via nativeSetMaxPollQps.
 static MAX_POLL_QPS: AtomicU32 = AtomicU32::new(0);
+/// Encode the tunnel payload with base64u instead of base32 (default false). Purely a client
+/// choice, no server config needed -- see slipstream_ffi::ClientConfig::base64u_encoding for the
+/// case-sensitivity caveat. Set from Kotlin via nativeSetBase64uEncoding.
+static BASE64U_ENCODING: AtomicBool = AtomicBool::new(false);
 static LAST_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 // Wait long enough for the client thread to actually finish before giving up and detaching it.
 // A detached thread keeps holding the local listen socket, so the next start fails with EADDRINUSE
@@ -161,6 +165,15 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeSetMaxPoll
     // 0 (or negative) means unlimited.
     let value = if qps > 0 { qps as u32 } else { 0 };
     MAX_POLL_QPS.store(value, Ordering::Relaxed);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeSetBase64uEncoding(
+    _env: JNIEnv<'_>,
+    _this: JObject<'_>,
+    enabled: bool,
+) {
+    BASE64U_ENCODING.store(enabled, Ordering::Relaxed);
 }
 
 #[no_mangle]
@@ -314,6 +327,7 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeStartSlips
                 max_poll_qps: MAX_POLL_QPS.load(Ordering::Relaxed),
                 debug_poll,
                 debug_streams,
+                base64u_encoding: BASE64U_ENCODING.load(Ordering::Relaxed),
             };
             if let Err(err) = runtime.block_on(runtime::run_client_with_control_and_liveness(
                 &config,
@@ -502,6 +516,7 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeStartProbe
                 max_poll_qps: MAX_POLL_QPS.load(Ordering::Relaxed),
                 debug_poll,
                 debug_streams,
+                base64u_encoding: BASE64U_ENCODING.load(Ordering::Relaxed),
             };
             if let Err(err) = runtime.block_on(runtime::run_client_with_control(
                 &config,

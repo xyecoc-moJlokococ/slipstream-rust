@@ -78,8 +78,8 @@ struct Args {
     upstream_encoding: UpstreamEncodingArg,
     #[arg(long = "qname-mtu", default_value_t = 0)]
     qname_mtu: u32,
-    /// DNS query type to send (default 16 = TXT). Server must accept the same type; non-TXT also
-    /// needs per-type answer encoding server-side (not implemented) so keep 16 in production.
+    /// DNS query type to send (default 16 = TXT). Purely a client choice; the server accepts every
+    /// type it knows how to answer unconditionally, no matching server config needed.
     #[arg(long = "dns-query-type", default_value_t = 16)]
     dns_query_type: u16,
     /// Label length (chars, 1..=63) for the encoded subdomain (default 57). Client-only fingerprint knob.
@@ -88,6 +88,11 @@ struct Args {
     /// Cap on DNS poll queries per second (0 = unlimited). Lowers the query-rate fingerprint at the cost of throughput.
     #[arg(long = "max-poll-qps", default_value_t = 0)]
     max_poll_qps: u32,
+    /// Encode the tunnel payload with base64u instead of base32 (default false). ~20% denser, but
+    /// case-sensitive -- only enable once the resolver path is confirmed to preserve label case
+    /// end to end. Purely a client choice, no server config needed.
+    #[arg(long = "base64u-encoding")]
+    base64u_encoding: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -267,6 +272,7 @@ fn main() {
         max_poll_qps: args.max_poll_qps,
         debug_poll: args.debug_poll,
         debug_streams: args.debug_streams,
+        base64u_encoding: args.base64u_encoding,
     };
 
     let runtime = Builder::new_current_thread()
@@ -306,6 +312,7 @@ struct ClientFileConfig {
     max_poll_qps: Option<u32>,
     debug_poll: Option<bool>,
     debug_streams: Option<bool>,
+    base64u_encoding: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -395,6 +402,11 @@ fn run_from_config_file(path: &str, args: &Args, matches: &clap::ArgMatches) -> 
     } else {
         file.debug_streams.unwrap_or(args.debug_streams)
     };
+    let base64u_encoding = if cli_provided(matches, "base64u_encoding") {
+        args.base64u_encoding
+    } else {
+        file.base64u_encoding.unwrap_or(args.base64u_encoding)
+    };
 
     let resolver_transport = if cli_provided(matches, "resolver_transport") {
         ResolverTransport::from(args.resolver_transport)
@@ -481,6 +493,7 @@ fn run_from_config_file(path: &str, args: &Args, matches: &clap::ArgMatches) -> 
         max_poll_qps,
         debug_poll,
         debug_streams,
+        base64u_encoding,
     };
 
     let runtime = Builder::new_current_thread()
