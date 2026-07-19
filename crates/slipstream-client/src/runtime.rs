@@ -411,6 +411,16 @@ pub async fn run_client_with_control_and_liveness(
         // Only used when max_poll_qps > 0; otherwise these stay untouched and impose no limit.
         let mut poll_window_start_us = 0u64;
         let mut poll_window_sent: u32 = 0;
+        // Fixed data-bearing DNS QPS cap (no thrash-adaptive). 0 = unlimited.
+        let mut data_window_start_us = 0u64;
+        let mut data_window_sent: u32 = 0;
+        let mut data_qps_cap = crate::resolve_max_data_qps();
+        if data_qps_cap > 0 {
+            warn!(
+                "data_qps_cap={} — fixed ceiling on data-bearing DNS (empty polls separate)",
+                data_qps_cap
+            );
+        }
 
         loop {
             if shutdown_requested(&mut shutdown_rx) || is_stale() {
@@ -683,6 +693,20 @@ pub async fn run_client_with_control_and_liveness(
                     return Ok(0);
                 }
                 let current_time = unsafe { picoquic_current_time() };
+                if data_window_start_us == 0
+                    || current_time.saturating_sub(data_window_start_us) >= 1_000_000
+                {
+                    data_window_start_us = current_time;
+                    data_window_sent = 0;
+                    let new_cap = crate::resolve_max_data_qps();
+                    if new_cap != data_qps_cap {
+                        warn!("data_qps_cap {} -> {}", data_qps_cap, new_cap);
+                        data_qps_cap = new_cap;
+                    }
+                }
+                if data_qps_cap > 0 && data_window_sent >= data_qps_cap {
+                    break;
+                }
                 let mut send_length: libc::size_t = 0;
                 let mut addr_to: slipstream_ffi::SockaddrStorage = unsafe { std::mem::zeroed() };
                 let mut addr_from: slipstream_ffi::SockaddrStorage = unsafe { std::mem::zeroed() };
@@ -787,6 +811,7 @@ pub async fn run_client_with_control_and_liveness(
                     Ok(()) => {
                         dns_send_bytes_total =
                             dns_send_bytes_total.saturating_add(packet.len() as u64);
+                        data_window_sent = data_window_sent.saturating_add(1);
                     }
                     Err(err) => {
                         if !dns_transport.is_transient_recv_error(&err) {

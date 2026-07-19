@@ -22,10 +22,11 @@ pub(crate) const UNPRODUCTIVE_MAX_INFLIGHT: usize = 8;
 /// responses can carry MAX_STREAM_DATA / ACKs — but we must not use the full active budget
 /// (or max_poll_qps=1400). Moderate inflight keeps window updates flowing without empty-poll
 /// firehose that starves the response path on the single-thread server.
-pub(crate) const FLOW_BLOCKED_MAX_INFLIGHT: usize = 24;
-/// Cap effective max_poll_qps while flow_blocked. Operators set high ceilings (e.g. 1400) for
-/// productive upload; under FC block those queries only amplify req≫resp asymmetry.
-pub(crate) const FLOW_BLOCKED_MAX_POLL_QPS: u32 = 96;
+/// When FC-blocked we need enough polls that responses can carry MAX_STREAM_DATA (live: streams
+/// stuck exactly at 1 MiB until updates arrive). Too low → window never opens; too high → firehose.
+pub(crate) const FLOW_BLOCKED_MAX_INFLIGHT: usize = 64;
+/// Cap effective max_poll_qps while flow_blocked.
+pub(crate) const FLOW_BLOCKED_MAX_POLL_QPS: u32 = 200;
 /// A stream can look "active" indefinitely while genuinely stuck (peer not acking) -- without
 /// this, the loop's sleep-timing stays pinned at the active floor forever, pegging a core at
 /// 100% CPU with zero throughput. This only affects sleep timing, not pacing/reconnection/the

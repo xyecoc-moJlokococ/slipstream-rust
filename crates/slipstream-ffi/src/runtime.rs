@@ -24,11 +24,10 @@ pub const SLIPSTREAM_INTERNAL_ERROR: u64 = 0x101;
 pub const SLIPSTREAM_FILE_CANCEL_ERROR: u64 = 0x105;
 pub const SLIPSTREAM_MAX_DATA_CONTROL_BYTES: u64 = 64 * 1024 * 1024;
 /// Moderate per-stream initial window (stock picoquic is ~64 KiB). Upload stalls on the DNS
-/// carrier when many parallel streams each hit 64 KiB and wait for poll-driven MAX_STREAM_DATA.
-/// 256 KiB is enough for a few Telegram upload chunks without ballooning server RAM the way a
-/// multi-MiB window would under multi-stream load. Applied server-side only (see
-/// [`set_server_stream_data_control`]).
-pub const SLIPSTREAM_MODERATE_STREAM_DATA_BYTES: u64 = 256 * 1024;
+/// carrier when streams hit the ceiling and wait for poll-driven MAX_STREAM_DATA.
+/// 2 MiB covers typical Telegram short videos (~1–2 MB) on a single stream without needing a
+/// window update; multi-stream load stays acceptable on a 1 GB VPS. Applied server-side only.
+pub const SLIPSTREAM_MODERATE_STREAM_DATA_BYTES: u64 = 2 * 1024 * 1024;
 
 extern "C" {
     fn ERR_error_string_n(e: c_ulong, buf: *mut c_char, len: size_t);

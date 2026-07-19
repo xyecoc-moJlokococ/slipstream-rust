@@ -57,6 +57,11 @@ static DNS_LABEL_LENGTH: AtomicU32 = AtomicU32::new(57);
 /// Optional cap on DNS poll queries per second (0 = unlimited). Purely a client-side pacing choice
 /// with no server-side counterpart. Set from Kotlin via nativeSetMaxPollQps.
 static MAX_POLL_QPS: AtomicU32 = AtomicU32::new(0);
+/// Cap on **data-bearing** DNS queries/sec from the QUIC send loop (0 = unlimited).
+/// Keeps multi-stream upload from starving the reverse path (MAX_STREAM_DATA / TLS).
+/// Fixed ceiling only — no thrash-adaptive. Default 1000 (configurable from app).
+pub(crate) const DEFAULT_MAX_DATA_QPS: u32 = 1000;
+static MAX_DATA_QPS: AtomicU32 = AtomicU32::new(DEFAULT_MAX_DATA_QPS);
 /// Encode the tunnel payload with base64u instead of base32 (default false). Purely a client
 /// choice, no server config needed -- see slipstream_ffi::ClientConfig::base64u_encoding for the
 /// case-sensitivity caveat. Set from Kotlin via nativeSetBase64uEncoding.
@@ -166,6 +171,33 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeSetMaxPoll
     // 0 (or negative) means unlimited.
     let value = if qps > 0 { qps as u32 } else { 0 };
     MAX_POLL_QPS.store(value, Ordering::Relaxed);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeSetMaxDataQps(
+    _env: JNIEnv<'_>,
+    _this: JObject<'_>,
+    qps: jint,
+) {
+    let value = if qps > 0 { qps as u32 } else { 0 };
+    MAX_DATA_QPS.store(value, Ordering::Relaxed);
+}
+
+/// Hard ceiling for data-bearing DNS send rate. Optional live override:
+/// `run-as app.vaydns sh -c 'echo N > files/max_data_qps'` (app-readable; not /data/local/tmp).
+pub(crate) fn resolve_max_data_qps() -> u32 {
+    const CANDIDATES: &[&str] = &[
+        "/data/data/app.vaydns/files/max_data_qps",
+        "/data/user/0/app.vaydns/files/max_data_qps",
+    ];
+    for path in CANDIDATES {
+        if let Ok(s) = std::fs::read_to_string(path) {
+            if let Ok(v) = s.trim().parse::<u32>() {
+                return v;
+            }
+        }
+    }
+    MAX_DATA_QPS.load(Ordering::Relaxed)
 }
 
 #[no_mangle]
