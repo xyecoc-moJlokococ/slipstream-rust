@@ -7,8 +7,8 @@ use crate::picoquic::{
     picoquic_set_key_log_file_from_env, picoquic_set_max_data_control,
     picoquic_set_max_half_open_retry_threshold, picoquic_set_mtu_max,
     picoquic_set_preemptive_repeat_policy, picoquic_set_stream_data_consumption_mode,
-    picoquic_stop_sending, slipstream_take_stateless_packet_for_cid, SockaddrStorage,
-    PICOQUIC_MAX_PACKET_SIZE,
+    picoquic_stop_sending, slipstream_set_default_stream_data_control,
+    slipstream_take_stateless_packet_for_cid, SockaddrStorage, PICOQUIC_MAX_PACKET_SIZE,
 };
 use libc::{c_char, c_int, c_ulong, size_t};
 use slipstream_core::tcp::stream_write_buffer_bytes;
@@ -23,6 +23,12 @@ use winapi::shared::ws2ipdef::SOCKADDR_IN6_LH;
 pub const SLIPSTREAM_INTERNAL_ERROR: u64 = 0x101;
 pub const SLIPSTREAM_FILE_CANCEL_ERROR: u64 = 0x105;
 pub const SLIPSTREAM_MAX_DATA_CONTROL_BYTES: u64 = 64 * 1024 * 1024;
+/// Moderate per-stream initial window (stock picoquic is ~64 KiB). Upload stalls on the DNS
+/// carrier when many parallel streams each hit 64 KiB and wait for poll-driven MAX_STREAM_DATA.
+/// 256 KiB is enough for a few Telegram upload chunks without ballooning server RAM the way a
+/// multi-MiB window would under multi-stream load. Applied server-side only (see
+/// [`set_server_stream_data_control`]).
+pub const SLIPSTREAM_MODERATE_STREAM_DATA_BYTES: u64 = 256 * 1024;
 
 extern "C" {
     fn ERR_error_string_n(e: c_ulong, buf: *mut c_char, len: size_t);
@@ -83,10 +89,27 @@ unsafe fn configure_quic_common(quic: *mut picoquic_quic_t, mtu: u32) {
     picoquic_set_stream_data_consumption_mode(quic, 1);
     let max_data = (stream_write_buffer_bytes() as u64).max(SLIPSTREAM_MAX_DATA_CONTROL_BYTES);
     picoquic_set_max_data_control(quic, max_data);
-    // per-stream flow-control raise reverted this session (download-path isolation); stock default.
+    // Per-stream window is NOT raised here (shared with the client). A too-large client-side
+    // receive window can amplify download buffering; the server applies a moderate raise via
+    // [`set_server_stream_data_control`] so peer-initiated upload streams get more than stock 64KiB.
     picoquic_set_mtu_max(quic, mtu);
     picoquic_set_initial_send_mtu(quic, mtu, mtu);
     picoquic_set_key_log_file_from_env(quic);
+}
+
+/// Raise the server's default per-stream flow-control windows to
+/// [`SLIPSTREAM_MODERATE_STREAM_DATA_BYTES`].
+///
+/// Call only on the **server** QUIC context, after `configure_quic*`. This is what lets a peer
+/// (phone) send more than ~64 KiB on each newly opened bidi stream before waiting for a
+/// MAX_STREAM_DATA update — critical on the DNS-poll carrier where those updates only leave the
+/// server in a response to a client poll. Kept off the shared configure path so the client
+/// retains stock defaults (download-path isolation).
+///
+/// # Safety
+/// `quic` must be a valid picoquic context returned by `picoquic_create`.
+pub unsafe fn set_server_stream_data_control(quic: *mut picoquic_quic_t) {
+    slipstream_set_default_stream_data_control(quic, SLIPSTREAM_MODERATE_STREAM_DATA_BYTES);
 }
 
 /// Lower picoquic's half-open (unvalidated) connection threshold on a **server** QUIC context.

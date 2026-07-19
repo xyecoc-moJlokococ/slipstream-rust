@@ -19,8 +19,8 @@ use slipstream_ffi::picoquic::{
     slipstream_server_cc_algorithm, PICOQUIC_MAX_PACKET_SIZE,
 };
 use slipstream_ffi::{
-    configure_quic_with_custom, set_server_half_open_retry_threshold, socket_addr_to_storage,
-    take_crypto_errors, QuicGuard,
+    configure_quic_with_custom, set_server_half_open_retry_threshold, set_server_stream_data_control,
+    socket_addr_to_storage, take_crypto_errors, QuicGuard,
 };
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -303,6 +303,10 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
             ));
         }
         configure_quic_with_custom(quic, slipstream_server_cc_algorithm, QUIC_MTU);
+        // Server-only: raise per-stream initial window above stock ~64 KiB so peer upload streams
+        // (Telegram multi-stream) don't each stall waiting for poll-driven MAX_STREAM_DATA.
+        // Moderate 256 KiB — see SLIPSTREAM_MODERATE_STREAM_DATA_BYTES. Not applied on the client.
+        set_server_stream_data_control(quic);
         // Server-only: lower picoquic's half-open retry threshold from its default of 64 so the
         // adaptive Retry-token defense engages at realistic burst sizes on this single-threaded
         // runtime, instead of letting concurrent full handshakes starve the accept loop

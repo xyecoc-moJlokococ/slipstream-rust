@@ -7,7 +7,10 @@ use self::path::{
     loop_burst_total, path_poll_burst_max,
 };
 use self::setup::{bind_tcp_listener, bind_udp_socket, compute_mtu, map_io};
-use self::stall::{StallDetector, StallInput, UNPRODUCTIVE_MAX_INFLIGHT};
+use self::stall::{
+    StallDetector, StallInput, FLOW_BLOCKED_MAX_INFLIGHT, FLOW_BLOCKED_MAX_POLL_QPS,
+    UNPRODUCTIVE_MAX_INFLIGHT,
+};
 use crate::dns::{
     add_paths, data_encoding, expire_inflight_polls, handle_dns_response, maybe_report_debug,
     refresh_resolver_path, resolve_resolvers, resolver_mode_to_c, send_poll_queries,
@@ -493,16 +496,19 @@ pub async fn run_client_with_control_and_liveness(
                             // Unlock the full inflight budget on active upload too, not just a
                             // recent big download -- previously only an inbound response
                             // >=512B extended high_throughput_until, so a pure-upload burst
-                            // (e.g. Telegram opening many parallel streams) stayed capped at 64
-                            // inflight even though the streams were actively sending, starving
-                            // MAX_STREAM_DATA grants across all of them and stalling the whole
-                            // connection (each stream stuck at exactly its per-stream flow
-                            // control ceiling with flow_blocked=true).
+                            // stayed capped too low. When already flow_blocked, use a moderate
+                            // ceiling (FLOW_BLOCKED_MAX_INFLIGHT): we still need polls so
+                            // responses can deliver MAX_STREAM_DATA/ACKs, but not the full ~384
+                            // active budget that becomes an empty-poll firehose.
+                            let flow_blocked_for_sleep =
+                                unsafe { slipstream_is_flow_blocked(cnx) != 0 };
                             let max_target = if current_time < resolver.high_throughput_until
                                 || has_recent_stream_activity_for_sleep
-                                || rate_limited
+                                || (rate_limited && !flow_blocked_for_sleep)
                             {
                                 MAX_ACTIVE_AUTHORITATIVE_TARGET_INFLIGHT
+                            } else if flow_blocked_for_sleep {
+                                FLOW_BLOCKED_MAX_INFLIGHT
                             } else {
                                 0
                             };
@@ -525,7 +531,9 @@ pub async fn run_client_with_control_and_liveness(
                             // Mirror the demand-driven cap from the send path (using last
                             // iteration's decision) so has_work goes false and the loop idle-sleeps
                             // instead of spinning while the poll flood is capped.
-                            let target = if stall.poll_backoff_active() && !rate_limited {
+                            let target = if flow_blocked_for_sleep {
+                                target.min(FLOW_BLOCKED_MAX_INFLIGHT)
+                            } else if stall.poll_backoff_active() && !rate_limited {
                                 target.min(UNPRODUCTIVE_MAX_INFLIGHT)
                             } else {
                                 target
@@ -535,7 +543,10 @@ pub async fn run_client_with_control_and_liveness(
                             let deficit = target.saturating_sub(
                                 inflight_packets.saturating_add(resolver.inflight_poll_ids.len()),
                             );
-                            if has_recent_stream_activity_for_sleep || rate_limited {
+                            if has_recent_stream_activity_for_sleep
+                                || rate_limited
+                                || flow_blocked_for_sleep
+                            {
                                 deficit
                             } else {
                                 deficit.min(1)
@@ -908,6 +919,8 @@ pub async fn run_client_with_control_and_liveness(
                         // connection deadlocks (observed dead on Megafon). Fully gated on
                         // max_poll_qps>0, so the default (uncapped) path is unchanged.
                         let rate_limited = config.max_poll_qps > 0;
+                        // flow_blocked still allows polls: responses carry MAX_STREAM_DATA/ACKs
+                        // that clear the block. Rate is capped below (not full max_poll_qps).
                         let allow_poll = has_recent_stream_activity
                             || flow_blocked
                             || idle_stream_poll_due
@@ -915,16 +928,17 @@ pub async fn run_client_with_control_and_liveness(
                         let mut poll_deficit = if streams_len > 0 && allow_poll {
                             let quality = fetch_path_quality(cnx, resolver);
                             let snapshot = resolver.last_pacing_snapshot;
-                            // See the matching comment on the sleep-path copy of this check above:
-                            // active upload (or being flow-blocked while streams are open, which is
-                            // exactly the "need more per-stream window" signal) also unlocks the full
-                            // inflight budget, not just a recent big download.
+                            // Active upload / high-throughput unlocks the full budget. When
+                            // already flow_blocked we only need a moderate poll stream so
+                            // MAX_STREAM_DATA/ACKs can return — not the full ~384 inflight
+                            // (that was burning CPU and starving responses under maxPollQps=1400).
                             let max_target = if current_time < resolver.high_throughput_until
                                 || has_recent_stream_activity
-                                || flow_blocked
-                                || (rate_limited && streams_len > 0)
+                                || (rate_limited && streams_len > 0 && !flow_blocked)
                             {
                                 MAX_ACTIVE_AUTHORITATIVE_TARGET_INFLIGHT
+                            } else if flow_blocked {
+                                FLOW_BLOCKED_MAX_INFLIGHT
                             } else {
                                 0
                             };
@@ -947,11 +961,11 @@ pub async fn run_client_with_control_and_liveness(
                             // Demand-driven cap: while no real data is moving, hold in-flight polls
                             // to a small keepalive count instead of the full ~384 the disabled-CC
                             // pacing would otherwise target. Lifts the instant data flows again.
-                            // Skip it in rate-limited mode: the max_poll_qps window is already the
-                            // rate bound, and clamping to the ~8 keepalive floor would stop the
-                            // client from using its full (already-tiny) budget to fetch pending
-                            // downlink -- the exact deadlock that made Megafon unusable.
-                            let pacing_target = if stall.poll_backoff_active() && !rate_limited {
+                            // Skip it in rate-limited mode (except flow_blocked, which has its own
+                            // moderate cap): the max_poll_qps window is the rate bound for Megafon.
+                            let pacing_target = if flow_blocked {
+                                pacing_target.min(FLOW_BLOCKED_MAX_INFLIGHT)
+                            } else if stall.poll_backoff_active() && !rate_limited {
                                 pacing_target.min(UNPRODUCTIVE_MAX_INFLIGHT)
                             } else {
                                 pacing_target
@@ -978,6 +992,8 @@ pub async fn run_client_with_control_and_liveness(
                         }
                         // Optional anti-fingerprinting DNS query-rate cap. Trades throughput for a
                         // lower/steadier query volume. No-op unless config.max_poll_qps > 0.
+                        // When flow_blocked, further cap so e.g. maxPollQps=1400 does not firehose
+                        // empty polls while waiting for MAX_STREAM_DATA.
                         if config.max_poll_qps > 0 && poll_deficit > 0 {
                             if poll_window_start_us == 0
                                 || current_time.saturating_sub(poll_window_start_us) >= 1_000_000
@@ -985,7 +1001,12 @@ pub async fn run_client_with_control_and_liveness(
                                 poll_window_start_us = current_time;
                                 poll_window_sent = 0;
                             }
-                            let budget = (config.max_poll_qps as usize)
+                            let effective_qps = if flow_blocked {
+                                config.max_poll_qps.min(FLOW_BLOCKED_MAX_POLL_QPS)
+                            } else {
+                                config.max_poll_qps
+                            };
+                            let budget = (effective_qps as usize)
                                 .saturating_sub(poll_window_sent as usize);
                             poll_deficit = poll_deficit.min(budget);
                         }

@@ -18,6 +18,14 @@ use tracing::{error, info, warn};
 /// productive transfers.
 pub(crate) const UNPRODUCTIVE_POLL_BACKOFF_US: u64 = 1_000_000;
 pub(crate) const UNPRODUCTIVE_MAX_INFLIGHT: usize = 8;
+/// When peer stream/connection flow control is blocking us we still need DNS polls so the
+/// responses can carry MAX_STREAM_DATA / ACKs — but we must not use the full active budget
+/// (or max_poll_qps=1400). Moderate inflight keeps window updates flowing without empty-poll
+/// firehose that starves the response path on the single-thread server.
+pub(crate) const FLOW_BLOCKED_MAX_INFLIGHT: usize = 24;
+/// Cap effective max_poll_qps while flow_blocked. Operators set high ceilings (e.g. 1400) for
+/// productive upload; under FC block those queries only amplify req≫resp asymmetry.
+pub(crate) const FLOW_BLOCKED_MAX_POLL_QPS: u32 = 96;
 /// A stream can look "active" indefinitely while genuinely stuck (peer not acking) -- without
 /// this, the loop's sleep-timing stays pinned at the active floor forever, pegging a core at
 /// 100% CPU with zero throughput. This only affects sleep timing, not pacing/reconnection/the
