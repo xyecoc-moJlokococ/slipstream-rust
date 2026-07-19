@@ -59,8 +59,11 @@ static DNS_LABEL_LENGTH: AtomicU32 = AtomicU32::new(57);
 static MAX_POLL_QPS: AtomicU32 = AtomicU32::new(0);
 /// Cap on **data-bearing** DNS queries/sec from the QUIC send loop (0 = unlimited).
 /// Keeps multi-stream upload from starving the reverse path (MAX_STREAM_DATA / TLS).
-/// Fixed ceiling only — no thrash-adaptive. Default 1000 (configurable from app).
-pub(crate) const DEFAULT_MAX_DATA_QPS: u32 = 1000;
+/// Fixed ceiling only — no thrash-adaptive.
+/// Default **800** (was 1000): live Spain VPS still saw RcvbufErrors at multi-kQPS peaks; a
+/// slightly lower data firehose improves stream survival (TG video parts were stream_reset
+/// after ~0.7 MiB). App can still raise via maxDataQps / nativeSetMaxDataQps.
+pub(crate) const DEFAULT_MAX_DATA_QPS: u32 = 800;
 static MAX_DATA_QPS: AtomicU32 = AtomicU32::new(DEFAULT_MAX_DATA_QPS);
 /// Encode the tunnel payload with base64u instead of base32 (default false). Purely a client
 /// choice, no server config needed -- see slipstream_ffi::ClientConfig::base64u_encoding for the

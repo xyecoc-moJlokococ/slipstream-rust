@@ -17,22 +17,28 @@ use tracing::{error, info, warn};
 /// target_inflight to UNPRODUCTIVE_MAX_INFLIGHT while idle collapses the flood without touching
 /// productive transfers.
 pub(crate) const UNPRODUCTIVE_POLL_BACKOFF_US: u64 = 1_000_000;
-pub(crate) const UNPRODUCTIVE_MAX_INFLIGHT: usize = 8;
+/// Raised from 8 → 24: under lossy UDP, backoff-at-8 made recovery too slow and Telegram upload
+/// streams were reset after ~0.7 MiB with no downlink ACKs/responses getting through.
+pub(crate) const UNPRODUCTIVE_MAX_INFLIGHT: usize = 24;
 /// When peer stream/connection flow control is blocking us we still need DNS polls so the
 /// responses can carry MAX_STREAM_DATA / ACKs — but we must not use the full active budget
 /// (or max_poll_qps=1400). Moderate inflight keeps window updates flowing without empty-poll
 /// firehose that starves the response path on the single-thread server.
 /// When FC-blocked we need enough polls that responses can carry MAX_STREAM_DATA (live: streams
 /// stuck exactly at 1 MiB until updates arrive). Too low → window never opens; too high → firehose.
-pub(crate) const FLOW_BLOCKED_MAX_INFLIGHT: usize = 64;
-/// Cap effective max_poll_qps while flow_blocked.
-pub(crate) const FLOW_BLOCKED_MAX_POLL_QPS: u32 = 200;
+pub(crate) const FLOW_BLOCKED_MAX_INFLIGHT: usize = 128;
+/// Cap effective max_poll_qps while flow_blocked. Raised 200→400 so multi-stream TG upload can
+/// still pull window updates + DC responses without empty-poll firehose.
+pub(crate) const FLOW_BLOCKED_MAX_POLL_QPS: u32 = 400;
 /// Empty-poll slots kept even while upload has ready stream data. Download (and MAX_STREAM_DATA)
 /// only arrives in DNS *responses*; if we set poll_deficit=0 whenever has_ready_stream, bulk
 /// upload starves downlink completely. This is the download share of the split budget.
-pub(crate) const DOWNLOAD_POLL_KEEPALIVE_INFLIGHT: usize = 48;
+/// Raised 48→96: live TG upload showed stream_reset after ~0.7MB with tx_bytes~100 (almost no
+/// reverse path) — chat stayed fine (small msgs) while video parts kept dying.
+pub(crate) const DOWNLOAD_POLL_KEEPALIVE_INFLIGHT: usize = 96;
 /// Floor on empty-poll QPS reserved for download while streams are open (under max_poll_qps).
-pub(crate) const DOWNLOAD_POLL_RESERVE_QPS: u32 = 250;
+/// Raised 250→400 for the same reverse-path stability reason as DOWNLOAD_POLL_KEEPALIVE_INFLIGHT.
+pub(crate) const DOWNLOAD_POLL_RESERVE_QPS: u32 = 400;
 /// A stream can look "active" indefinitely while genuinely stuck (peer not acking) -- without
 /// this, the loop's sleep-timing stays pinned at the active floor forever, pegging a core at
 /// 100% CPU with zero throughput. This only affects sleep timing, not pacing/reconnection/the

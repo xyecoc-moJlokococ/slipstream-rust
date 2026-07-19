@@ -1,6 +1,6 @@
 use crate::config::{ensure_cert_key, load_or_create_reset_seed, ResetSeed};
 #[cfg(target_os = "linux")]
-use crate::mmsg::{recv_ready, send_batch, RecvMmsgBatch, SendBatchScratch};
+use crate::mmsg::{recv_ready, send_batch, try_recv_once, RecvMmsgBatch, SendBatchScratch};
 use crate::udp_fallback::{handle_packet, FallbackManager, PacketContext, MAX_UDP_PACKET_SIZE};
 use slipstream_core::{
     net::{
@@ -434,6 +434,42 @@ async fn run_server_single(config: &ServerConfig) -> Result<i32, ServerError> {
                             let (data, peer) = recv_batch.datagram(i);
                             handle_packet(&mut slots, data, peer, &context, &mut fallback_mgr)
                                 .await?;
+                        }
+                        // Greedy drain when the batch was full (more packets likely waiting).
+                        if n == recvmmsg_batch {
+                            for _ in 0..8 {
+                                let more = match try_recv_once(&udp, &mut recv_batch) {
+                                    Ok(m) => m,
+                                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                                    Err(err) if is_transient_udp_error(&err) => break,
+                                    Err(err) => return Err(map_io(err)),
+                                };
+                                if more == 0 {
+                                    break;
+                                }
+                                let loop_time = unsafe { picoquic_current_time() };
+                                let context = PacketContext {
+                                    domains: &domains,
+                                    quic,
+                                    current_time: loop_time,
+                                    local_addr_storage: &local_addr_storage,
+                                    accepted_query_type: config.accepted_query_type,
+                                };
+                                for i in 0..more {
+                                    let (data, peer) = recv_batch.datagram(i);
+                                    handle_packet(
+                                        &mut slots,
+                                        data,
+                                        peer,
+                                        &context,
+                                        &mut fallback_mgr,
+                                    )
+                                    .await?;
+                                }
+                                if more < recvmmsg_batch {
+                                    break;
+                                }
+                            }
                         }
                     }
                     Err(err) => {

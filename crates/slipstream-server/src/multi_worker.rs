@@ -34,7 +34,7 @@
 use crate::buf_pool::{BufPool, PooledBuf};
 use crate::config::{ensure_cert_key, load_or_create_reset_seed, ResetSeed};
 #[cfg(target_os = "linux")]
-use crate::mmsg::{recv_ready, send_batch, RecvMmsgBatch, SendBatchScratch};
+use crate::mmsg::{recv_ready, send_batch, try_recv_once, RecvMmsgBatch, SendBatchScratch};
 use crate::server::{
     bind_tcp_listener, bind_udp_socket, map_io, maybe_gc_idle_connections, note_active_connections,
     ServerConfig, ServerError, Slot, DNS_MAX_QUERY_SIZE, FLOW_BLOCKED_LOG_INTERVAL_US,
@@ -366,6 +366,37 @@ async fn run_demux(
                                     None,
                                     &dropped,
                                 );
+                            }
+                            // Greedy drain: full batch ⇒ kernel likely has more. Keep pulling
+                            // without another select sleep (cuts RcvbufErrors under TG upload peaks).
+                            if n == recvmmsg_batch {
+                                for _ in 0..8 {
+                                    let more = match try_recv_once(&udp, &mut recv_batch) {
+                                        Ok(m) => m,
+                                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                                            break;
+                                        }
+                                        Err(err) if is_transient_udp_error(&err) => break,
+                                        Err(err) => return Err(map_io(err)),
+                                    };
+                                    if more == 0 {
+                                        break;
+                                    }
+                                    for i in 0..more {
+                                        let (data, peer) = recv_batch.datagram(i);
+                                        dispatch_packet(
+                                            worker_txs,
+                                            workers,
+                                            buf_pool.copy_from(data),
+                                            peer,
+                                            None,
+                                            &dropped,
+                                        );
+                                    }
+                                    if more < recvmmsg_batch {
+                                        break;
+                                    }
+                                }
                             }
                         }
                         Err(err) => {

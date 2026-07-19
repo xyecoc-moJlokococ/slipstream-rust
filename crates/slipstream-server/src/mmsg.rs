@@ -111,12 +111,17 @@ impl RecvMmsgBatch {
 pub(crate) async fn recv_ready(socket: &UdpSocket, batch: &mut RecvMmsgBatch) -> io::Result<usize> {
     loop {
         socket.readable().await?;
-        match socket.try_io(Interest::READABLE, || batch.recv_once(socket.as_raw_fd())) {
+        match try_recv_once(socket, batch) {
             Ok(n) => return Ok(n),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
             Err(e) => return Err(e),
         }
     }
+}
+
+/// Non-blocking single `recvmmsg` for greedy demux drain (call after a full batch).
+pub(crate) fn try_recv_once(socket: &UdpSocket, batch: &mut RecvMmsgBatch) -> io::Result<usize> {
+    socket.try_io(Interest::READABLE, || batch.recv_once(socket.as_raw_fd()))
 }
 
 /// Reused kernel-message scratch for `sendmmsg` — avoids 3× Vec alloc per send batch under
