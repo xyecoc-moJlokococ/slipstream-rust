@@ -146,14 +146,16 @@ pub fn bind_tcp_listener_addr(addr: SocketAddr) -> Result<TokioTcpListener, Erro
     TokioTcpListener::from_std(std_listener)
 }
 
-/// Default UDP socket buffer size (8 MiB). On a busy DNS-carrier server the single-threaded packet
-/// loop can't always drain the socket before a burst of queries overflows a small kernel-default
-/// receive buffer — those drops become QUIC packet loss → retransmits → *more* datagrams → more CPU.
+/// Default UDP socket buffer size (16 MiB). On a busy DNS-carrier server the packet loop can't
+/// always drain the socket before a burst of queries overflows a small kernel-default receive
+/// buffer — those drops become QUIC packet loss → retransmits → *more* datagrams → more CPU.
+/// Live profiling under video upload saw non-zero RcvbufErrors at ~7–11k pps peaks with 8 MiB;
+/// 16 MiB gives more headroom when `net.core.rmem_max` allows it.
 /// Setting a large SO_RCVBUF/SO_SNDBUF directly on the socket makes this robust regardless of the
 /// system `rmem_default`/`wmem_default` (which a co-located manager's sysctl redeploy can reset).
 /// Override with SLIPSTREAM_UDP_SOCKET_BUFFER_BYTES. The kernel silently caps the effective value at
 /// net.core.rmem_max/wmem_max, so this is a request, not a guarantee.
-const DEFAULT_UDP_SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_UDP_SOCKET_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 
 fn udp_socket_buffer_bytes() -> usize {
     std::env::var("SLIPSTREAM_UDP_SOCKET_BUFFER_BYTES")
@@ -167,6 +169,32 @@ fn tune_udp_socket_buffers(socket: &Socket, addr: SocketAddr) {
     let bytes = udp_socket_buffer_bytes();
     if let Err(err) = socket.set_recv_buffer_size(bytes) {
         tracing::warn!("Failed to set UDP SO_RCVBUF={} on {}: {}", bytes, addr, err);
+    } else {
+        match socket.recv_buffer_size() {
+            Ok(effective) => {
+                // Linux doubles SO_*BUF for bookkeeping; getsockopt returns the doubled figure.
+                #[cfg(target_os = "linux")]
+                let capacity = effective / 2;
+                #[cfg(not(target_os = "linux"))]
+                let capacity = effective;
+                tracing::info!(
+                    "UDP SO_RCVBUF requested={} capacity≈{} (getsockopt={}) on {}",
+                    bytes,
+                    capacity,
+                    effective,
+                    addr
+                );
+                if capacity + 4096 < bytes {
+                    tracing::warn!(
+                        "UDP SO_RCVBUF capacity≈{} < requested {} on {} — raise net.core.rmem_max (RcvbufErrors under load)",
+                        capacity,
+                        bytes,
+                        addr
+                    );
+                }
+            }
+            Err(err) => tracing::debug!("Could not read back SO_RCVBUF on {}: {}", addr, err),
+        }
     }
     if let Err(err) = socket.set_send_buffer_size(bytes) {
         tracing::warn!("Failed to set UDP SO_SNDBUF={} on {}: {}", bytes, addr, err);

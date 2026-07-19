@@ -31,9 +31,10 @@
 //!   CID-sticky routing is a follow-up if multipath matters.
 //! - Demux drops packets when a worker queue is full (DNS is lossy; client retries).
 
+use crate::buf_pool::{BufPool, PooledBuf};
 use crate::config::{ensure_cert_key, load_or_create_reset_seed, ResetSeed};
 #[cfg(target_os = "linux")]
-use crate::mmsg::{recv_ready, send_batch, RecvMmsgBatch};
+use crate::mmsg::{recv_ready, send_batch, RecvMmsgBatch, SendBatchScratch};
 use crate::server::{
     bind_tcp_listener, bind_udp_socket, map_io, maybe_gc_idle_connections, note_active_connections,
     ServerConfig, ServerError, Slot, DNS_MAX_QUERY_SIZE, FLOW_BLOCKED_LOG_INTERVAL_US,
@@ -50,11 +51,11 @@ use crate::udp_fallback::{handle_packet, FallbackManager, PacketContext, MAX_UDP
 use slipstream_core::{
     net::is_transient_udp_error, normalize_dual_stack_addr, resolve_host_port,
 };
-use slipstream_dns::{encode_response_with_ttl, ResponseParams};
+use slipstream_dns::{encode_response_with_ttl_into, ResponseParams};
 #[cfg(not(target_os = "linux"))]
 use slipstream_ffi::picoquic::PICOQUIC_PACKET_LOOP_RECV_MAX;
 use slipstream_ffi::picoquic::{
-    picoquic_create, picoquic_current_time, picoquic_prepare_packet_ex, picoquic_quic_t,
+    picoquic_create, picoquic_current_time, picoquic_prepare_packet_ex,
     slipstream_has_ready_stream, slipstream_is_flow_blocked, slipstream_server_cc_algorithm,
     PICOQUIC_MAX_PACKET_SIZE,
 };
@@ -78,10 +79,15 @@ use tokio::time::sleep;
 /// Per-worker inbound queue depth. DNS is lossy — prefer drop over unbounded RAM growth when a
 /// worker is stuck or overloaded.
 const WORKER_QUEUE_CAP: usize = 8192;
+/// Soft cap on recycled DNS response buffers per worker (encode hot path).
+const RESPONSE_BUF_POOL_CAP: usize = 256;
 
 /// Packet handed from the demux thread to a worker.
+///
+/// `data` is a pooled slab (not a fresh malloc per packet) — live profiling under video
+/// upload showed demux `to_vec` + glibc malloc as a measurable share of CPU.
 struct DemuxPacket {
-    data: Vec<u8>,
+    data: PooledBuf,
     peer: SocketAddr,
     /// Present for DNS-over-TCP requests accepted on the shared listener.
     tcp_response: Option<oneshot::Sender<Vec<u8>>>,
@@ -267,8 +273,19 @@ pub(crate) async fn run_server_multi(config: &ServerConfig) -> Result<i32, Serve
         joins.push(handle);
     }
 
+    let recv_buf_len = if fallback_addr.is_some() {
+        MAX_UDP_PACKET_SIZE
+    } else {
+        DNS_MAX_QUERY_SIZE
+    };
+    let buf_pool = BufPool::new(recv_buf_len);
+    tracing::info!(
+        "multi-worker demux buffer pool slab_cap={} (steady-state path recycles Vec slabs)",
+        recv_buf_len
+    );
+
     let (tcp_dns_tx, mut tcp_dns_rx) = mpsc::unbounded_channel::<DemuxPacket>();
-    tokio::spawn(accept_tcp_dns_demux(tcp, tcp_dns_tx));
+    tokio::spawn(accept_tcp_dns_demux(tcp, tcp_dns_tx, buf_pool.clone()));
 
     let demux_result = run_demux(
         udp,
@@ -277,6 +294,7 @@ pub(crate) async fn run_server_multi(config: &ServerConfig) -> Result<i32, Serve
         workers,
         fallback_addr.is_some(),
         dropped.clone(),
+        buf_pool,
     )
     .await;
 
@@ -302,6 +320,7 @@ async fn run_demux(
     workers: usize,
     fallback_enabled: bool,
     dropped: Arc<AtomicU64>,
+    buf_pool: BufPool,
 ) -> Result<i32, ServerError> {
     let recv_buf_len = if fallback_enabled {
         MAX_UDP_PACKET_SIZE
@@ -342,7 +361,7 @@ async fn run_demux(
                                 dispatch_packet(
                                     worker_txs,
                                     workers,
-                                    data.to_vec(),
+                                    buf_pool.copy_from(data),
                                     peer,
                                     None,
                                     &dropped,
@@ -380,7 +399,7 @@ async fn run_demux(
                             dispatch_packet(
                                 worker_txs,
                                 workers,
-                                recv_buf[..size].to_vec(),
+                                buf_pool.copy_from(&recv_buf[..size]),
                                 peer,
                                 None,
                                 &dropped,
@@ -391,7 +410,7 @@ async fn run_demux(
                                         dispatch_packet(
                                             worker_txs,
                                             workers,
-                                            recv_buf[..size].to_vec(),
+                                            buf_pool.copy_from(&recv_buf[..size]),
                                             peer,
                                             None,
                                             &dropped,
@@ -454,7 +473,7 @@ async fn run_demux(
 fn dispatch_packet(
     worker_txs: &[mpsc::Sender<DemuxPacket>],
     workers: usize,
-    data: Vec<u8>,
+    data: PooledBuf,
     peer: SocketAddr,
     tcp_response: Option<oneshot::Sender<Vec<u8>>>,
     dropped: &AtomicU64,
@@ -469,12 +488,13 @@ fn dispatch_packet(
         Ok(()) => {}
         Err(mpsc::error::TrySendError::Full(packet)) => {
             dropped.fetch_add(1, Ordering::Relaxed);
-            // Best-effort: if this was TCP DNS, close the oneshot (client sees timeout/reset).
+            // Drop returns the slab to BufPool; TCP oneshot closes.
             drop(packet);
         }
-        Err(mpsc::error::TrySendError::Closed(_)) => {
+        Err(mpsc::error::TrySendError::Closed(packet)) => {
             // Worker died; count as drop. Demux will exit on next shutdown check or fatal.
             dropped.fetch_add(1, Ordering::Relaxed);
+            drop(packet);
         }
     }
 }
@@ -482,13 +502,15 @@ fn dispatch_packet(
 async fn accept_tcp_dns_demux(
     listener: tokio::net::TcpListener,
     tx: mpsc::UnboundedSender<DemuxPacket>,
+    buf_pool: BufPool,
 ) {
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 let tx = tx.clone();
+                let buf_pool = buf_pool.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = handle_tcp_dns_connection(stream, peer, tx).await {
+                    if let Err(err) = handle_tcp_dns_connection(stream, peer, tx, buf_pool).await {
                         tracing::debug!("DNS TCP connection {} closed: {}", peer, err);
                     }
                 });
@@ -505,6 +527,7 @@ async fn handle_tcp_dns_connection(
     mut stream: tokio::net::TcpStream,
     peer: SocketAddr,
     tx: mpsc::UnboundedSender<DemuxPacket>,
+    buf_pool: BufPool,
 ) -> Result<(), std::io::Error> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::time::timeout;
@@ -534,8 +557,8 @@ async fn handle_tcp_dns_connection(
             return Ok(());
         }
 
-        let mut packet = vec![0u8; len];
-        stream.read_exact(&mut packet).await?;
+        let mut packet = buf_pool.take(len);
+        stream.read_exact(packet.as_mut_sized(len)).await?;
         let (response_tx, response_rx) = oneshot::channel();
         if tx
             .send(DemuxPacket {
@@ -661,6 +684,10 @@ async fn run_worker(
     let mut last_response: HashMap<usize, (Instant, Vec<u8>)> = HashMap::new();
     let mut last_idle_gc = Instant::now();
     let mut last_flow_block_log_at: u64 = 0;
+    // Recycled DNS answer buffers + sendmmsg scratch (malloc was top-N in live perf).
+    let mut response_free: Vec<Vec<u8>> = Vec::with_capacity(RESPONSE_BUF_POOL_CAP);
+    #[cfg(target_os = "linux")]
+    let mut send_scratch = SendBatchScratch::new();
 
     loop {
         drain_commands(state_ptr, &mut command_rx);
@@ -780,12 +807,14 @@ async fn run_worker(
 
         respond_slots(
             &mut slots,
-            quic,
             state_ptr,
             &udp,
             &mut send_buf,
             &mut last_response,
             &mut last_flow_block_log_at,
+            &mut response_free,
+            #[cfg(target_os = "linux")]
+            &mut send_scratch,
             cfg.response_ttl,
             cfg.response_ttl_jitter,
             cfg.map_ipv4_peers,
@@ -799,12 +828,13 @@ async fn run_worker(
 #[allow(clippy::too_many_arguments)]
 async fn respond_slots(
     slots: &mut [Slot],
-    _quic: *mut picoquic_quic_t,
     state_ptr: *mut ServerState,
     udp: &tokio::net::UdpSocket,
     send_buf: &mut [u8],
     last_response: &mut HashMap<usize, (Instant, Vec<u8>)>,
     last_flow_block_log_at: &mut u64,
+    response_free: &mut Vec<Vec<u8>>,
+    #[cfg(target_os = "linux")] send_scratch: &mut SendBatchScratch,
     response_ttl: u32,
     response_ttl_jitter: u32,
     map_ipv4_peers: bool,
@@ -878,14 +908,25 @@ async fn respond_slots(
             }
         }
 
-        let payload_override = slot.payload_override.as_deref();
         let cnx_id = slot.cnx as usize;
-        let (payload, rcode) = if let Some(payload) = payload_override {
+        // Cache QUIC payload in last_response with clear+extend (no fresh to_vec alloc).
+        if slot.payload_override.is_none() && send_length > 0 {
+            let bytes = &send_buf[..send_length];
+            let entry = last_response
+                .entry(cnx_id)
+                .or_insert_with(|| (Instant::now(), Vec::with_capacity(bytes.len())));
+            entry.0 = Instant::now();
+            entry.1.clear();
+            entry.1.extend_from_slice(bytes);
+        }
+
+        let (payload, rcode) = if let Some(payload) = slot.payload_override.as_deref() {
             (Some(payload), slot.rcode)
         } else if send_length > 0 {
-            let bytes = &send_buf[..send_length];
-            last_response.insert(cnx_id, (Instant::now(), bytes.to_vec()));
-            (Some(bytes), slot.rcode)
+            (
+                last_response.get(&cnx_id).map(|(_, v)| v.as_slice()),
+                slot.rcode,
+            )
         } else if slot.rcode.is_none() {
             match last_response.get(&cnx_id) {
                 Some((sent_at, cached)) if sent_at.elapsed() < RETRANSMIT_REPLAY_WINDOW => {
@@ -901,7 +942,8 @@ async fn respond_slots(
         } else {
             response_ttl
         };
-        let response = encode_response_with_ttl(
+        let mut response = response_free.pop().unwrap_or_else(|| Vec::with_capacity(512));
+        encode_response_with_ttl_into(
             &ResponseParams {
                 id: slot.id,
                 rd: slot.rd,
@@ -912,9 +954,11 @@ async fn respond_slots(
                 encoding: slot.encoding,
             },
             answer_ttl,
+            &mut response,
         )
         .map_err(|err| ServerError::new(err.to_string()))?;
         if let Some(response_tx) = slot.tcp_response.take() {
+            // TCP owns the buffer; do not recycle.
             let _ = response_tx.send(response);
         } else {
             let peer = if map_ipv4_peers {
@@ -933,12 +977,25 @@ async fn respond_slots(
                         return Err(map_io(err));
                     }
                 }
+                if response_free.len() < RESPONSE_BUF_POOL_CAP {
+                    response.clear();
+                    response_free.push(response);
+                }
             }
         }
     }
     #[cfg(target_os = "linux")]
     {
-        send_batch(udp, &mut udp_responses).await.map_err(map_io)?;
+        send_batch(udp, &mut udp_responses, send_scratch)
+            .await
+            .map_err(map_io)?;
+        // Recycle answer buffers after send.
+        for (mut buf, _) in udp_responses.drain(..) {
+            if response_free.len() < RESPONSE_BUF_POOL_CAP && buf.capacity() <= 4096 {
+                buf.clear();
+                response_free.push(buf);
+            }
+        }
     }
     Ok(())
 }

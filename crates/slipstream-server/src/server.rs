@@ -1,6 +1,6 @@
 use crate::config::{ensure_cert_key, load_or_create_reset_seed, ResetSeed};
 #[cfg(target_os = "linux")]
-use crate::mmsg::{recv_ready, send_batch, RecvMmsgBatch};
+use crate::mmsg::{recv_ready, send_batch, RecvMmsgBatch, SendBatchScratch};
 use crate::udp_fallback::{handle_packet, FallbackManager, PacketContext, MAX_UDP_PACKET_SIZE};
 use slipstream_core::{
     net::{
@@ -9,7 +9,9 @@ use slipstream_core::{
     },
     normalize_dual_stack_addr, resolve_host_port, HostPort,
 };
-use slipstream_dns::{encode_response_with_ttl, DataEncoding, Question, Rcode, ResponseParams};
+use slipstream_dns::{
+    encode_response_with_ttl_into, DataEncoding, Question, Rcode, ResponseParams,
+};
 #[cfg(not(target_os = "linux"))]
 use slipstream_ffi::picoquic::PICOQUIC_PACKET_LOOP_RECV_MAX;
 use slipstream_ffi::picoquic::{
@@ -390,6 +392,10 @@ async fn run_server_single(config: &ServerConfig) -> Result<i32, ServerError> {
     let mut last_response: HashMap<usize, (Instant, Vec<u8>)> = HashMap::new();
     let mut last_idle_gc = Instant::now();
     let mut last_flow_block_log_at: u64 = 0;
+    // Recycled DNS answer Vecs + sendmmsg scratch (cuts malloc under multi-kQPS).
+    let mut response_free: Vec<Vec<u8>> = Vec::with_capacity(256);
+    #[cfg(target_os = "linux")]
+    let mut send_scratch = SendBatchScratch::new();
 
     loop {
         drain_commands(state_ptr, &mut command_rx);
@@ -641,20 +647,26 @@ async fn run_server_single(config: &ServerConfig) -> Result<i32, ServerError> {
                 }
             }
 
-            let payload_override = slot.payload_override.as_deref();
             let cnx_id = slot.cnx as usize;
-            let (payload, rcode) = if let Some(payload) = payload_override {
+            if slot.payload_override.is_none() && send_length > 0 {
+                let bytes = &send_buf[..send_length];
+                let entry = last_response
+                    .entry(cnx_id)
+                    .or_insert_with(|| (Instant::now(), Vec::with_capacity(bytes.len())));
+                entry.0 = Instant::now();
+                entry.1.clear();
+                entry.1.extend_from_slice(bytes);
+            }
+            // picoquic had nothing new to prepare → usually idle poll; may need retransmit replay
+            // of last real response (see RETRANSMIT_REPLAY_WINDOW).
+            let (payload, rcode) = if let Some(payload) = slot.payload_override.as_deref() {
                 (Some(payload), slot.rcode)
             } else if send_length > 0 {
-                let bytes = &send_buf[..send_length];
-                last_response.insert(cnx_id, (Instant::now(), bytes.to_vec()));
-                (Some(bytes), slot.rcode)
+                (
+                    last_response.get(&cnx_id).map(|(_, v)| v.as_slice()),
+                    slot.rcode,
+                )
             } else if slot.rcode.is_none() {
-                // picoquic had nothing new to prepare. Usually a genuinely idle poll, but if this
-                // incoming query was an exact retransmission of one picoquic already answered (it
-                // recognizes the duplicate and queues nothing new), the client is still waiting on
-                // the same data -- replay the last real response instead of clearing the poll with
-                // an empty NOERROR, which would otherwise silently drop the retransmitted query.
                 match last_response.get(&cnx_id) {
                     Some((sent_at, cached)) if sent_at.elapsed() < RETRANSMIT_REPLAY_WINDOW => {
                         (Some(cached.as_slice()), Some(slipstream_dns::Rcode::Ok))
@@ -671,7 +683,8 @@ async fn run_server_single(config: &ServerConfig) -> Result<i32, ServerError> {
             } else {
                 config.response_ttl
             };
-            let response = encode_response_with_ttl(
+            let mut response = response_free.pop().unwrap_or_else(|| Vec::with_capacity(512));
+            encode_response_with_ttl_into(
                 &ResponseParams {
                     id: slot.id,
                     rd: slot.rd,
@@ -682,6 +695,7 @@ async fn run_server_single(config: &ServerConfig) -> Result<i32, ServerError> {
                     encoding: slot.encoding,
                 },
                 answer_ttl,
+                &mut response,
             )
             .map_err(|err| ServerError::new(err.to_string()))?;
             if let Some(response_tx) = slot.tcp_response.take() {
@@ -703,12 +717,24 @@ async fn run_server_single(config: &ServerConfig) -> Result<i32, ServerError> {
                             return Err(map_io(err));
                         }
                     }
+                    if response_free.len() < 256 {
+                        response.clear();
+                        response_free.push(response);
+                    }
                 }
             }
         }
         #[cfg(target_os = "linux")]
         {
-            send_batch(&udp, &mut udp_responses).await.map_err(map_io)?;
+            send_batch(&udp, &mut udp_responses, &mut send_scratch)
+                .await
+                .map_err(map_io)?;
+            for (mut buf, _) in udp_responses.drain(..) {
+                if response_free.len() < 256 && buf.capacity() <= 4096 {
+                    buf.clear();
+                    response_free.push(buf);
+                }
+            }
         }
     }
 

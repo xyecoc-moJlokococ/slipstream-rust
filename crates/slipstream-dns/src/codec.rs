@@ -321,6 +321,19 @@ pub fn encode_response_with_ttl(
     answer_ttl: u32,
 ) -> Result<Vec<u8>, DnsError> {
     let payload_len = params.payload.map(|payload| payload.len()).unwrap_or(0);
+    let mut out = Vec::with_capacity(256 + payload_len * 2);
+    encode_response_with_ttl_into(params, answer_ttl, &mut out)?;
+    Ok(out)
+}
+
+/// Like [`encode_response_with_ttl`], but reuses `out`'s allocation (clears first).
+/// Hot path on the DNS-tunnel server under multi-kQPS load — avoids a malloc per reply.
+pub fn encode_response_with_ttl_into(
+    params: &ResponseParams<'_>,
+    answer_ttl: u32,
+    out: &mut Vec<u8>,
+) -> Result<(), DnsError> {
+    let payload_len = params.payload.map(|payload| payload.len()).unwrap_or(0);
     let payload = params.payload.unwrap_or(&[]);
     let per_record = max_bytes_per_record(params.question.qtype, params.encoding);
 
@@ -344,7 +357,11 @@ pub fn encode_response_with_ttl(
         rcode = params.rcode.unwrap_or(Rcode::Ok);
     }
 
-    let mut out = Vec::with_capacity(256 + payload_len * 2);
+    out.clear();
+    let need = 256 + payload_len * 2;
+    if out.capacity() < need {
+        out.reserve(need - out.capacity());
+    }
     let mut flags = 0x8000 | 0x0400;
     if params.rd {
         flags |= 0x0100;
@@ -354,16 +371,16 @@ pub fn encode_response_with_ttl(
     }
     flags |= rcode.to_u8() as u16;
 
-    write_u16(&mut out, params.id);
-    write_u16(&mut out, flags);
-    write_u16(&mut out, 1);
-    write_u16(&mut out, ancount);
-    write_u16(&mut out, 0);
-    write_u16(&mut out, 1);
+    write_u16(out, params.id);
+    write_u16(out, flags);
+    write_u16(out, 1);
+    write_u16(out, ancount);
+    write_u16(out, 0);
+    write_u16(out, 1);
 
-    encode_name(&params.question.name, &mut out)?;
-    write_u16(&mut out, params.question.qtype);
-    write_u16(&mut out, params.question.qclass);
+    encode_name(&params.question.name, out)?;
+    write_u16(out, params.question.qtype);
+    write_u16(out, params.question.qclass);
 
     let chunk_size = per_record.unwrap_or(payload_len);
     let mut cursor = 0usize;
@@ -374,15 +391,15 @@ pub fn encode_response_with_ttl(
         cursor += this_chunk;
 
         out.extend_from_slice(&[0xC0, 0x0C]);
-        write_u16(&mut out, params.question.qtype);
-        write_u16(&mut out, params.question.qclass);
-        write_u32(&mut out, answer_ttl);
-        encode_answer_rdata(params.question.qtype, chunk, params.encoding, &mut out)?;
+        write_u16(out, params.question.qtype);
+        write_u16(out, params.question.qclass);
+        write_u32(out, answer_ttl);
+        encode_answer_rdata(params.question.qtype, chunk, params.encoding, out)?;
     }
 
-    encode_opt_record(&mut out)?;
+    encode_opt_record(out)?;
 
-    Ok(out)
+    Ok(())
 }
 
 /// Encode one answer record's RDATA (length-prefixed) for `chunk` of the tunnel payload, per

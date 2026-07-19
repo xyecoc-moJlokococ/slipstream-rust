@@ -1,3 +1,4 @@
+mod buf_pool;
 mod config;
 #[cfg(target_os = "linux")]
 mod mmsg;

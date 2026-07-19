@@ -119,6 +119,57 @@ pub(crate) async fn recv_ready(socket: &UdpSocket, batch: &mut RecvMmsgBatch) ->
     }
 }
 
+/// Reused kernel-message scratch for `sendmmsg` — avoids 3× Vec alloc per send batch under
+/// multi-kQPS load (visible as malloc/free in live perf).
+pub(crate) struct SendBatchScratch {
+    names: Vec<libc::sockaddr_storage>,
+    iovecs: Vec<libc::iovec>,
+    msgs: Vec<libc::mmsghdr>,
+}
+
+// SAFETY: pointers in iovecs/msgs only reference entries/names owned by the caller for the
+// duration of `send_batch`; scratch itself is never shared across threads.
+unsafe impl Send for SendBatchScratch {}
+
+impl SendBatchScratch {
+    pub(crate) fn new() -> Self {
+        Self {
+            names: Vec::with_capacity(64),
+            iovecs: Vec::with_capacity(64),
+            msgs: Vec::with_capacity(64),
+        }
+    }
+
+    fn prepare(&mut self, entries: &mut [(Vec<u8>, SocketAddr)]) {
+        let n = entries.len();
+        self.names.clear();
+        self.iovecs.clear();
+        self.msgs.clear();
+        self.names.reserve(n);
+        self.iovecs.reserve(n);
+        self.msgs.reserve(n);
+        for (buf, addr) in entries.iter_mut() {
+            self.names.push(socket_addr_to_storage(*addr));
+            self.iovecs.push(libc::iovec {
+                iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+                iov_len: buf.len(),
+            });
+        }
+        // Second pass: msgs need stable pointers into names/iovecs.
+        for i in 0..n {
+            let mut msg_hdr: libc::msghdr = unsafe { std::mem::zeroed() };
+            msg_hdr.msg_name = &self.names[i] as *const libc::sockaddr_storage as *mut libc::c_void;
+            msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            msg_hdr.msg_iov = &mut self.iovecs[i] as *mut libc::iovec;
+            msg_hdr.msg_iovlen = 1;
+            self.msgs.push(libc::mmsghdr {
+                msg_hdr,
+                msg_len: 0,
+            });
+        }
+    }
+}
+
 /// Sends every `(datagram, destination)` pair in one or more batched `sendmmsg` calls.
 /// A destination-specific transient failure (e.g. a rejected/unreachable send) only
 /// drops that one datagram — matches the old per-datagram `send_to` error handling,
@@ -126,40 +177,18 @@ pub(crate) async fn recv_ready(socket: &UdpSocket, batch: &mut RecvMmsgBatch) ->
 pub(crate) async fn send_batch(
     socket: &UdpSocket,
     entries: &mut [(Vec<u8>, SocketAddr)],
+    scratch: &mut SendBatchScratch,
 ) -> io::Result<()> {
     if entries.is_empty() {
         return Ok(());
     }
-    let names: Vec<libc::sockaddr_storage> = entries
-        .iter()
-        .map(|(_, addr)| socket_addr_to_storage(*addr))
-        .collect();
-    let mut iovecs: Vec<libc::iovec> = entries
-        .iter_mut()
-        .map(|(buf, _)| libc::iovec {
-            iov_base: buf.as_mut_ptr() as *mut libc::c_void,
-            iov_len: buf.len(),
-        })
-        .collect();
-    let mut msgs: Vec<libc::mmsghdr> = (0..entries.len())
-        .map(|i| {
-            let mut msg_hdr: libc::msghdr = unsafe { std::mem::zeroed() };
-            msg_hdr.msg_name = &names[i] as *const libc::sockaddr_storage as *mut libc::c_void;
-            msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-            msg_hdr.msg_iov = &mut iovecs[i] as *mut libc::iovec;
-            msg_hdr.msg_iovlen = 1;
-            libc::mmsghdr {
-                msg_hdr,
-                msg_len: 0,
-            }
-        })
-        .collect();
+    scratch.prepare(entries);
 
     let fd = socket.as_raw_fd();
     let mut sent = 0usize;
-    while sent < msgs.len() {
+    while sent < scratch.msgs.len() {
         socket.writable().await?;
-        let remaining = &mut msgs[sent..];
+        let remaining = &mut scratch.msgs[sent..];
         match socket.try_io(Interest::WRITABLE, || {
             let n = unsafe {
                 libc::sendmmsg(

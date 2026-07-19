@@ -12,7 +12,7 @@ pub use codec::{
     build_edns_raw_qname, decode_query, decode_query_with_domains,
     decode_query_with_domains_and_qtype, decode_response, decode_response_with_encoding,
     encode_query, encode_query_compact, encode_query_edns_raw, encode_response,
-    encode_response_with_ttl, is_response, DEFAULT_RESPONSE_TTL,
+    encode_response_with_ttl, encode_response_with_ttl_into, is_response, DEFAULT_RESPONSE_TTL,
 };
 pub use dots::{dotify, dotify_with_label_len, undotify, DEFAULT_LABEL_LEN};
 use types::BASE64U_MARKER;

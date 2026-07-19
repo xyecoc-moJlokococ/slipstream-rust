@@ -65,6 +65,8 @@ exclusive. If neither is given, server certificates are not verified.
   Values `>1` enable **userspace demux by source IP** (port ignored): one master
   thread receives UDP with recvmmsg and routes each datagram to
   `hash(src_ip) % N`. Replies are sent from workers on the shared bound socket.
+  Demux copies into a **recycled buffer pool** (no `malloc` per packet in steady
+  state); workers recycle DNS answer buffers and reuse sendmmsg scratch.
 
   Why not SO_REUSEPORT alone? Resolver/client source-port spray makes the kernel
   4-tuple hash split one logical client across sockets and would break QUIC.
@@ -74,6 +76,9 @@ exclusive. If neither is given, server certificates are not verified.
   through several recursive resolvers (different source IPs) may land on more
   than one worker. If a worker queue is full (8192), demux drops the packet
   (DNS is lossy) and logs a periodic warning.
+- `SLIPSTREAM_UDP_SOCKET_BUFFER_BYTES` (default: 16 MiB)
+  Requested SO_RCVBUF/SO_SNDBUF. Raise `net.core.rmem_max`/`wmem_max` at least as
+  high (deploy sets 32 MiB) or the kernel will cap the effective size.
 
 ## picoquic build environment
 
