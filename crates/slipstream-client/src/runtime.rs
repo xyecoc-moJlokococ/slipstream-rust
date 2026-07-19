@@ -492,35 +492,31 @@ pub async fn run_client_with_control_and_liveness(
                 }
                 let pending_for_sleep = match resolver.mode {
                     ResolverMode::Authoritative => {
-                        // See the send-path copy: in rate-limited mode (max_poll_qps>0) keep the
-                        // loop awake and polling at the budget whenever streams are open, so streams
-                        // awaiting downlink don't fall to the idle 1-poll/2s path and deadlock.
-                        let rate_limited = config.max_poll_qps > 0;
+                        // Demand-driven polls only. (Old Megafon path forced steady max_poll_qps
+                        // whenever any stream was open and disabled poll_backoff — that idle-firehosed
+                        // the server at ~1–4k qps with Telegram open. Megafon ~50 qps is unusable
+                        // for Slipstream anyway.)
                         if ready
                             && streams_len_for_sleep > 0
                             && (has_recent_stream_activity_for_sleep
                                 || idle_stream_poll_due_for_sleep
-                                || rate_limited)
+                                || unsafe { slipstream_is_flow_blocked(cnx) != 0 })
                         {
                             let quality = fetch_path_quality(cnx, resolver);
-                            // Unlock the full inflight budget on active upload too, not just a
-                            // recent big download -- previously only an inbound response
-                            // >=512B extended high_throughput_until, so a pure-upload burst
-                            // stayed capped too low. When already flow_blocked, use a moderate
-                            // ceiling (FLOW_BLOCKED_MAX_INFLIGHT): we still need polls so
-                            // responses can deliver MAX_STREAM_DATA/ACKs, but not the full ~384
-                            // active budget that becomes an empty-poll firehose.
                             let flow_blocked_for_sleep =
                                 unsafe { slipstream_is_flow_blocked(cnx) != 0 };
+                            // Full ~384 only on real activity / high-throughput, not because
+                            // max_poll_qps is set.
                             let max_target = if current_time < resolver.high_throughput_until
                                 || has_recent_stream_activity_for_sleep
-                                || (rate_limited && !flow_blocked_for_sleep)
                             {
                                 MAX_ACTIVE_AUTHORITATIVE_TARGET_INFLIGHT
                             } else if flow_blocked_for_sleep {
                                 FLOW_BLOCKED_MAX_INFLIGHT
                             } else {
-                                0
+                                // Streams open but quiet (e.g. TG idle): modest target; backoff may
+                                // shrink further to UNPRODUCTIVE_MAX_INFLIGHT (8).
+                                64
                             };
                             let snapshot = resolver.pacing_budget.as_mut().map(|budget| {
                                 if max_target > 0 {
@@ -538,12 +534,10 @@ pub async fn run_client_with_control_and_liveness(
                                         mtu,
                                     )
                                 });
-                            // Mirror the demand-driven cap from the send path (using last
-                            // iteration's decision) so has_work goes false and the loop idle-sleeps
-                            // instead of spinning while the poll flood is capped.
+                            // Always apply poll_backoff when unproductive (including max_poll_qps>0).
                             let target = if flow_blocked_for_sleep {
                                 target.min(FLOW_BLOCKED_MAX_INFLIGHT)
-                            } else if stall.poll_backoff_active() && !rate_limited {
+                            } else if stall.poll_backoff_active() {
                                 target.min(UNPRODUCTIVE_MAX_INFLIGHT)
                             } else {
                                 target
@@ -553,10 +547,7 @@ pub async fn run_client_with_control_and_liveness(
                             let deficit = target.saturating_sub(
                                 inflight_packets.saturating_add(resolver.inflight_poll_ids.len()),
                             );
-                            if has_recent_stream_activity_for_sleep
-                                || rate_limited
-                                || flow_blocked_for_sleep
-                            {
+                            if has_recent_stream_activity_for_sleep || flow_blocked_for_sleep {
                                 deficit
                             } else {
                                 deficit.min(1)
@@ -935,37 +926,28 @@ pub async fn run_client_with_control_and_liveness(
                 match resolver.mode {
                     ResolverMode::Authoritative => {
                         let mut quality_for_log = None;
-                        // Rate-limited mode (config.max_poll_qps > 0): the operator hard-limits DNS
-                        // queries/sec (e.g. Megafon ~50 q/s per client), so the max_poll_qps window
-                        // cap below is the real rate bound. In that mode, poll STEADILY at the budget
-                        // whenever streams are open -- including streams only awaiting DOWNLINK (a TLS
-                        // ServerHello / HTTP response) with no recent upload enqueue. Otherwise those
-                        // fall to the idle 1-poll/2s path, never fetch their downlink, and the
-                        // connection deadlocks (observed dead on Megafon). Fully gated on
-                        // max_poll_qps>0, so the default (uncapped) path is unchanged.
-                        let rate_limited = config.max_poll_qps > 0;
-                        // flow_blocked still allows polls: responses carry MAX_STREAM_DATA/ACKs
-                        // that clear the block. Rate is capped below (not full max_poll_qps).
+                        // Demand-driven polls. max_poll_qps is only a hard ceiling on empty polls
+                        // (anti-fingerprint / operator courtesy) — NOT a "always send this many"
+                        // target. (Megafon steady-poll-at-cap was removed: ~50 qps resolvers are
+                        // unusable for Slipstream; the path caused idle TG to hold ~1–4k qps.)
                         let allow_poll = has_recent_stream_activity
                             || flow_blocked
                             || idle_stream_poll_due
-                            || (rate_limited && streams_len > 0);
+                            || streams_len > 0;
                         let mut poll_deficit = if streams_len > 0 && allow_poll {
                             let quality = fetch_path_quality(cnx, resolver);
                             let snapshot = resolver.last_pacing_snapshot;
-                            // Active upload / high-throughput unlocks the full budget. When
-                            // already flow_blocked we only need a moderate poll stream so
-                            // MAX_STREAM_DATA/ACKs can return — not the full ~384 inflight
-                            // (that was burning CPU and starving responses under maxPollQps=1400).
+                            // Full ~384 only on real activity / high-throughput.
                             let max_target = if current_time < resolver.high_throughput_until
                                 || has_recent_stream_activity
-                                || (rate_limited && streams_len > 0 && !flow_blocked)
                             {
                                 MAX_ACTIVE_AUTHORITATIVE_TARGET_INFLIGHT
                             } else if flow_blocked {
                                 FLOW_BLOCKED_MAX_INFLIGHT
                             } else {
-                                0
+                                // Quiet streams (TG open, no transfer): modest target; poll_backoff
+                                // further drops to UNPRODUCTIVE_MAX_INFLIGHT when no useful data.
+                                64
                             };
                             let pacing_target = snapshot
                                 .map(|snapshot| snapshot.target_inflight)
@@ -983,14 +965,11 @@ pub async fn run_client_with_control_and_liveness(
                                         )
                                     }
                                 });
-                            // Demand-driven cap: while no real data is moving, hold in-flight polls
-                            // to a small keepalive count instead of the full ~384 the disabled-CC
-                            // pacing would otherwise target. Lifts the instant data flows again.
-                            // Skip it in rate-limited mode (except flow_blocked, which has its own
-                            // moderate cap): the max_poll_qps window is the rate bound for Megafon.
+                            // Always apply poll_backoff when unproductive — including when
+                            // max_poll_qps > 0 (was skipped for Megafon steady mode).
                             let pacing_target = if flow_blocked {
                                 pacing_target.min(FLOW_BLOCKED_MAX_INFLIGHT)
-                            } else if stall.poll_backoff_active() && !rate_limited {
+                            } else if stall.poll_backoff_active() {
                                 pacing_target.min(UNPRODUCTIVE_MAX_INFLIGHT)
                             } else {
                                 pacing_target
@@ -1008,7 +987,6 @@ pub async fn run_client_with_control_and_liveness(
                         if idle_stream_poll_due
                             && !has_recent_stream_activity
                             && !flow_blocked
-                            && !rate_limited
                         {
                             poll_deficit = poll_deficit.min(1);
                         }
