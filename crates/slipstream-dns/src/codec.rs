@@ -122,7 +122,7 @@ pub fn decode_query_with_domains_and_qtype(
                     // NXDOMAIN is cacheable and handled gently. Valid tunnel queries still decode
                     // and get their TXT, so this only changes the error path.
                     rcode: Rcode::NameError,
-                })
+                });
             }
         };
         return Ok(DecodedQuery {
@@ -162,7 +162,7 @@ pub fn decode_query_with_domains_and_qtype(
                 // just a bogus name, not a server failure. Avoids resolver retry-amplification
                 // and domain damping under per-client query-rate limits.
                 rcode: Rcode::NameError,
-            })
+            });
         }
     };
 
@@ -183,7 +183,8 @@ pub fn decode_query_with_domains_and_qtype(
 fn split_encoding_marker(undotted: &str) -> (DataEncoding, &str) {
     if undotted.len() >= BASE64U_MARKER.len()
         && undotted.is_char_boundary(BASE64U_MARKER.len())
-        && undotted.as_bytes()[..BASE64U_MARKER.len()].eq_ignore_ascii_case(BASE64U_MARKER.as_bytes())
+        && undotted.as_bytes()[..BASE64U_MARKER.len()]
+            .eq_ignore_ascii_case(BASE64U_MARKER.as_bytes())
     {
         (DataEncoding::Base64Url, &undotted[BASE64U_MARKER.len()..])
     } else {
@@ -484,7 +485,11 @@ fn encode_answer_rdata(
 /// labels), used as the RDATA (or RDATA tail, for MX/SRV) of the name-carrier answer types. No
 /// marker prefix here (unlike the query side): the client already knows which encoding it asked
 /// for, so the answer just needs to match it, no in-band signal required.
-fn encode_data_name(chunk: &[u8], encoding: DataEncoding, out: &mut Vec<u8>) -> Result<(), DnsError> {
+fn encode_data_name(
+    chunk: &[u8],
+    encoding: DataEncoding,
+    out: &mut Vec<u8>,
+) -> Result<(), DnsError> {
     let encoded = match encoding {
         DataEncoding::Base32 => base32::encode(chunk),
         DataEncoding::Base64Url => base64u::encode(chunk),
@@ -730,11 +735,13 @@ fn parse_edns_raw_payload(packet: &[u8], mut offset: usize, arcount: u16) -> Opt
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_response_with_encoding, encode_query, encode_response, DEFAULT_RESPONSE_TTL};
+    use super::{
+        decode_response_with_encoding, encode_query, encode_response, DEFAULT_RESPONSE_TTL,
+    };
     use crate::codec::encode_response_with_ttl;
     use crate::types::{
-        DataEncoding, QueryParams, Question, ResponseParams, CLASS_IN, EDNS_UDP_PAYLOAD, RR_AAAA,
-        RR_A, RR_CNAME, RR_HTTPS, RR_MX, RR_NULL, RR_OPT, RR_SRV, RR_TXT,
+        DataEncoding, QueryParams, Question, ResponseParams, CLASS_IN, EDNS_UDP_PAYLOAD, RR_A,
+        RR_AAAA, RR_CNAME, RR_HTTPS, RR_MX, RR_NULL, RR_OPT, RR_SRV, RR_TXT,
     };
 
     /// Shared round-trip check used by every per-type test below: encode a response carrying
@@ -760,9 +767,8 @@ mod tests {
             DEFAULT_RESPONSE_TTL,
         )
         .unwrap_or_else(|e| panic!("encode qtype={qtype} encoding={encoding:?} response: {e}"));
-        let decoded = decode_response_with_encoding(&encoded, encoding).unwrap_or_else(|| {
-            panic!("decode qtype={qtype} encoding={encoding:?} response")
-        });
+        let decoded = decode_response_with_encoding(&encoded, encoding)
+            .unwrap_or_else(|| panic!("decode qtype={qtype} encoding={encoding:?} response"));
         assert_eq!(
             decoded, payload,
             "round-trip mismatch for qtype={qtype} encoding={encoding:?}"

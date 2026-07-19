@@ -15,9 +15,12 @@ pub fn find_system_ca_bundle() -> Result<CString, String> {
          this system doesn't appear to have"
             .to_string()
     })?;
-    let path_str = path
-        .to_str()
-        .ok_or_else(|| format!("system CA bundle path is not valid UTF-8: {}", path.display()))?;
+    let path_str = path.to_str().ok_or_else(|| {
+        format!(
+            "system CA bundle path is not valid UTF-8: {}",
+            path.display()
+        )
+    })?;
     CString::new(path_str)
         .map_err(|_| format!("system CA bundle path contains a NUL byte: {path_str}"))
 }

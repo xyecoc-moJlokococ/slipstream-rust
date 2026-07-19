@@ -15,12 +15,12 @@ pub use codec::{
     encode_response_with_ttl, is_response, DEFAULT_RESPONSE_TTL,
 };
 pub use dots::{dotify, dotify_with_label_len, undotify, DEFAULT_LABEL_LEN};
+use types::BASE64U_MARKER;
 pub use types::{
     DataEncoding, DecodeQueryError, DecodedQuery, DnsError, QueryParams, Question, Rcode,
     ResponseParams, CLASS_IN, EDNS_SLIPSTREAM_PAYLOAD_OPTION, EDNS_UDP_PAYLOAD, RR_A, RR_AAAA,
     RR_CNAME, RR_HTTPS, RR_MX, RR_NULL, RR_OPT, RR_SRV, RR_TXT, SVCPARAM_ECH,
 };
-use types::BASE64U_MARKER;
 
 pub fn build_qname(payload: &[u8], domain: &str) -> Result<String, DnsError> {
     build_qname_with_label_len(payload, domain, DEFAULT_LABEL_LEN)
@@ -211,8 +211,9 @@ mod tests {
         // sharpest test that the marker survives being split across a label boundary (undotify
         // just concatenates everything back before the server ever looks for the marker).
         for label_len in [1usize, 2, 3, 5, 57, 63] {
-            let qname = build_qname_with_encoding(b"hello", "test.com", label_len, DataEncoding::Base64Url)
-                .unwrap_or_else(|e| panic!("label_len={label_len}: {e}"));
+            let qname =
+                build_qname_with_encoding(b"hello", "test.com", label_len, DataEncoding::Base64Url)
+                    .unwrap_or_else(|e| panic!("label_len={label_len}: {e}"));
             let query = crate::encode_query(&crate::QueryParams {
                 id: 1,
                 qname: &qname,
@@ -226,7 +227,11 @@ mod tests {
             .expect("encode query");
             let decoded = decode_query_with_domains_and_qtype(&query, &["test.com"], RR_TXT)
                 .unwrap_or_else(|e| panic!("label_len={label_len}: {e:?}"));
-            assert_eq!(decoded.encoding, DataEncoding::Base64Url, "label_len={label_len}");
+            assert_eq!(
+                decoded.encoding,
+                DataEncoding::Base64Url,
+                "label_len={label_len}"
+            );
             assert_eq!(decoded.payload, b"hello", "label_len={label_len}");
         }
     }
@@ -254,8 +259,6 @@ mod tests {
             max_payload_len_for_domain_with_encoding(domain, 57, DataEncoding::Base64Url)
                 .expect("max payload");
         let payload = vec![0u8; max_payload + 1];
-        assert!(
-            build_qname_with_encoding(&payload, domain, 57, DataEncoding::Base64Url).is_err()
-        );
+        assert!(build_qname_with_encoding(&payload, domain, 57, DataEncoding::Base64Url).is_err());
     }
 }

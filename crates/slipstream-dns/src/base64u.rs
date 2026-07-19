@@ -1,7 +1,6 @@
 use std::fmt;
 
-const ENCODE_TABLE: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+const ENCODE_TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Base64UError {

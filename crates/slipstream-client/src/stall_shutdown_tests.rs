@@ -23,7 +23,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use slipstream_core::AddressFamily;
-use slipstream_ffi::{ClientConfig, ResolverMode, ResolverSpec, ResolverTransport, UpstreamEncoding};
+use slipstream_ffi::{
+    ClientConfig, ResolverMode, ResolverSpec, ResolverTransport, UpstreamEncoding,
+};
 use tokio::sync::mpsc;
 
 use crate::join_or_detach;
@@ -247,7 +249,10 @@ fn stop_returns_promptly_when_resolver_goes_silent_under_heavy_backlog() {
     let stop_started = Instant::now();
     let joined = join_or_detach(stop_tx, client_thread, Duration::from_secs(5));
     let elapsed = stop_started.elapsed();
-    eprintln!("stall_shutdown_tests: stop returned in {:?} (joined={})", elapsed, joined);
+    eprintln!(
+        "stall_shutdown_tests: stop returned in {:?} (joined={})",
+        elapsed, joined
+    );
 
     assert!(
         joined,

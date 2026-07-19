@@ -459,7 +459,11 @@ fn stale_half_closed_tcp_selector_respects_deadline() {
     let acceptor = acceptor::ClientAcceptor::new();
     let mut state = ClientState::new(command_tx, data_notify, false, acceptor);
 
-    for (stream_id, eof_at) in [(4u64, Some(1_000u64)), (8u64, Some(40_000_000u64)), (12u64, None)] {
+    for (stream_id, eof_at) in [
+        (4u64, Some(1_000u64)),
+        (8u64, Some(40_000_000u64)),
+        (12u64, None),
+    ] {
         let (write_tx, _write_rx) = mpsc::unbounded_channel();
         let (read_abort_tx, _read_abort_rx) = oneshot::channel();
         state.streams.insert(

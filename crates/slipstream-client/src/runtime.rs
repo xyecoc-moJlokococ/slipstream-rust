@@ -19,11 +19,11 @@ use crate::pacing::{
     inflight_packet_estimate, sanitize_pacing_gain_probe, MAX_ACTIVE_AUTHORITATIVE_TARGET_INFLIGHT,
 };
 use crate::pinning::configure_pinned_certificate;
-use crate::system_ca::find_system_ca_bundle;
 use crate::streams::{
     acceptor::ClientAcceptor, client_callback, drain_commands, drain_stream_data, handle_command,
     reap_half_closed_tcp_streams, ClientState, Command,
 };
+use crate::system_ca::find_system_ca_bundle;
 use slipstream_dns::{
     build_edns_raw_qname, build_qname_with_encoding, encode_query, encode_query_compact,
     encode_query_edns_raw, QueryParams, CLASS_IN, EDNS_UDP_PAYLOAD,
@@ -150,7 +150,11 @@ pub(crate) fn sanitize_dns_tcp_packet_loop_burst(value: usize) -> usize {
 fn compute_transport_mtu(config: &ClientConfig<'_>) -> Result<u32, ClientError> {
     match config.upstream_encoding {
         UpstreamEncoding::Qname => {
-            let max_mtu = compute_mtu(config.domain, config.dns_label_length, data_encoding(config))?;
+            let max_mtu = compute_mtu(
+                config.domain,
+                config.dns_label_length,
+                data_encoding(config),
+            )?;
             if config.qname_mtu == 0 {
                 Ok(max_mtu)
             } else {
