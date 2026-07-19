@@ -69,6 +69,12 @@ impl ServerState {
         }
     }
 
+    /// Connection ids that currently hold at least one application stream. Used by idle GC to
+    /// refresh the "last active" timestamp only on real app traffic, not DNS poll packets.
+    pub(crate) fn connection_ids_with_streams(&self) -> impl Iterator<Item = usize> + '_ {
+        self.streams.keys().map(|key| key.cnx)
+    }
+
     pub(crate) fn stream_debug_metrics(&self, cnx_id: usize) -> ServerStreamMetrics {
         metrics::stream_debug_metrics(self, cnx_id)
     }

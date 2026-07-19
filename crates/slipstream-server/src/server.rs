@@ -13,10 +13,10 @@ use slipstream_dns::{encode_response_with_ttl, DataEncoding, Question, Rcode, Re
 #[cfg(not(target_os = "linux"))]
 use slipstream_ffi::picoquic::PICOQUIC_PACKET_LOOP_RECV_MAX;
 use slipstream_ffi::picoquic::{
-    picoquic_cnx_t, picoquic_create, picoquic_current_time, picoquic_delete_cnx,
-    picoquic_get_first_cnx, picoquic_get_next_cnx, picoquic_prepare_packet_ex, picoquic_quic_t,
-    slipstream_has_ready_stream, slipstream_is_flow_blocked, slipstream_server_cc_algorithm,
-    PICOQUIC_MAX_PACKET_SIZE,
+    picoquic_close_immediate, picoquic_cnx_t, picoquic_create, picoquic_current_time,
+    picoquic_delete_cnx, picoquic_get_first_cnx, picoquic_get_next_cnx, picoquic_prepare_packet_ex,
+    picoquic_quic_t, slipstream_has_ready_stream, slipstream_is_flow_blocked,
+    slipstream_server_cc_algorithm, PICOQUIC_MAX_PACKET_SIZE,
 };
 use slipstream_ffi::{
     configure_quic_with_custom, set_server_half_open_retry_threshold, socket_addr_to_storage,
@@ -531,7 +531,11 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
 
         let now = Instant::now();
         if idle_timeout != Duration::ZERO {
-            note_active_connections(&mut last_seen, &slots, now);
+            // Borrow state only for the note pass; GC takes &mut separately below.
+            {
+                let state = unsafe { &*state_ptr };
+                note_active_connections(&mut last_seen, state, &slots, now);
+            }
             maybe_gc_idle_connections(
                 quic,
                 state_ptr,
@@ -799,11 +803,26 @@ pub(crate) fn map_io(err: std::io::Error) -> ServerError {
     ServerError::new(err.to_string())
 }
 
-fn note_active_connections(last_seen: &mut HashMap<usize, Instant>, slots: &[Slot], now: Instant) {
+/// Track connections for idle GC.
+///
+/// - First packet that associates a slot with a QUIC cnx *registers* the connection (starts the
+///   idle timer) but does **not** keep refreshing it on every subsequent DNS poll.
+/// - Only real application stream activity refreshes the timer. Continuous client DNS polls /
+///   QUIC keepalives must not prevent idle GC, or idle_timeout becomes a no-op while a client
+///   is sitting on an open tunnel with no TCP streams.
+fn note_active_connections(
+    last_seen: &mut HashMap<usize, Instant>,
+    state: &ServerState,
+    slots: &[Slot],
+    now: Instant,
+) {
     for slot in slots {
         if !slot.cnx.is_null() {
-            last_seen.insert(slot.cnx as usize, now);
+            last_seen.entry(slot.cnx as usize).or_insert(now);
         }
+    }
+    for cnx_id in state.connection_ids_with_streams() {
+        last_seen.insert(cnx_id, now);
     }
 }
 
@@ -875,13 +894,17 @@ fn maybe_gc_idle_connections(
         if let Some(&cnx) = active.get(&cnx_id) {
             remove_connection_streams(state, cnx_id);
             if let Some(last) = last_seen.get(&cnx_id) {
-                tracing::debug!(
+                // info (not debug): idle_gc_e2e and ops both need to observe this without RUST_LOG=debug.
+                tracing::info!(
                     "idle gc: closing connection cnx_id={} idle_for_ms={}",
                     cnx_id,
                     now.duration_since(*last).as_millis()
                 );
             }
+            // close_immediate first so subsequent client packets can still elicit a reset/close
+            // rather than silently vanishing; then free the cnx.
             unsafe {
+                picoquic_close_immediate(cnx);
                 picoquic_delete_cnx(cnx);
             }
             last_seen.remove(&cnx_id);
