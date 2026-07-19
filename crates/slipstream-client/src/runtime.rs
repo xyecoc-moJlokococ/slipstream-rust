@@ -8,8 +8,8 @@ use self::path::{
 };
 use self::setup::{bind_tcp_listener, bind_udp_socket, compute_mtu, map_io};
 use self::stall::{
-    StallDetector, StallInput, FLOW_BLOCKED_MAX_INFLIGHT, FLOW_BLOCKED_MAX_POLL_QPS,
-    UNPRODUCTIVE_MAX_INFLIGHT,
+    StallDetector, StallInput, DOWNLOAD_POLL_KEEPALIVE_INFLIGHT, DOWNLOAD_POLL_RESERVE_QPS,
+    FLOW_BLOCKED_MAX_INFLIGHT, FLOW_BLOCKED_MAX_POLL_QPS, UNPRODUCTIVE_MAX_INFLIGHT,
 };
 use crate::dns::{
     add_paths, data_encoding, expire_inflight_polls, handle_dns_response, maybe_report_debug,
@@ -415,10 +415,10 @@ pub async fn run_client_with_control_and_liveness(
         let mut data_window_start_us = 0u64;
         let mut data_window_sent: u32 = 0;
         let mut data_qps_cap = crate::resolve_max_data_qps();
-        if data_qps_cap > 0 {
+        if data_qps_cap > 0 || config.max_poll_qps > 0 {
             warn!(
-                "data_qps_cap={} — fixed ceiling on data-bearing DNS (empty polls separate)",
-                data_qps_cap
+                "split DNS budgets: upload_data_qps={} download_poll_qps={} (0=unlimited; polls reserved during upload)",
+                data_qps_cap, config.max_poll_qps
             );
         }
 
@@ -1012,13 +1012,15 @@ pub async fn run_client_with_control_and_liveness(
                         {
                             poll_deficit = poll_deficit.min(1);
                         }
+                        // Split budget: upload uses data_qps_cap (prepare path); download uses empty
+                        // polls. Never zero polls entirely while streams exist — responses carry
+                        // downlink + MAX_STREAM_DATA. During bulk upload keep a download slice.
                         if has_ready_stream && !flow_blocked {
-                            poll_deficit = 0;
+                            poll_deficit = poll_deficit.min(DOWNLOAD_POLL_KEEPALIVE_INFLIGHT);
                         }
-                        // Optional anti-fingerprinting DNS query-rate cap. Trades throughput for a
-                        // lower/steadier query volume. No-op unless config.max_poll_qps > 0.
-                        // When flow_blocked, further cap so e.g. maxPollQps=1400 does not firehose
-                        // empty polls while waiting for MAX_STREAM_DATA.
+                        // Optional anti-fingerprinting / download poll rate cap (max_poll_qps).
+                        // When flow_blocked, further cap so e.g. maxPollQps=1400 does not firehose.
+                        // While uploading, still guarantee DOWNLOAD_POLL_RESERVE_QPS headroom.
                         if config.max_poll_qps > 0 && poll_deficit > 0 {
                             if poll_window_start_us == 0
                                 || current_time.saturating_sub(poll_window_start_us) >= 1_000_000
@@ -1027,7 +1029,14 @@ pub async fn run_client_with_control_and_liveness(
                                 poll_window_sent = 0;
                             }
                             let effective_qps = if flow_blocked {
-                                config.max_poll_qps.min(FLOW_BLOCKED_MAX_POLL_QPS)
+                                // Prefer window updates over firehose; still keep download reserve.
+                                config
+                                    .max_poll_qps
+                                    .min(FLOW_BLOCKED_MAX_POLL_QPS)
+                                    .max(DOWNLOAD_POLL_RESERVE_QPS.min(config.max_poll_qps))
+                            } else if has_ready_stream {
+                                // Upload active: dedicate a fixed download-poll slice (not full 1400).
+                                DOWNLOAD_POLL_RESERVE_QPS.min(config.max_poll_qps)
                             } else {
                                 config.max_poll_qps
                             };

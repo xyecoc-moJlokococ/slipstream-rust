@@ -27,6 +27,12 @@ pub(crate) const UNPRODUCTIVE_MAX_INFLIGHT: usize = 8;
 pub(crate) const FLOW_BLOCKED_MAX_INFLIGHT: usize = 64;
 /// Cap effective max_poll_qps while flow_blocked.
 pub(crate) const FLOW_BLOCKED_MAX_POLL_QPS: u32 = 200;
+/// Empty-poll slots kept even while upload has ready stream data. Download (and MAX_STREAM_DATA)
+/// only arrives in DNS *responses*; if we set poll_deficit=0 whenever has_ready_stream, bulk
+/// upload starves downlink completely. This is the download share of the split budget.
+pub(crate) const DOWNLOAD_POLL_KEEPALIVE_INFLIGHT: usize = 48;
+/// Floor on empty-poll QPS reserved for download while streams are open (under max_poll_qps).
+pub(crate) const DOWNLOAD_POLL_RESERVE_QPS: u32 = 250;
 /// A stream can look "active" indefinitely while genuinely stuck (peer not acking) -- without
 /// this, the loop's sleep-timing stays pinned at the active floor forever, pegging a core at
 /// 100% CPU with zero throughput. This only affects sleep timing, not pacing/reconnection/the
