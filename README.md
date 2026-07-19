@@ -24,34 +24,6 @@ This is `xyecoc-moJlokococ`'s personal fork of [Mygod/slipstream-rust](https://g
 personal/development fork, not a clean drop-in replacement for upstream — expect uncommitted
 work-in-progress on branches from time to time.
 
-- **Active development branch: `feature/dns-tcp-carrier`.** This is where all the fork-specific
-  work below lands; `main` tracks upstream more closely and lags behind. If you're looking for the
-  current state of this fork, check out `feature/dns-tcp-carrier`, not `main`.
-- **`vendor/picoquic` submodule gotcha.** `.gitmodules` points the submodule at
-  `https://github.com/Mygod/slipstream-picoquic` (the upstream author's picoquic fork), and the
-  local submodule checkout's own `origin` remote is configured the same way. That means **any
-  picoquic-level fix made directly in `vendor/picoquic` and committed locally is only fetchable by
-  a fresh clone / CI if it has also been pushed to that upstream picoquic repo** — which this
-  fork's own contributors don't have push access to. If the superproject's tracked submodule
-  commit ever points at a commit that only exists in a local clone, `git submodule update` (and
-  therefore CI's checkout step, and therefore every single CI job) fails outright with `remote
-  error: upload-pack: not our ref <sha>`. Before bumping the tracked `vendor/picoquic` commit,
-  either get the change merged upstream, or push it to a submodule remote this fork's contributors
-  actually control (e.g. a personal fork of `slipstream-picoquic`) and repoint `.gitmodules` at it.
-- **CI has been broken on `feature/dns-tcp-carrier` for an extended period** for exactly the reason
-  above: the tracked `vendor/picoquic` commit is a locally-made fix
-  (picosplay infinite-loop/cyclic-structure guards) that was never pushed anywhere reachable. Every
-  job fails at the "Check out slipstream-rust" step, before any actual build/test/lint runs — so a
-  red CI badge on this branch does not currently mean the Rust code itself is broken. See
-  `docs/picoquic-changes.md` for what should be pushed/repointed to fix this.
-- Two long-standing, separately-tracked CI flakes were also observed on older runs (both already
-  fixed on current `feature/dns-tcp-carrier`, but worth knowing about if you see them on a stale
-  branch or PR): a `clippy::question_mark` lint failure in
-  `crates/slipstream-server/src/udp_fallback/forwarding.rs`, and a Windows build failure from
-  hardcoding the `"Visual Studio 17 2022"` CMake generator (`scripts/build_picoquic_windows.ps1`
-  now lets CMake auto-detect the installed VS version instead, since GitHub's hosted Windows
-  runner images upgrade their bundled VS version over time).
-
 ## Differences from upstream (Mygod/slipstream-rust)
 
 On top of upstream, this fork adds:
