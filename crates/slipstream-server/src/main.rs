@@ -1,6 +1,7 @@
 mod config;
 #[cfg(target_os = "linux")]
 mod mmsg;
+mod multi_worker;
 mod server;
 mod socks_target;
 mod streams;
@@ -85,6 +86,13 @@ struct Args {
     /// not-yet-implemented type without a code change.
     #[arg(long = "accepted-query-type", default_value_t = 16)]
     accepted_query_type: u16,
+    /// Number of independent server worker threads (each with its own picoquic context).
+    /// Default 1 preserves the historical single-threaded path. Values >1 enable userspace
+    /// demux by source IP so DNS/QUIC CPU scales across cores for multi-client load. Do not use
+    /// kernel SO_REUSEPORT alone for this — client/resolver source-port spray would split one
+    /// QUIC connection across workers. SIP003 option: `workers`.
+    #[arg(long = "workers", default_value_t = 1, value_parser = parse_workers)]
+    workers: usize,
 }
 
 fn main() {
@@ -202,6 +210,14 @@ fn main() {
         args.max_half_open_connections
     };
 
+    let workers = if cli_provided(&matches, "workers") {
+        args.workers
+    } else if let Some(value) = sip003::last_option_value(&sip003_env.plugin_options, "workers") {
+        unwrap_or_exit(parse_workers(&value), "SIP003 env error", 2)
+    } else {
+        args.workers
+    };
+
     let config = ServerConfig {
         dns_listen_host,
         dns_listen_port,
@@ -221,6 +237,7 @@ fn main() {
         response_ttl: args.response_ttl,
         response_ttl_jitter: args.response_ttl_jitter,
         accepted_query_type: args.accepted_query_type,
+        workers,
     };
 
     let runtime = Builder::new_current_thread()
@@ -271,6 +288,22 @@ fn parse_max_half_open_connections(input: &str) -> Result<u32, String> {
     // least 1 so this knob only ever engages once concurrency actually appears.
     if value == 0 {
         return Err("max-half-open-connections must be at least 1".to_string());
+    }
+    Ok(value)
+}
+
+fn parse_workers(input: &str) -> Result<usize, String> {
+    let trimmed = input.trim();
+    let value = trimmed
+        .parse::<usize>()
+        .map_err(|_| format!("Invalid workers value: {}", trimmed))?;
+    if value == 0 {
+        return Err("workers must be at least 1".to_string());
+    }
+    // Soft cap: more than a few dozen picoquic contexts is almost never useful on a VPS and
+    // multiplies memory (cert/TLS tables per context). Raise via code if a real need appears.
+    if value > 64 {
+        return Err("workers must be at most 64".to_string());
     }
     Ok(value)
 }
@@ -349,5 +382,24 @@ mod tests {
         assert_eq!(parse_max_half_open_connections("  16 "), Ok(16));
         assert!(parse_max_half_open_connections("0").is_err());
         assert!(parse_max_half_open_connections("nope").is_err());
+    }
+
+    #[test]
+    fn workers_defaults_to_one() {
+        let args = parse_args(&[]).expect("defaults parse");
+        assert_eq!(args.workers, 1);
+    }
+
+    #[test]
+    fn workers_flag_overrides_default() {
+        let args = parse_args(&["--workers", "4"]).expect("flag parses");
+        assert_eq!(args.workers, 4);
+    }
+
+    #[test]
+    fn workers_rejects_zero_and_too_large() {
+        assert!(parse_args(&["--workers", "0"]).is_err());
+        assert!(parse_args(&["--workers", "65"]).is_err());
+        assert_eq!(parse_workers("8"), Ok(8));
     }
 }

@@ -20,7 +20,7 @@ use slipstream_ffi::picoquic::PICOQUIC_RESET_SECRET_SIZE;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct ResetSeed {
     pub(crate) bytes: [u8; PICOQUIC_RESET_SECRET_SIZE],
     pub(crate) created: bool,

@@ -70,6 +70,7 @@ Common flags:
 - --fallback <HOST:PORT> (optional; forward non-DNS packets to this UDP endpoint)
 - --idle-timeout-seconds <SECONDS> (default: 60; set to 0 to disable)
 - --reset-seed <PATH> (optional; 32 hex chars / 16 bytes; auto-created if missing)
+- --workers <N> (default: 1; multi-worker mode for multi-client CPU scale-out)
 - When binding the default `--dns-listen-host ::`, slipstream falls back to `0.0.0.0` if IPv6 is unavailable on the host.
 - When binding to `::`, slipstream still attempts to enable dual-stack (IPV6_V6ONLY=0); if your OS disallows it, IPv4 DNS clients require sysctl changes or binding to an IPv4 address.
 - With --fallback enabled, peers that have recently sent DNS stay DNS-only; while active they switch to fallback only after 16 consecutive non-DNS packets to avoid diverting DNS on stray traffic. DNS-only classification expires after an idle timeout without DNS traffic.
@@ -87,6 +88,22 @@ Example:
   --key ./key.pem \
   --reset-seed ./reset-seed
 ```
+
+Multi-worker example (scale DNS/QUIC CPU across cores for several concurrent clients):
+
+```
+./target/release/slipstream-server \
+  --dns-listen-port 53 \
+  --target-address 127.0.0.1:1090 \
+  --domain ns2w.smugvpn.com \
+  --cert ./cert.pem \
+  --key ./key.pem \
+  --reset-seed ./reset-seed \
+  --workers 4
+```
+
+`--workers 1` (default) keeps the original single-threaded path. See docs/config.md for
+affinity semantics and limits.
 
 For quick tests you can use the sample certs in `fixtures/certs/` (test-only).
 If the configured cert/key paths are missing, the server auto-generates a

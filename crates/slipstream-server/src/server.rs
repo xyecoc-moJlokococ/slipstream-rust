@@ -42,30 +42,30 @@ use crate::streams::{
 use crate::target::TargetMode;
 
 // Protocol defaults; see docs/config.md for details.
-const SLIPSTREAM_ALPN: &str = "picoquic_sample";
-const DNS_MAX_QUERY_SIZE: usize = 512;
+pub(crate) const SLIPSTREAM_ALPN: &str = "picoquic_sample";
+pub(crate) const DNS_MAX_QUERY_SIZE: usize = 512;
 const DNS_TCP_MAX_QUERY_SIZE: usize = 4096;
 const DNS_TCP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
-const IDLE_SLEEP_MS: u64 = 10;
+pub(crate) const IDLE_SLEEP_MS: u64 = 10;
 const IDLE_GC_INTERVAL: Duration = Duration::from_secs(1);
 // recvmmsg batch size (Linux only; see mmsg.rs) -- one syscall can pull up to this many
 // datagrams instead of one recv_from per datagram. Well above the old
 // PICOQUIC_PACKET_LOOP_RECV_MAX=10 per-select-iteration cap.
 #[cfg(target_os = "linux")]
-const RECVMMSG_BATCH: usize = 64;
+pub(crate) const RECVMMSG_BATCH: usize = 64;
 // Default QUIC MTU for server packets; see docs/config.md for details.
-const QUIC_MTU: u32 = 900;
+pub(crate) const QUIC_MTU: u32 = 900;
 pub(crate) const STREAM_READ_CHUNK_BYTES: usize = 4096;
 pub(crate) const DEFAULT_TCP_RCVBUF_BYTES: usize = 256 * 1024;
 pub(crate) const TARGET_WRITE_COALESCE_DEFAULT_BYTES: usize = 256 * 1024;
-const FLOW_BLOCKED_LOG_INTERVAL_US: u64 = 1_000_000;
+pub(crate) const FLOW_BLOCKED_LOG_INTERVAL_US: u64 = 1_000_000;
 // How long a per-connection last-sent-payload stays eligible for replay. Covers picoquic's own
 // client-side retransmission of an already-answered poll (observed ~215ms apart over a real
 // recursive-resolver relay with under-estimated RTT) without holding onto data long enough to
 // replay it into a later, genuinely-new empty poll.
-const RETRANSMIT_REPLAY_WINDOW: Duration = Duration::from_secs(2);
+pub(crate) const RETRANSMIT_REPLAY_WINDOW: Duration = Duration::from_secs(2);
 
-static SHOULD_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+pub(crate) static SHOULD_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_sigterm(_signum: libc::c_int) {
     SHOULD_SHUTDOWN.store(true, Ordering::Relaxed);
@@ -121,6 +121,10 @@ pub struct ServerConfig {
     /// DNS query type the server accepts in tunnel queries (default 16 = TXT). Must match the
     /// client's `dns_query_type`. Non-TXT also needs per-type answer RDATA encoding (not implemented).
     pub accepted_query_type: u16,
+    /// Number of independent worker threads, each with its own picoquic context and event loop.
+    /// `1` keeps the historical single-threaded path (default). `>1` enables userspace demux by
+    /// source IP so CPU-heavy DNS/QUIC work scales across cores. See `multi_worker.rs`.
+    pub workers: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -193,6 +197,15 @@ struct TcpDnsRequest {
 }
 
 pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
+    if config.workers > 1 {
+        return crate::multi_worker::run_server_multi(config).await;
+    }
+    run_server_single(config).await
+}
+
+/// Historical single-threaded server path (workers == 1). Kept separate so the multi-worker
+/// demux path never pays channel/scheduling overhead on the common single-client deploy.
+async fn run_server_single(config: &ServerConfig) -> Result<i32, ServerError> {
     let cert_path = Path::new(&config.cert);
     let key_path = Path::new(&config.key);
     let generated = ensure_cert_key(cert_path, key_path).map_err(ServerError::new)?;
@@ -702,14 +715,14 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
     Ok(0)
 }
 
-async fn bind_tcp_listener(host: &str, port: u16) -> Result<TokioTcpListener, ServerError> {
+pub(crate) async fn bind_tcp_listener(host: &str, port: u16) -> Result<TokioTcpListener, ServerError> {
     bind_first_resolved_with_ipv4_fallback(host, port, bind_tcp_listener_addr, "TCP listener")
         .await
         .map(|(listener, _)| listener)
         .map_err(map_io)
 }
 
-async fn bind_udp_socket(host: &str, port: u16) -> Result<TokioUdpSocket, ServerError> {
+pub(crate) async fn bind_udp_socket(host: &str, port: u16) -> Result<TokioUdpSocket, ServerError> {
     bind_first_resolved_with_ipv4_fallback(
         host,
         port,
@@ -814,7 +827,7 @@ pub(crate) fn map_io(err: std::io::Error) -> ServerError {
 /// - Only real application stream activity refreshes the timer. Continuous client DNS polls /
 ///   QUIC keepalives must not prevent idle GC, or idle_timeout becomes a no-op while a client
 ///   is sitting on an open tunnel with no TCP streams.
-fn note_active_connections(
+pub(crate) fn note_active_connections(
     last_seen: &mut HashMap<usize, Instant>,
     state: &ServerState,
     slots: &[Slot],
@@ -856,7 +869,7 @@ fn prune_and_collect_idle<T>(
     idle
 }
 
-fn maybe_gc_idle_connections(
+pub(crate) fn maybe_gc_idle_connections(
     quic: *mut picoquic_quic_t,
     state_ptr: *mut ServerState,
     last_seen: &mut HashMap<usize, Instant>,
@@ -918,7 +931,7 @@ fn maybe_gc_idle_connections(
     *last_gc = now;
 }
 
-fn warn_overlapping_domains(domains: &[String]) {
+pub(crate) fn warn_overlapping_domains(domains: &[String]) {
     if domains.len() < 2 {
         return;
     }

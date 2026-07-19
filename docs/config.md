@@ -50,6 +50,7 @@ exclusive. If neither is given, server certificates are not verified.
 
 - `--max-connections`
   Caps concurrent QUIC connections and sizes internal connection tables (default: 256).
+  In multi-worker mode each worker gets this cap independently (total capacity ≈ N × cap).
 - `--idle-timeout-seconds`
   Closes idle QUIC connections after the given number of seconds (default: 60).
   Set to 0 to disable idle GC.
@@ -58,6 +59,21 @@ exclusive. If neither is given, server certificates are not verified.
   exist, the server generates one and writes it with 0600 permissions. If not
   provided, the server uses an ephemeral seed and stateless resets will not
   survive restarts.
+- `--workers <N>` (default: 1; SIP003 option `workers`)
+  Number of independent worker threads, each with its own picoquic context and
+  Tokio current-thread runtime. `1` is the historical single-threaded path.
+  Values `>1` enable **userspace demux by source IP** (port ignored): one master
+  thread receives UDP with recvmmsg and routes each datagram to
+  `hash(src_ip) % N`. Replies are sent from workers on the shared bound socket.
+
+  Why not SO_REUSEPORT alone? Resolver/client source-port spray makes the kernel
+  4-tuple hash split one logical client across sockets and would break QUIC.
+
+  Good for ~5–10 concurrent clients where DNS/QUIC CPU saturates one core.
+  Limits of v1: RX demux still runs on one core; a single client that multipaths
+  through several recursive resolvers (different source IPs) may land on more
+  than one worker. If a worker queue is full (8192), demux drops the packet
+  (DNS is lossy) and logs a periodic warning.
 
 ## picoquic build environment
 
