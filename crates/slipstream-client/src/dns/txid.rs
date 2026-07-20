@@ -46,15 +46,32 @@ impl TxidGen {
         Self { state: seed }
     }
 
-    /// Next transaction ID. Advances the SplitMix64 state and returns the high 16 bits of the
-    /// mixed output (the high bits have the best avalanche).
-    pub(crate) fn next_id(&mut self) -> u16 {
+    /// Advance the SplitMix64 state and return the full 64-bit mixed output. This doubles as the
+    /// client's general-purpose non-crypto PRNG for other per-query cosmetics (e.g. label-length
+    /// jitter), so those don't stand out with a constant value either.
+    pub(crate) fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(SPLITMIX_GAMMA);
         let mut z = self.state;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^= z >> 31;
-        (z >> 48) as u16
+        z
+    }
+
+    /// Next transaction ID. Returns the high 16 bits of the mixed output (the high bits have the
+    /// best avalanche).
+    pub(crate) fn next_id(&mut self) -> u16 {
+        (self.next_u64() >> 48) as u16
+    }
+
+    /// Uniform-ish value in `[lo, hi]` inclusive. For the small ranges this is used with (DNS label
+    /// lengths, 1..=63) the modulo bias is negligible. Returns `lo` if `hi <= lo`.
+    pub(crate) fn next_in_range(&mut self, lo: usize, hi: usize) -> usize {
+        if hi <= lo {
+            return lo;
+        }
+        let span = (hi - lo + 1) as u64;
+        lo + (self.next_u64() % span) as usize
     }
 }
 
@@ -92,6 +109,23 @@ mod tests {
             plus_one < n / 100,
             "too many +1 steps ({plus_one}/{n}); output looks sequential"
         );
+    }
+
+    #[test]
+    fn next_in_range_stays_in_bounds_and_varies() {
+        let mut gen = TxidGen::from_seed(0xABCD_1234_5678_9F0F);
+        let (lo, hi) = (40usize, 63usize);
+        let mut seen = HashSet::new();
+        for _ in 0..5000 {
+            let v = gen.next_in_range(lo, hi);
+            assert!((lo..=hi).contains(&v), "{v} out of [{lo},{hi}]");
+            seen.insert(v);
+        }
+        // Should exercise the whole small range, not sit on one value.
+        assert!(seen.len() >= (hi - lo), "range {seen:?} too narrow");
+        // Degenerate range returns lo.
+        assert_eq!(gen.next_in_range(57, 57), 57);
+        assert_eq!(gen.next_in_range(57, 10), 57);
     }
 
     #[test]

@@ -90,12 +90,13 @@ pub(crate) async fn send_poll_queries(
         resolver.debug.polls_sent = resolver.debug.polls_sent.saturating_add(1);
 
         let poll_id = txid.next_id();
+        let label_length = super::pick_label_length(config, txid);
         let packet = match config.upstream_encoding {
             UpstreamEncoding::Qname => {
                 let qname = build_qname_with_encoding(
                     &send_buf[..send_length],
                     config.domain,
-                    config.dns_label_length,
+                    label_length,
                     super::data_encoding(config),
                 )
                 .map_err(|err| ClientError::new(err.to_string()))?;

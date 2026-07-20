@@ -13,8 +13,9 @@ use self::stall::{
 };
 use crate::dns::{
     add_paths, data_encoding, expire_inflight_polls, handle_dns_response, maybe_report_debug,
-    refresh_resolver_path, resolve_resolvers, resolver_mode_to_c, send_poll_queries,
-    sockaddr_storage_to_socket_addr, DnsResponseContext, DnsTransport, PeerAddrMode, TxidGen,
+    min_label_length, pick_label_length, refresh_resolver_path, resolve_resolvers,
+    resolver_mode_to_c, send_poll_queries, sockaddr_storage_to_socket_addr, DnsResponseContext,
+    DnsTransport, PeerAddrMode, TxidGen,
 };
 use crate::error::ClientError;
 use crate::pacing::{
@@ -153,9 +154,12 @@ pub(crate) fn sanitize_dns_tcp_packet_loop_burst(value: usize) -> usize {
 fn compute_transport_mtu(config: &ClientConfig<'_>) -> Result<u32, ClientError> {
     match config.upstream_encoding {
         UpstreamEncoding::Qname => {
+            // Size at the *minimum* label length a query might use (see `min_label_length`): with
+            // label-length jitter on, a shorter label means more dots and thus a longer name for the
+            // same payload, so the worst case must fit the 253-byte limit.
             let max_mtu = compute_mtu(
                 config.domain,
-                config.dns_label_length,
+                min_label_length(config),
                 data_encoding(config),
             )?;
             if config.qname_mtu == 0 {
@@ -764,12 +768,13 @@ pub async fn run_client_with_control_and_liveness(
                 }
 
                 let dns_id = txid.next_id();
+                let label_length = pick_label_length(config, &mut txid);
                 let packet = match config.upstream_encoding {
                     UpstreamEncoding::Qname => {
                         let qname = build_qname_with_encoding(
                             &send_buf[..send_length],
                             config.domain,
-                            config.dns_label_length,
+                            label_length,
                             data_encoding(config),
                         )
                         .map_err(|err| ClientError::new(err.to_string()))?;

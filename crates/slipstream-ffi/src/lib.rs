@@ -61,6 +61,14 @@ pub struct ClientConfig<'a> {
     /// Label length (chars) for the encoded subdomain (default 57). Client-only: the server strips
     /// dots before decoding, so this only alters the on-the-wire label-length fingerprint.
     pub dns_label_length: usize,
+    /// Per-query jitter (chars) applied *below* `dns_label_length` (default 0 = off). When > 0, each
+    /// query picks a label length uniformly in `[dns_label_length - dns_label_length_jitter,
+    /// dns_label_length]` (clamped to >= 1) instead of a constant, so the "every label is exactly N
+    /// chars" fingerprint goes away. Client-only (the server strips dots). Because shorter labels
+    /// mean a longer dotted name for the same payload, the transport MTU is sized at the *minimum*
+    /// label length in the range, so a jittered name can never overflow the 253-byte DNS name limit;
+    /// the cost is a slightly smaller MTU when this is enabled.
+    pub dns_label_length_jitter: u32,
     /// Encode the tunnel payload with base64u instead of base32 in DNS query/answer names (default
     /// false = base32). Purely a client choice: the server detects it per-query via a marker
     /// prefix (`slipstream_dns::DataEncoding`), no server config needed. ~20% denser than base32,

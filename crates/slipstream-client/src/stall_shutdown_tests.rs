@@ -178,6 +178,7 @@ fn stop_returns_promptly_when_resolver_goes_silent_under_heavy_backlog() {
                 keep_alive_interval: 400,
                 dns_query_type: 16,
                 dns_label_length: 57,
+                dns_label_length_jitter: 0,
                 max_poll_qps: 0,
                 debug_poll: false,
                 debug_streams: false,

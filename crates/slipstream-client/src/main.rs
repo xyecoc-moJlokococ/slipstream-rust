@@ -90,6 +90,11 @@ struct Args {
     /// Label length (chars, 1..=63) for the encoded subdomain (default 57). Client-only fingerprint knob.
     #[arg(long = "dns-label-length", default_value_t = 57)]
     dns_label_length: usize,
+    /// Per-query jitter (chars) applied below --dns-label-length (default 0 = off, constant length).
+    /// When > 0, each query's label length is chosen in [dns-label-length - N, dns-label-length] so
+    /// labels aren't all identical length. Client-only; slightly lowers MTU when enabled.
+    #[arg(long = "dns-label-length-jitter", default_value_t = 0)]
+    dns_label_length_jitter: u32,
     /// Cap on DNS poll queries per second (0 = unlimited). Lowers the query-rate fingerprint at the cost of throughput.
     #[arg(long = "max-poll-qps", default_value_t = 0)]
     max_poll_qps: u32,
@@ -281,6 +286,7 @@ fn main() {
         dns_tcp_packet_loop_burst: args.dns_tcp_packet_loop_burst,
         dns_query_type: args.dns_query_type,
         dns_label_length: args.dns_label_length,
+        dns_label_length_jitter: args.dns_label_length_jitter,
         max_poll_qps: args.max_poll_qps,
         debug_poll: args.debug_poll,
         debug_streams: args.debug_streams,
@@ -322,6 +328,7 @@ struct ClientFileConfig {
     dns_tcp_packet_loop_burst: Option<usize>,
     dns_query_type: Option<u16>,
     dns_label_length: Option<usize>,
+    dns_label_length_jitter: Option<u32>,
     max_poll_qps: Option<u32>,
     debug_poll: Option<bool>,
     debug_streams: Option<bool>,
@@ -399,6 +406,12 @@ fn run_from_config_file(path: &str, args: &Args, matches: &clap::ArgMatches) -> 
         args.dns_label_length
     } else {
         file.dns_label_length.unwrap_or(args.dns_label_length)
+    };
+    let dns_label_length_jitter = if cli_provided(matches, "dns_label_length_jitter") {
+        args.dns_label_length_jitter
+    } else {
+        file.dns_label_length_jitter
+            .unwrap_or(args.dns_label_length_jitter)
     };
     let max_poll_qps = if cli_provided(matches, "max_poll_qps") {
         args.max_poll_qps
@@ -515,6 +528,7 @@ fn run_from_config_file(path: &str, args: &Args, matches: &clap::ArgMatches) -> 
         dns_tcp_packet_loop_burst,
         dns_query_type,
         dns_label_length,
+        dns_label_length_jitter,
         max_poll_qps,
         debug_poll,
         debug_streams,

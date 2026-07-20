@@ -54,6 +54,10 @@ static DNS_QUERY_TYPE: AtomicU16 = AtomicU16::new(16);
 /// (57). Client-only fingerprint knob: the server strips dots before decoding, so this never needs
 /// to match a server setting. Set from Kotlin via nativeSetDnsLabelLength.
 static DNS_LABEL_LENGTH: AtomicU32 = AtomicU32::new(57);
+/// Per-query label-length jitter (chars) below DNS_LABEL_LENGTH (0 = off, the default). Client-only
+/// fingerprint knob; no JNI setter yet, so the Android client leaves it off (constant label length)
+/// unless the CLI/config enables it.
+static DNS_LABEL_LENGTH_JITTER: AtomicU32 = AtomicU32::new(0);
 /// Optional cap on DNS poll queries per second (0 = unlimited). Purely a client-side pacing choice
 /// with no server-side counterpart. Set from Kotlin via nativeSetMaxPollQps.
 static MAX_POLL_QPS: AtomicU32 = AtomicU32::new(0);
@@ -362,6 +366,7 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeStartSlips
                 // (called right before each native start); defaults preserve historical behavior.
                 dns_query_type: DNS_QUERY_TYPE.load(Ordering::Relaxed),
                 dns_label_length: DNS_LABEL_LENGTH.load(Ordering::Relaxed) as usize,
+                dns_label_length_jitter: DNS_LABEL_LENGTH_JITTER.load(Ordering::Relaxed),
                 max_poll_qps: MAX_POLL_QPS.load(Ordering::Relaxed),
                 debug_poll,
                 debug_streams,
@@ -552,6 +557,7 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeStartProbe
                 // (called right before each native start); defaults preserve historical behavior.
                 dns_query_type: DNS_QUERY_TYPE.load(Ordering::Relaxed),
                 dns_label_length: DNS_LABEL_LENGTH.load(Ordering::Relaxed) as usize,
+                dns_label_length_jitter: DNS_LABEL_LENGTH_JITTER.load(Ordering::Relaxed),
                 max_poll_qps: MAX_POLL_QPS.load(Ordering::Relaxed),
                 debug_poll,
                 debug_streams,
