@@ -14,7 +14,7 @@ use self::stall::{
 use crate::dns::{
     add_paths, data_encoding, expire_inflight_polls, handle_dns_response, maybe_report_debug,
     refresh_resolver_path, resolve_resolvers, resolver_mode_to_c, send_poll_queries,
-    sockaddr_storage_to_socket_addr, DnsResponseContext, DnsTransport, PeerAddrMode,
+    sockaddr_storage_to_socket_addr, DnsResponseContext, DnsTransport, PeerAddrMode, TxidGen,
 };
 use crate::error::ClientError;
 use crate::pacing::{
@@ -393,7 +393,9 @@ pub async fn run_client_with_control_and_liveness(
             warn!("GSO is not implemented in the Rust client loop yet.");
         }
 
-        let mut dns_id = 1u16;
+        // Non-sequential DNS transaction IDs (RFC 5452), like a normal randomizing stub resolver.
+        // The old monotonic 1,2,3,... counter was a trivial DPI signature for the tunnel.
+        let mut txid = TxidGen::new();
         let mut recv_buf = vec![0u8; 4096];
         let mut send_buf = vec![0u8; PICOQUIC_MAX_PACKET_SIZE];
         let packet_loop_send_max = loop_burst_total(&resolvers, packet_loop_send_base);
@@ -761,6 +763,7 @@ pub async fn run_client_with_control_and_liveness(
                     }
                 }
 
+                let dns_id = txid.next_id();
                 let packet = match config.upstream_encoding {
                     UpstreamEncoding::Qname => {
                         let qname = build_qname_with_encoding(
@@ -793,7 +796,6 @@ pub async fn run_client_with_control_and_liveness(
                             .map_err(|err| ClientError::new(err.to_string()))?
                     }
                 };
-                dns_id = dns_id.wrapping_add(1);
 
                 let dest = sockaddr_storage_to_socket_addr(&addr_to)?;
                 let dest = peer_addr_mode.canonicalize(dest);
@@ -1043,7 +1045,7 @@ pub async fn run_client_with_control_and_liveness(
                                 &mut dns_transport,
                                 config,
                                 &mut local_addr_storage,
-                                &mut dns_id,
+                                &mut txid,
                                 resolver,
                                 peer_addr_mode,
                                 &mut to_send,
@@ -1074,7 +1076,7 @@ pub async fn run_client_with_control_and_liveness(
                                     &mut dns_transport,
                                     config,
                                     &mut local_addr_storage,
-                                    &mut dns_id,
+                                    &mut txid,
                                     resolver,
                                     peer_addr_mode,
                                     &mut to_send,
@@ -1092,7 +1094,7 @@ pub async fn run_client_with_control_and_liveness(
                                     &mut dns_transport,
                                     config,
                                     &mut local_addr_storage,
-                                    &mut dns_id,
+                                    &mut txid,
                                     resolver,
                                     peer_addr_mode,
                                     &mut pending,

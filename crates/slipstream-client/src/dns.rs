@@ -4,6 +4,7 @@ mod poll;
 mod resolver;
 mod response;
 mod transport;
+mod txid;
 
 pub(crate) use debug::maybe_report_debug;
 pub(crate) use path::{add_paths, refresh_resolver_path, resolver_mode_to_c};
@@ -14,6 +15,7 @@ pub(crate) use resolver::{
 };
 pub(crate) use response::{handle_dns_response, DnsResponseContext};
 pub(crate) use transport::DnsTransport;
+pub(crate) use txid::TxidGen;
 
 /// Translate the client's plain-bool config knob into the DNS crate's encoding choice. Kept as one
 /// spot so every qname-building/parsing call site picks the same encoding the same way.

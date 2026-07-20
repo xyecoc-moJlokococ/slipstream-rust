@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use super::path::refresh_resolver_path;
 use super::resolver::{sockaddr_storage_to_socket_addr, PeerAddrMode, ResolverState};
 use super::transport::DnsTransport;
+use super::txid::TxidGen;
 
 const AUTHORITATIVE_POLL_TIMEOUT_US: u64 = 5_000_000;
 
@@ -37,7 +38,7 @@ pub(crate) async fn send_poll_queries(
     dns_transport: &mut DnsTransport,
     config: &ClientConfig<'_>,
     local_addr_storage: &mut slipstream_ffi::SockaddrStorage,
-    dns_id: &mut u16,
+    txid: &mut TxidGen,
     resolver: &mut ResolverState,
     peer_addr_mode: PeerAddrMode,
     remaining: &mut usize,
@@ -88,7 +89,7 @@ pub(crate) async fn send_poll_queries(
         resolver.debug.send_bytes = resolver.debug.send_bytes.saturating_add(send_length as u64);
         resolver.debug.polls_sent = resolver.debug.polls_sent.saturating_add(1);
 
-        let poll_id = *dns_id;
+        let poll_id = txid.next_id();
         let packet = match config.upstream_encoding {
             UpstreamEncoding::Qname => {
                 let qname = build_qname_with_encoding(
@@ -121,7 +122,6 @@ pub(crate) async fn send_poll_queries(
                     .map_err(|err| ClientError::new(err.to_string()))?
             }
         };
-        *dns_id = dns_id.wrapping_add(1);
 
         let dest = sockaddr_storage_to_socket_addr(&addr_to)?;
         let dest = peer_addr_mode.canonicalize(dest);
