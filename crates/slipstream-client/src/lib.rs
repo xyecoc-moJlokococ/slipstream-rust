@@ -54,9 +54,10 @@ static DNS_QUERY_TYPE: AtomicU16 = AtomicU16::new(16);
 /// (57). Client-only fingerprint knob: the server strips dots before decoding, so this never needs
 /// to match a server setting. Set from Kotlin via nativeSetDnsLabelLength.
 static DNS_LABEL_LENGTH: AtomicU32 = AtomicU32::new(57);
-/// Per-query label-length jitter (chars) below DNS_LABEL_LENGTH (0 = off, the default). Client-only
-/// fingerprint knob; no JNI setter yet, so the Android client leaves it off (constant label length)
-/// unless the CLI/config enables it.
+/// Per-query label-length jitter (chars) below DNS_LABEL_LENGTH (0 = off). Client-only fingerprint
+/// knob; the server strips dots before decoding, so this never needs to match a server setting. Set
+/// from Kotlin via nativeSetDnsLabelLengthJitter before each start; the Android client defaults to a
+/// small non-zero jitter so the "every label is exactly N chars" signature is broken out of the box.
 static DNS_LABEL_LENGTH_JITTER: AtomicU32 = AtomicU32::new(0);
 /// Optional cap on DNS poll queries per second (0 = unlimited). Purely a client-side pacing choice
 /// with no server-side counterpart. Set from Kotlin via nativeSetMaxPollQps.
@@ -168,6 +169,23 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeSetDnsLabe
         57
     };
     DNS_LABEL_LENGTH.store(value, Ordering::Relaxed);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeSetDnsLabelLengthJitter(
+    _env: JNIEnv<'_>,
+    _this: JObject<'_>,
+    jitter: jint,
+) {
+    // Chars of per-query jitter applied *below* the label length. Negative -> off (0). The upper
+    // bound is a sanity clamp (a full DNS label is 63); the engine floors the effective minimum
+    // label length at 1 regardless, so any value here is safe.
+    let value = if jitter > 0 {
+        (jitter as u32).min(63)
+    } else {
+        0
+    };
+    DNS_LABEL_LENGTH_JITTER.store(value, Ordering::Relaxed);
 }
 
 #[no_mangle]
