@@ -129,6 +129,7 @@ pub extern "system" fn JNI_OnLoad(vm: JavaVM, _reserved: *mut std::ffi::c_void) 
         }
         platform::set_java_vm(vm);
         platform::init_android_logging();
+        platform::install_panic_hook();
     }
     #[cfg(not(target_os = "android"))]
     let _ = vm;

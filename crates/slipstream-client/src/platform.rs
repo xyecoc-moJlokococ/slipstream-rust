@@ -47,6 +47,32 @@ pub(crate) fn init_android_logging() {
         .try_init();
 }
 
+/// Persist the panic thread/location/message to the native log file BEFORE the process aborts (this
+/// crate is built with panic="abort", and the client is compiled with `invariant-panic`). Without
+/// this, an engine panic surfaces only as a bare SIGABRT that the hev-socks5-tunnel C signal handler
+/// mislabels as `component=hev-socks5-tunnel` with no message, hiding the real fault site.
+pub(crate) fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown location>".to_string());
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+        let thread = std::thread::current()
+            .name()
+            .unwrap_or("<unnamed>")
+            .to_string();
+        write_native_log(6, &format!("RUST PANIC thread='{thread}' at {loc}: {msg}"));
+        default(info);
+    }));
+}
+
 pub(crate) fn set_log_file_path(path: Option<String>) {
     let slot = LOG_FILE.get_or_init(|| Mutex::new(None));
     if let Ok(mut value) = slot.lock() {
