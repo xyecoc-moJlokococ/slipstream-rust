@@ -252,8 +252,15 @@ static int encode_response_packet(uint16_t id, const dns_question_t *question, b
 
         response.ancount = 1;
         response.answers = (dns_answer_t *)&answer_txt;
-    } else if (error_rcode == RCODE_OKAY) {
-        response.rcode = RCODE_NAME_ERROR;
+    }
+
+    /* Mirror encode_response_with_ttl_into (crates/slipstream-dns/src/codec.rs): the server never
+       puts NXDOMAIN on the wire. We are authoritative for the whole tunnel zone, so an undecodable
+       query is NODATA (NOERROR + empty answer), not a non-existent name. Emitting NXDOMAIN lets a
+       resolver apply RFC 8020 and serve NXDOMAIN for the ENTIRE subtree from cache without ever
+       querying us again, which kills the tunnel behind that resolver. Keep FORMAT_ERROR/SERVFAIL. */
+    if (response.rcode == RCODE_NAME_ERROR) {
+        response.rcode = RCODE_OKAY;
     }
 
     dns_rcode_t rc = dns_encode((dns_packet_t *)out, out_len, &response);

@@ -337,11 +337,24 @@ pub fn encode_response_with_ttl_into(
     let payload = params.payload.unwrap_or(&[]);
     let per_record = max_bytes_per_record(params.question.qtype, params.encoding);
 
-    let mut rcode = params.rcode.unwrap_or(if payload_len > 0 {
-        Rcode::Ok
-    } else {
-        Rcode::NameError
-    });
+    // NEVER answer NXDOMAIN. We are authoritative for the whole tunnel zone, so every name under it
+    // exists by construction: a query we cannot decode is just a name carrying no data of the
+    // requested type, i.e. NODATA (NOERROR + empty answer) -- not a non-existent name.
+    //
+    // Emitting NXDOMAIN here is actively harmful. Under RFC 8020 ("NXDOMAIN really means NXDOMAIN")
+    // a resolver that sees NXDOMAIN for the zone apex may answer NXDOMAIN for the ENTIRE subtree
+    // from cache without ever querying us again -- silently killing the tunnel for every client
+    // behind it. Observed live: a strict operator resolver stopped forwarding the zone altogether
+    // (0 packets reached the server) while permissive resolvers kept working.
+    //
+    // This keeps the original anti-SERVFAIL property intact: we still never look like a failing
+    // authoritative server, so resolvers don't retry-amplify or damp the domain. Leaving NSCOUNT=0
+    // (no SOA in AUTHORITY) is deliberate -- without it resolvers cannot negatively cache the
+    // answer, which is exactly what a tunnel wants. FormatError/ServerFailure are left untouched.
+    let rcode = match params.rcode.unwrap_or(Rcode::Ok) {
+        Rcode::NameError => Rcode::Ok,
+        other => other,
+    };
 
     let mut ancount = 0u16;
     if payload_len > 0 && rcode == Rcode::Ok {
@@ -353,8 +366,6 @@ pub fn encode_response_with_ttl_into(
             return Err(DnsError::new("payload too long"));
         }
         ancount = count as u16;
-    } else if params.rcode.is_some() {
-        rcode = params.rcode.unwrap_or(Rcode::Ok);
     }
 
     out.clear();
