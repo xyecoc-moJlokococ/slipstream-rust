@@ -68,7 +68,24 @@ pub(crate) fn install_panic_hook() {
             .name()
             .unwrap_or("<unnamed>")
             .to_string();
-        write_native_log(6, &format!("RUST PANIC thread='{thread}' at {loc}: {msg}"));
+        let line = format!("RUST PANIC thread='{thread}' at {loc}: {msg}");
+        write_native_log(6, &line);
+        // Also append to a dedicated, never-truncated file. The native log file (vaydns-debug.log)
+        // is recreated per app session, so the auto-restart after the abort wipes this line before
+        // it can be read; this persistent append-only file (mirroring the C crash log) survives.
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_millis())
+            .unwrap_or(0);
+        for path in [
+            "/data/data/app.vaydns/files/rust-panic.log",
+            "/data/user/0/app.vaydns/files/rust-panic.log",
+        ] {
+            if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+                let _ = file.write_all(format!("{ts} {line}\n").as_bytes());
+                break;
+            }
+        }
         default(info);
     }));
 }

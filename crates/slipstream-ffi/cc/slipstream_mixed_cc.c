@@ -44,9 +44,29 @@ static picoquic_congestion_algorithm_t const* slipstream_select_cc(picoquic_path
     return picoquic_dcubic_algorithm;
 }
 
+/* Resolve the algorithm for a path that already owns congestion_alg_state: ALWAYS the one pinned
+   when that state was allocated. Re-running slipstream_select_cc here is a heap-corruption bug --
+   the selection reads mutable state (per-path mode + global override) which really does change
+   while a connection is live (apply_path_mode runs again on resolver refresh), so a later callback
+   could interpret the state as a different algorithm's struct: dcubic's notify memsets a ~120-byte
+   picoquic_cubic_state_t over slipstream_server_cc's 4-byte allocation. Falls back to a fresh
+   selection only for paths never initialised through us (pin still NULL). */
+static picoquic_congestion_algorithm_t const* slipstream_pinned_cc(picoquic_path_t* path_x)
+{
+    if (path_x->slipstream_cc_alg != NULL) {
+        return path_x->slipstream_cc_alg;
+    }
+    return slipstream_select_cc(path_x);
+}
+
 static void slipstream_mixed_cc_init(picoquic_cnx_t* cnx, picoquic_path_t* path_x, uint64_t current_time)
 {
+    /* The one place a fresh selection is correct: this is the pinning point. */
     picoquic_congestion_algorithm_t const* alg = slipstream_select_cc(path_x);
+    /* Pin before delegating: alg_init allocates congestion_alg_state, and every later callback must
+       dispatch to this same algorithm. picoquic may re-init a live path (see
+       picoquic_set_congestion_algorithm), which re-pins in step with the newly allocated state. */
+    path_x->slipstream_cc_alg = alg;
     if (alg != NULL && alg->alg_init != NULL) {
         alg->alg_init(cnx, path_x, current_time);
     }
@@ -59,7 +79,7 @@ static void slipstream_mixed_cc_notify(
     picoquic_per_ack_state_t* ack_state,
     uint64_t current_time)
 {
-    picoquic_congestion_algorithm_t const* alg = slipstream_select_cc(path_x);
+    picoquic_congestion_algorithm_t const* alg = slipstream_pinned_cc(path_x);
     if (alg != NULL && alg->alg_notify != NULL) {
         alg->alg_notify(cnx, path_x, notification, ack_state, current_time);
     }
@@ -67,15 +87,17 @@ static void slipstream_mixed_cc_notify(
 
 static void slipstream_mixed_cc_delete(picoquic_path_t* path_x)
 {
-    picoquic_congestion_algorithm_t const* alg = slipstream_select_cc(path_x);
+    picoquic_congestion_algorithm_t const* alg = slipstream_pinned_cc(path_x);
     if (alg != NULL && alg->alg_delete != NULL) {
         alg->alg_delete(path_x);
     }
+    /* State is gone; unpin so a later init cannot be mistaken for the old allocation. */
+    path_x->slipstream_cc_alg = NULL;
 }
 
 static void slipstream_mixed_cc_observe(picoquic_path_t* path_x, uint64_t* cc_state, uint64_t* cc_param)
 {
-    picoquic_congestion_algorithm_t const* alg = slipstream_select_cc(path_x);
+    picoquic_congestion_algorithm_t const* alg = slipstream_pinned_cc(path_x);
     if (alg != NULL && alg->alg_observe != NULL) {
         alg->alg_observe(path_x, cc_state, cc_param);
         return;
