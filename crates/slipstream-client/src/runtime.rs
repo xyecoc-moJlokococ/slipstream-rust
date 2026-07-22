@@ -614,6 +614,10 @@ pub async fn run_client_with_control_and_liveness(
                                     encoding: data_encoding(config),
                                 },
                             )?;
+                            // Apply consumes deferred by the stream-data callback, now that we are
+                            // OUTSIDE picoquic's callback loop (avoids the re-entrant stream delete /
+                            // double-recycle). See ClientState::drain_pending_consumes.
+                            unsafe { (*state_ptr).drain_pending_consumes(cnx) };
                             for _ in 1..packet_loop_recv_max {
                                 // Same hazard as the send burst below: draining a backlog of
                                 // already-buffered responses (e.g. a bloated per-stream reassembly
@@ -644,6 +648,8 @@ pub async fn run_client_with_control_and_liveness(
                                                 encoding: data_encoding(config),
                                             },
                                         )?;
+                                        // Apply deferred consumes outside picoquic's callback loop.
+                                        unsafe { (*state_ptr).drain_pending_consumes(cnx) };
                                     }
                                     Ok(None) => break,
                                     Err(err) => {

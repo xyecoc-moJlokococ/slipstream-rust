@@ -1,7 +1,9 @@
 use super::acceptor;
 use super::io_tasks::StreamWrite;
 use slipstream_core::flow_control::{FlowControlState, HasFlowControlState};
-use slipstream_ffi::picoquic::{picoquic_cnx_t, slipstream_get_stream_send_debug};
+use slipstream_ffi::picoquic::{
+    picoquic_cnx_t, picoquic_stream_data_consumed, slipstream_get_stream_send_debug,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::TcpStream as TokioTcpStream;
@@ -30,6 +32,14 @@ pub(crate) struct ClientState {
     pub(super) debug_enqueued_bytes: u64,
     pub(super) debug_last_enqueue_at: u64,
     pub(super) acceptor_limit_logged: bool,
+    /// Deferred stream-consume offsets (stream_id -> highest consumed offset), applied by
+    /// [`Self::drain_pending_consumes`] from the main loop. In deferred-consumption mode we must NOT
+    /// call `picoquic_stream_data_consumed` from inside `handle_stream_data` (the picoquic stream-data
+    /// callback): that runs inside picoquic's `picoquic_stream_data_callback` consume loop, and the
+    /// consume can delete the just-finished stream, freeing the very node the loop still holds ->
+    /// double-recycle / use-after-free. Recording the offset here and applying it after the callback
+    /// unwinds breaks that re-entrancy.
+    pub(super) pending_consumes: HashMap<u64, u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +130,43 @@ impl ClientState {
             debug_enqueued_bytes: 0,
             debug_last_enqueue_at: 0,
             acceptor_limit_logged: false,
+            pending_consumes: HashMap::new(),
+        }
+    }
+
+    /// Record a deferred consume for `stream_id` up to `target_offset`, keeping the highest offset
+    /// seen (consume is monotonic). Applied later by [`Self::drain_pending_consumes`].
+    pub(super) fn queue_consume(&mut self, stream_id: u64, target_offset: u64) {
+        self.pending_consumes
+            .entry(stream_id)
+            .and_modify(|e| {
+                if target_offset > *e {
+                    *e = target_offset;
+                }
+            })
+            .or_insert(target_offset);
+    }
+
+    /// Apply every deferred consume via `picoquic_stream_data_consumed`. MUST be called from the main
+    /// runtime loop, OUTSIDE any picoquic callback (i.e. after `handle_dns_response` /
+    /// `picoquic_incoming_packet_ex` returns) so the stream deletion this can trigger is not
+    /// re-entrant. One call per stream, to its highest offset, so a lower-then-higher pair can't
+    /// delete the stream before the higher call runs.
+    ///
+    /// # Safety
+    /// `cnx` must be the live connection these stream ids belong to.
+    pub(crate) fn drain_pending_consumes(&mut self, cnx: *mut picoquic_cnx_t) {
+        if self.pending_consumes.is_empty() {
+            return;
+        }
+        for (stream_id, offset) in std::mem::take(&mut self.pending_consumes) {
+            let ret = unsafe { picoquic_stream_data_consumed(cnx, stream_id, offset) };
+            if ret < 0 {
+                debug!(
+                    "stream {}: deferred consume to offset {} failed ret={}",
+                    stream_id, offset, ret
+                );
+            }
         }
     }
 

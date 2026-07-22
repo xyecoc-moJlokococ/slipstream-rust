@@ -8,7 +8,6 @@ use slipstream_core::flow_control::{
 use slipstream_ffi::picoquic::{
     picoquic_call_back_event_t, picoquic_cnx_t, picoquic_get_close_reasons, picoquic_get_cnx_state,
     picoquic_provide_stream_data_buffer, picoquic_reset_stream, picoquic_stop_sending,
-    picoquic_stream_data_consumed,
 };
 use slipstream_ffi::{abort_stream_bidi, SLIPSTREAM_FILE_CANCEL_ERROR, SLIPSTREAM_INTERNAL_ERROR};
 use tokio::sync::mpsc;
@@ -138,6 +137,11 @@ pub(super) fn handle_stream_data(
     let debug_streams = state.debug_streams;
     let mut reset_stream = false;
     let mut remove_stream = false;
+    // Deferred consume: the `consume` op below records the target offset here instead of calling
+    // picoquic_stream_data_consumed synchronously (which, from inside picoquic's data-callback loop,
+    // could delete this stream and free the node the loop still holds -> double-recycle). We apply it
+    // from the main loop via ClientState::drain_pending_consumes after this callback unwinds.
+    let mut consume_target: Option<u64> = None;
     let multi_stream = state.multi_stream_mode;
     let reserve_bytes = if multi_stream {
         0
@@ -184,8 +188,15 @@ pub(super) fn handle_stream_data(
                     let (drain_tx, _drain_rx) = mpsc::unbounded_channel();
                     stream.write_tx = drain_tx;
                 },
-                consume: |new_offset| unsafe {
-                    picoquic_stream_data_consumed(cnx, stream_id, new_offset)
+                consume: |new_offset| {
+                    // Defer, don't call picoquic_stream_data_consumed here (re-entrancy: see
+                    // consume_target). Keep the highest target; report success so the flow-control
+                    // bookkeeping in handle_stream_receive advances as before.
+                    consume_target = Some(match consume_target {
+                        Some(current) => current.max(new_offset),
+                        None => new_offset,
+                    });
+                    0
                 },
                 stop_sending: || {
                     let _ =
@@ -252,6 +263,16 @@ pub(super) fn handle_stream_data(
             && stream.flow.queued_bytes == 0
         {
             remove_stream = true;
+        }
+    }
+
+    // The `stream` borrow has ended; record the deferred consume for the main loop to apply. Skip on
+    // reset: we are force-aborting, so advancing the consumed offset is moot and the abort drives
+    // picoquic-side cleanup. On a normal finish (remove_stream) we still queue it -- that consume is
+    // what lets picoquic close the stream, now safely from outside its callback loop.
+    if let Some(target) = consume_target {
+        if !reset_stream {
+            state.queue_consume(stream_id, target);
         }
     }
 
