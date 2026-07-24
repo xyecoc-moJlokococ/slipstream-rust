@@ -55,8 +55,9 @@ use slipstream_dns::{encode_response_with_ttl_into, ResponseParams};
 #[cfg(not(target_os = "linux"))]
 use slipstream_ffi::picoquic::PICOQUIC_PACKET_LOOP_RECV_MAX;
 use slipstream_ffi::picoquic::{
-    picoquic_create, picoquic_current_time, picoquic_prepare_packet_ex,
-    slipstream_has_ready_stream, slipstream_is_flow_blocked, slipstream_server_cc_algorithm,
+    picoquic_create, picoquic_current_time, picoquic_get_first_cnx, picoquic_get_next_cnx,
+    picoquic_prepare_packet_ex, picoquic_quic_t, slipstream_has_ready_stream,
+    slipstream_is_flow_blocked, slipstream_server_cc_algorithm,
     PICOQUIC_MAX_PACKET_SIZE,
 };
 use slipstream_ffi::{
@@ -720,6 +721,19 @@ async fn run_worker(
     #[cfg(target_os = "linux")]
     let mut send_scratch = SendBatchScratch::new();
 
+    // UDP lazy-response hold (see the same block in server.rs::run_server_single). Parks an empty
+    // poll for up to this long so downlink data rides back on it instead of costing the client a
+    // whole extra round-trip. 0 = disabled. Env-tunable so rollout/rollback is a restart.
+    let udp_lazy_hold_us: u64 = std::env::var("SLIPSTREAM_UDP_LAZY_HOLD_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0)
+        .saturating_mul(1000);
+    let mut held: Vec<(Slot, u64)> = Vec::new();
+    if udp_lazy_hold_us > 0 && worker_id == 0 {
+        tracing::info!("UDP lazy-response hold enabled: {} us", udp_lazy_hold_us);
+    }
+
     loop {
         drain_commands(state_ptr, &mut command_rx);
 
@@ -832,12 +846,15 @@ async fn run_worker(
         drain_commands(state_ptr, &mut command_rx);
         maybe_report_command_stats(state_ptr);
 
-        if slots.is_empty() {
+        if slots.is_empty() && held.is_empty() {
             continue;
         }
 
         respond_slots(
             &mut slots,
+            &mut held,
+            udp_lazy_hold_us,
+            quic,
             state_ptr,
             &udp,
             &mut send_buf,
@@ -858,7 +875,10 @@ async fn run_worker(
 
 #[allow(clippy::too_many_arguments)]
 async fn respond_slots(
-    slots: &mut [Slot],
+    slots: &mut Vec<Slot>,
+    held: &mut Vec<(Slot, u64)>,
+    udp_lazy_hold_us: u64,
+    quic: *mut picoquic_quic_t,
     state_ptr: *mut ServerState,
     udp: &tokio::net::UdpSocket,
     send_buf: &mut [u8],
@@ -870,17 +890,50 @@ async fn respond_slots(
     response_ttl_jitter: u32,
     map_ipv4_peers: bool,
 ) -> Result<(), ServerError> {
+    const MAX_HELD_SLOTS: usize = 1024;
     let loop_time = unsafe { picoquic_current_time() };
     #[cfg(target_os = "linux")]
-    let mut udp_responses: Vec<(Vec<u8>, SocketAddr)> = Vec::with_capacity(slots.len());
+    let mut udp_responses: Vec<(Vec<u8>, SocketAddr)> =
+        Vec::with_capacity(slots.len() + held.len());
 
-    for slot in slots.iter_mut() {
+    // Live-connection set so a held poll never prepares on a cnx that idle-GC freed mid-hold.
+    let live_cnxs: std::collections::HashSet<usize> = if udp_lazy_hold_us > 0 && !held.is_empty() {
+        let mut set = std::collections::HashSet::with_capacity(held.len());
+        let mut c = unsafe { picoquic_get_first_cnx(quic) };
+        while !c.is_null() {
+            set.insert(c as usize);
+            c = unsafe { picoquic_get_next_cnx(c) };
+        }
+        set
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    // Working set = carried-over held polls (with their deadlines) + this iteration's fresh slots.
+    let mut work: Vec<(Slot, Option<u64>)> = Vec::with_capacity(held.len() + slots.len());
+    for (slot, deadline) in held.drain(..) {
+        work.push((slot, Some(deadline)));
+    }
+    for slot in slots.drain(..) {
+        work.push((slot, None));
+    }
+    let mut next_held: Vec<(Slot, u64)> = Vec::new();
+
+    for (mut slot, carried_deadline) in work.drain(..) {
         let mut send_length = 0usize;
         let mut addr_to: slipstream_ffi::SockaddrStorage = unsafe { std::mem::zeroed() };
         let mut addr_from: slipstream_ffi::SockaddrStorage = unsafe { std::mem::zeroed() };
         let mut if_index: libc::c_int = 0;
 
-        if slot.payload_override.is_none() && slot.rcode.is_none() && !slot.cnx.is_null() {
+        let cnx_dead = carried_deadline.is_some()
+            && !slot.cnx.is_null()
+            && !live_cnxs.contains(&(slot.cnx as usize));
+
+        if slot.payload_override.is_none()
+            && slot.rcode.is_none()
+            && !slot.cnx.is_null()
+            && !cnx_dead
+        {
             let ret = unsafe {
                 picoquic_prepare_packet_ex(
                     slot.cnx,
@@ -936,6 +989,26 @@ async fn respond_slots(
                     );
                     *last_flow_block_log_at = loop_time;
                 }
+            }
+        }
+
+        // LAZY HOLD (v1): nothing at all to send for this poll -- park it (up to udp_lazy_hold_us)
+        // instead of burning it on an empty answer, so the client doesn't have to spend another
+        // query to collect whatever lands a moment later. Measured ~6x fewer client queries
+        // (500 -> 85 q/s), relieving the mobile return path, the radio and the server.
+        if udp_lazy_hold_us > 0
+            && send_length == 0
+            && slot.payload_override.is_none()
+            && slot.rcode.is_none()
+            && slot.tcp_response.is_none()
+            && !slot.cnx.is_null()
+            && !cnx_dead
+        {
+            let deadline =
+                carried_deadline.unwrap_or_else(|| loop_time.saturating_add(udp_lazy_hold_us));
+            if loop_time < deadline && next_held.len() < MAX_HELD_SLOTS {
+                next_held.push((slot, deadline));
+                continue;
             }
         }
 
@@ -1015,6 +1088,7 @@ async fn respond_slots(
             }
         }
     }
+    *held = next_held;
     #[cfg(target_os = "linux")]
     {
         send_batch(udp, &mut udp_responses, send_scratch)

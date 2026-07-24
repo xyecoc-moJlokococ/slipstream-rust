@@ -397,6 +397,23 @@ async fn run_server_single(config: &ServerConfig) -> Result<i32, ServerError> {
     #[cfg(target_os = "linux")]
     let mut send_scratch = SendBatchScratch::new();
 
+    // UDP lazy-response ("hold") window: park an empty poll up to this long so downlink data that
+    // arrives within it rides back on THIS poll instead of forcing the client to send a fresh one
+    // (which, under return-path loss on mobile, is what inflates interactive latency). Mirrors the
+    // TCP long-poll (DNS_TCP_RESPONSE_TIMEOUT) but far shorter, to stay under the recursive
+    // resolver's own timeout and picoquic's ~215ms poll retransmit (see RETRANSMIT_REPLAY_WINDOW).
+    // 0 = disabled (historical immediate-answer). Env-tunable so rollout/rollback is just a restart.
+    let udp_lazy_hold_us: u64 = std::env::var("SLIPSTREAM_UDP_LAZY_HOLD_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0)
+        .saturating_mul(1000);
+    const MAX_HELD_SLOTS: usize = 1024;
+    let mut held: Vec<(Slot, u64)> = Vec::new();
+    if udp_lazy_hold_us > 0 {
+        tracing::info!("UDP lazy-response hold enabled: {} us", udp_lazy_hold_us);
+    }
+
     loop {
         drain_commands(state_ptr, &mut command_rx);
 
@@ -609,21 +626,59 @@ async fn run_server_single(config: &ServerConfig) -> Result<i32, ServerError> {
         drain_commands(state_ptr, &mut command_rx);
         maybe_report_command_stats(state_ptr);
 
-        if slots.is_empty() {
+        if slots.is_empty() && held.is_empty() {
             continue;
         }
 
+        // Live-connection set, built once per iteration, so a held poll never calls
+        // prepare_packet_ex on a cnx that idle-GC freed mid-hold. (A held poll implies activity
+        // within the hold window, so GC won't actually have reached it -- this just makes the
+        // raw-pointer use provably safe against a close/GC race.)
+        let live_cnxs: std::collections::HashSet<usize> =
+            if udp_lazy_hold_us > 0 && !held.is_empty() {
+                let mut set = std::collections::HashSet::with_capacity(held.len());
+                let mut c = unsafe { picoquic_get_first_cnx(quic) };
+                while !c.is_null() {
+                    set.insert(c as usize);
+                    c = unsafe { picoquic_get_next_cnx(c) };
+                }
+                set
+            } else {
+                std::collections::HashSet::new()
+            };
+
         let loop_time = unsafe { picoquic_current_time() };
         #[cfg(target_os = "linux")]
-        let mut udp_responses: Vec<(Vec<u8>, SocketAddr)> = Vec::with_capacity(slots.len());
+        let mut udp_responses: Vec<(Vec<u8>, SocketAddr)> =
+            Vec::with_capacity(slots.len() + held.len());
 
-        for slot in slots.iter_mut() {
+        // Working set = carried-over held polls (each still carrying its deadline) + this
+        // iteration's fresh slots (deadline None until first parked). Survivors re-park in next_held.
+        let mut work: Vec<(Slot, Option<u64>)> = Vec::with_capacity(held.len() + slots.len());
+        for (slot, deadline) in held.drain(..) {
+            work.push((slot, Some(deadline)));
+        }
+        for slot in slots.drain(..) {
+            work.push((slot, None));
+        }
+        let mut next_held: Vec<(Slot, u64)> = Vec::new();
+
+        for (mut slot, carried_deadline) in work.drain(..) {
             let mut send_length = 0usize;
             let mut addr_to: slipstream_ffi::SockaddrStorage = unsafe { std::mem::zeroed() };
             let mut addr_from: slipstream_ffi::SockaddrStorage = unsafe { std::mem::zeroed() };
             let mut if_index: libc::c_int = 0;
 
-            if slot.payload_override.is_none() && slot.rcode.is_none() && !slot.cnx.is_null() {
+            // A carried held poll whose cnx vanished (close/GC) must never be prepared.
+            let cnx_dead = carried_deadline.is_some()
+                && !slot.cnx.is_null()
+                && !live_cnxs.contains(&(slot.cnx as usize));
+
+            if slot.payload_override.is_none()
+                && slot.rcode.is_none()
+                && !slot.cnx.is_null()
+                && !cnx_dead
+            {
                 let ret = unsafe {
                     picoquic_prepare_packet_ex(
                         slot.cnx,
@@ -681,6 +736,29 @@ async fn run_server_single(config: &ServerConfig) -> Result<i32, ServerError> {
                         last_flow_block_log_at = loop_time;
                     }
                 }
+            }
+
+            // LAZY HOLD (v1): picoquic had nothing at all to send for this poll, so answering now
+            // would burn the poll on an empty answer and force the client to spend another query to
+            // pick up whatever lands a moment later. Park it instead (up to udp_lazy_hold_us) and
+            // re-prepare on later iterations; measured to cut the client's poll flood ~6x
+            // (500 -> 85 q/s), which is what relieves the mobile return path, the radio and the
+            // server. Anything with real data, an override, an rcode or a TCP responder never parks.
+            if udp_lazy_hold_us > 0
+                && send_length == 0
+                && slot.payload_override.is_none()
+                && slot.rcode.is_none()
+                && slot.tcp_response.is_none()
+                && !slot.cnx.is_null()
+                && !cnx_dead
+            {
+                let deadline =
+                    carried_deadline.unwrap_or_else(|| loop_time.saturating_add(udp_lazy_hold_us));
+                if loop_time < deadline && next_held.len() < MAX_HELD_SLOTS {
+                    next_held.push((slot, deadline));
+                    continue;
+                }
+                // Deadline reached (or hold cap hit): fall through and answer empty now.
             }
 
             let cnx_id = slot.cnx as usize;
@@ -760,6 +838,7 @@ async fn run_server_single(config: &ServerConfig) -> Result<i32, ServerError> {
                 }
             }
         }
+        held = next_held;
         #[cfg(target_os = "linux")]
         {
             send_batch(&udp, &mut udp_responses, &mut send_scratch)
