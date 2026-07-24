@@ -420,7 +420,7 @@ pub async fn run_client_with_control_and_liveness(
         // Fixed data-bearing DNS QPS cap (no thrash-adaptive). 0 = unlimited.
         let mut data_window_start_us = 0u64;
         let mut data_window_sent: u32 = 0;
-        let mut data_qps_cap = crate::resolve_max_data_qps();
+        let mut data_qps_cap = crate::data_qps::resolve_max_data_qps();
         if data_qps_cap > 0 || config.max_poll_qps > 0 {
             warn!(
                 "split DNS budgets: upload_data_qps={} download_poll_qps={} (0=unlimited; polls reserved during upload)",
@@ -702,7 +702,7 @@ pub async fn run_client_with_control_and_liveness(
                 {
                     data_window_start_us = current_time;
                     data_window_sent = 0;
-                    let new_cap = crate::resolve_max_data_qps();
+                    let new_cap = crate::data_qps::resolve_max_data_qps();
                     if new_cap != data_qps_cap {
                         warn!("data_qps_cap {} -> {}", data_qps_cap, new_cap);
                         data_qps_cap = new_cap;

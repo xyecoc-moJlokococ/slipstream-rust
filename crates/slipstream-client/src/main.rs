@@ -1,3 +1,4 @@
+mod data_qps;
 mod dns;
 mod error;
 mod pacing;
