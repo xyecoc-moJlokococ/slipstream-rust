@@ -38,7 +38,7 @@ use crate::mmsg::{recv_ready, send_batch, try_recv_once, RecvMmsgBatch, SendBatc
 use crate::server::{
     bind_tcp_listener, bind_udp_socket, map_io, maybe_gc_idle_connections, note_active_connections,
     ServerConfig, ServerError, Slot, DNS_MAX_QUERY_SIZE, FLOW_BLOCKED_LOG_INTERVAL_US,
-    IDLE_SLEEP_MS, QUIC_MTU, RETRANSMIT_REPLAY_WINDOW, SHOULD_SHUTDOWN, SLIPSTREAM_ALPN,
+    IDLE_SLEEP_MS, RETRANSMIT_REPLAY_WINDOW, SHOULD_SHUTDOWN, SLIPSTREAM_ALPN,
 };
 #[cfg(target_os = "linux")]
 use crate::server::RECVMMSG_BATCH;
@@ -105,6 +105,7 @@ struct WorkerSpawnConfig {
     domains: Vec<String>,
     max_connections: u32,
     max_half_open_connections: u32,
+    max_mtu: u32,
     idle_timeout_seconds: u64,
     debug_streams: bool,
     debug_commands: bool,
@@ -245,6 +246,7 @@ pub(crate) async fn run_server_multi(config: &ServerConfig) -> Result<i32, Serve
             domains: config.domains.clone(),
             max_connections: config.max_connections,
             max_half_open_connections: config.max_half_open_connections,
+            max_mtu: config.max_mtu,
             idle_timeout_seconds: config.idle_timeout_seconds,
             debug_streams: config.debug_streams,
             debug_commands: config.debug_commands,
@@ -699,7 +701,7 @@ async fn run_worker(
                 "Slipstream server congestion algorithm is unavailable",
             ));
         }
-        configure_quic_with_custom(quic, slipstream_server_cc_algorithm, QUIC_MTU);
+        configure_quic_with_custom(quic, slipstream_server_cc_algorithm, cfg.max_mtu);
         set_server_stream_data_control(quic);
         set_server_half_open_retry_threshold(quic, cfg.max_half_open_connections);
     }

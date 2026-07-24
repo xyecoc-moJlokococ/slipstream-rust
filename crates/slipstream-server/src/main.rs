@@ -65,6 +65,17 @@ struct Args {
     /// without a rebuild.
     #[arg(long = "max-half-open-connections", default_value_t = 4, value_parser = parse_max_half_open_connections)]
     max_half_open_connections: u32,
+    /// Max QUIC packet size the server emits = tunnel bytes carried by ONE DNS answer (default 900).
+    ///
+    /// Higher means fewer DNS round trips per downloaded byte, which is the lever where the return
+    /// path is policed by packet *rate* (a mobile operator measured ~78% of answers delivered at
+    /// 34 q/s vs ~24% at 225 q/s) and it also cuts handset radio airtime. Upper bound 1440 is
+    /// vendored picoquic's `PICOQUIC_PRACTICAL_MAX_MTU` (its send buffer is 1536).
+    ///
+    /// Only raise past ~1150 when clients use the DNS-over-**TCP** carrier: over UDP the answer must
+    /// still fit the advertised EDNS buffer (1232) or resolvers truncate it. SIP003 option: `max-mtu`.
+    #[arg(long = "max-mtu", default_value_t = server::QUIC_MTU, value_parser = parse_max_mtu)]
+    max_mtu: u32,
     #[arg(long = "idle-timeout-seconds", default_value_t = 60)]
     idle_timeout_seconds: u64,
     #[arg(long = "debug-streams")]
@@ -211,6 +222,16 @@ fn main() {
         args.max_half_open_connections
     };
 
+    // Same SIP003 reasoning as max-half-open-connections above: under a plugin manager there is no
+    // CLI, and response size is exactly the knob an operator needs to tune per carrier.
+    let max_mtu = if cli_provided(&matches, "max_mtu") {
+        args.max_mtu
+    } else if let Some(value) = sip003::last_option_value(&sip003_env.plugin_options, "max-mtu") {
+        unwrap_or_exit(parse_max_mtu(&value), "SIP003 env error", 2)
+    } else {
+        args.max_mtu
+    };
+
     let workers = if cli_provided(&matches, "workers") {
         args.workers
     } else if let Some(value) = sip003::last_option_value(&sip003_env.plugin_options, "workers") {
@@ -230,6 +251,7 @@ fn main() {
         domains,
         max_connections,
         max_half_open_connections,
+        max_mtu,
         idle_timeout_seconds: args.idle_timeout_seconds,
         debug_streams: args.debug_streams,
         debug_commands: args.debug_commands,
@@ -289,6 +311,23 @@ fn parse_max_half_open_connections(input: &str) -> Result<u32, String> {
     // least 1 so this knob only ever engages once concurrency actually appears.
     if value == 0 {
         return Err("max-half-open-connections must be at least 1".to_string());
+    }
+    Ok(value)
+}
+
+/// Lower bound 512 keeps a raise from silently *shrinking* answers below the historical 900 by
+/// typo; upper bound 1440 is vendored picoquic's `PICOQUIC_PRACTICAL_MAX_MTU` — beyond it picoquic's
+/// own 1536-byte packet buffer and MTU logic would need patching, so reject rather than pretend.
+fn parse_max_mtu(input: &str) -> Result<u32, String> {
+    let trimmed = input.trim();
+    let value = trimmed
+        .parse::<u32>()
+        .map_err(|_| format!("Invalid max-mtu value: {}", trimmed))?;
+    if !(512..=1440).contains(&value) {
+        return Err(format!(
+            "max-mtu must be between 512 and 1440 (vendored picoquic PICOQUIC_PRACTICAL_MAX_MTU); got {}",
+            value
+        ));
     }
     Ok(value)
 }

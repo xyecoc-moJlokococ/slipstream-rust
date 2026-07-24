@@ -110,6 +110,21 @@ pub struct ServerConfig {
     /// (upstream issues #71/#37). See `--max-half-open-connections` in main.rs for the default's
     /// rationale.
     pub max_half_open_connections: u32,
+    /// Ceiling on the QUIC packet size the server emits, i.e. how many tunnel bytes fit in ONE DNS
+    /// answer. Defaults to [`QUIC_MTU`] (900).
+    ///
+    /// Raising it trades round trips for response size: a client needs proportionally fewer DNS
+    /// queries per downloaded byte, which matters most where the return path is policed by *packet
+    /// rate* rather than volume (measured on a mobile operator: ~78% of answers delivered at 34
+    /// q/s but only ~24% at 225 q/s). Fewer, larger answers also cut the handset's radio airtime.
+    ///
+    /// Bounds come from vendored picoquic: `PICOQUIC_PRACTICAL_MAX_MTU` (1440) and the 1536-byte
+    /// `PICOQUIC_MAX_PACKET_SIZE` send buffer, so anything above ~1440 needs a vendor patch.
+    ///
+    /// **Carrier caveat:** safe to raise for a DNS-over-**TCP** carrier (RFC 7766 framing allows a
+    /// 64 KiB message). Over **UDP** the whole answer must still fit the advertised EDNS buffer
+    /// (`EDNS_UDP_PAYLOAD` = 1232) or resolvers truncate it, so keep UDP deployments at/below ~1150.
+    pub max_mtu: u32,
     pub idle_timeout_seconds: u64,
     pub debug_streams: bool,
     pub debug_commands: bool,
@@ -317,7 +332,7 @@ async fn run_server_single(config: &ServerConfig) -> Result<i32, ServerError> {
                 "Slipstream server congestion algorithm is unavailable",
             ));
         }
-        configure_quic_with_custom(quic, slipstream_server_cc_algorithm, QUIC_MTU);
+        configure_quic_with_custom(quic, slipstream_server_cc_algorithm, config.max_mtu);
         // Server-only: raise per-stream initial window above stock ~64 KiB so peer upload streams
         // (Telegram multi-stream) don't each stall waiting for poll-driven MAX_STREAM_DATA.
         // Moderate 256 KiB — see SLIPSTREAM_MODERATE_STREAM_DATA_BYTES. Not applied on the client.
