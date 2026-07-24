@@ -9,7 +9,7 @@ use self::path::{
 use self::setup::{bind_tcp_listener, bind_udp_socket, compute_mtu, map_io};
 use self::stall::{
     StallDetector, StallInput, DOWNLOAD_POLL_KEEPALIVE_INFLIGHT, DOWNLOAD_POLL_RESERVE_QPS,
-    FLOW_BLOCKED_MAX_INFLIGHT, FLOW_BLOCKED_MAX_POLL_QPS, UNPRODUCTIVE_MAX_INFLIGHT,
+    FLOW_BLOCKED_MAX_INFLIGHT, FLOW_BLOCKED_MAX_POLL_QPS,
 };
 use crate::dns::{
     add_paths, data_encoding, expire_inflight_polls, handle_dns_response, maybe_report_debug,
@@ -521,7 +521,8 @@ pub async fn run_client_with_control_and_liveness(
                                 FLOW_BLOCKED_MAX_INFLIGHT
                             } else {
                                 // Streams open but quiet (e.g. TG idle): modest target; backoff may
-                                // shrink further to UNPRODUCTIVE_MAX_INFLIGHT (8).
+                                // shrink further via unproductive_inflight_cap (24 -> 6 -> 2 as the
+                                // quiet lengthens).
                                 64
                             };
                             let snapshot = resolver.pacing_budget.as_mut().map(|budget| {
@@ -544,7 +545,7 @@ pub async fn run_client_with_control_and_liveness(
                             let target = if flow_blocked_for_sleep {
                                 target.min(FLOW_BLOCKED_MAX_INFLIGHT)
                             } else if stall.poll_backoff_active() {
-                                target.min(UNPRODUCTIVE_MAX_INFLIGHT)
+                                target.min(stall.unproductive_inflight_cap(current_time))
                             } else {
                                 target
                             };
@@ -959,7 +960,7 @@ pub async fn run_client_with_control_and_liveness(
                                 FLOW_BLOCKED_MAX_INFLIGHT
                             } else {
                                 // Quiet streams (TG open, no transfer): modest target; poll_backoff
-                                // further drops to UNPRODUCTIVE_MAX_INFLIGHT when no useful data.
+                                // further drops via unproductive_inflight_cap when no useful data.
                                 64
                             };
                             let pacing_target = snapshot
@@ -983,7 +984,7 @@ pub async fn run_client_with_control_and_liveness(
                             let pacing_target = if flow_blocked {
                                 pacing_target.min(FLOW_BLOCKED_MAX_INFLIGHT)
                             } else if stall.poll_backoff_active() {
-                                pacing_target.min(UNPRODUCTIVE_MAX_INFLIGHT)
+                                pacing_target.min(stall.unproductive_inflight_cap(now))
                             } else {
                                 pacing_target
                             };

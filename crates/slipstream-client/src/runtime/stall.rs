@@ -19,7 +19,17 @@ use tracing::{error, info, warn};
 pub(crate) const UNPRODUCTIVE_POLL_BACKOFF_US: u64 = 1_000_000;
 /// Raised from 8 → 24: under lossy UDP, backoff-at-8 made recovery too slow and Telegram upload
 /// streams were reset after ~0.7 MiB with no downlink ACKs/responses getting through.
+/// Applies only to the first [`UNPRODUCTIVE_DEEP_IDLE_US`] of quiet; see
+/// [`StallDetector::unproductive_inflight_cap`] for the decay that follows.
 pub(crate) const UNPRODUCTIVE_MAX_INFLIGHT: usize = 24;
+/// Quiet for this long => the link is idle rather than mid-transfer-hiccup; drop to
+/// [`UNPRODUCTIVE_DEEP_IDLE_INFLIGHT`].
+pub(crate) const UNPRODUCTIVE_DEEP_IDLE_US: u64 = 5_000_000;
+pub(crate) const UNPRODUCTIVE_DEEP_IDLE_INFLIGHT: usize = 6;
+/// Quiet for this long => nothing is using the tunnel; keep just enough polls in flight to notice
+/// incoming data promptly (a push still arrives within ~1 RTT at this depth).
+pub(crate) const UNPRODUCTIVE_LONG_IDLE_US: u64 = 20_000_000;
+pub(crate) const UNPRODUCTIVE_LONG_IDLE_INFLIGHT: usize = 2;
 /// When peer stream/connection flow control is blocking us we still need DNS polls so the
 /// responses can carry MAX_STREAM_DATA / ACKs — but we must not use the full active budget
 /// (or max_poll_qps=1400). Moderate inflight keeps window updates flowing without empty-poll
@@ -116,6 +126,31 @@ impl StallDetector {
     /// Whether the loop should fall back to the idle sleep floor.
     pub(crate) fn cpu_throttle_active(&self) -> bool {
         self.cpu_throttle_active
+    }
+
+    /// Cap on polls in flight while unproductive, decayed by how long the quiet has lasted.
+    ///
+    /// The poll rate is `target_inflight / RTT`, so a flat cap of [`UNPRODUCTIVE_MAX_INFLIGHT`] (24)
+    /// keeps ~120 queries/s flowing on a ~200 ms carrier *with no data moving at all* -- measured on
+    /// a real handset as 19-62 KB/s of cellular traffic against ~0 KB/s of app traffic, which keeps
+    /// the modem transmitting continuously (the dominant battery/heat cost; app CPU was only ~12% of
+    /// one core). During an actual transfer the same polls are productive and overhead is just
+    /// ~1.3x, so only the *quiet* case needs shrinking.
+    ///
+    /// 24 is kept for the first few seconds of quiet, which is the window
+    /// [`UNPRODUCTIVE_MAX_INFLIGHT`] was raised 8 -> 24 for (lossy-UDP recovery mid-upload, where
+    /// ACKs/MAX_STREAM_DATA must keep coming back); only genuinely idle links decay further. Any
+    /// useful progress clears `last_useful_progress_at`, so the full budget returns immediately --
+    /// this only ever costs one extra RTT of ramp-up after a long silence.
+    pub(crate) fn unproductive_inflight_cap(&self, now: u64) -> usize {
+        let quiet_us = now.saturating_sub(self.last_useful_progress_at);
+        if quiet_us < UNPRODUCTIVE_DEEP_IDLE_US {
+            UNPRODUCTIVE_MAX_INFLIGHT
+        } else if quiet_us < UNPRODUCTIVE_LONG_IDLE_US {
+            UNPRODUCTIVE_DEEP_IDLE_INFLIGHT
+        } else {
+            UNPRODUCTIVE_LONG_IDLE_INFLIGHT
+        }
     }
 
     /// Call once per loop iteration after the send/recv work is done. Returns `Some(reason)` once
