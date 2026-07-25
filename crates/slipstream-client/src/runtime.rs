@@ -84,6 +84,13 @@ const UPSTREAM_BACKPRESSURE_RECENT_US: u64 = 2_000_000;
 const STREAM_ACTIVE_POLL_GRACE_US: u64 = 2_000_000;
 // Only applies after streams go quiet. Active transfers still use the normal burst/pacing path.
 const IDLE_STREAM_POLL_INTERVAL_US: u64 = 2_000_000;
+// NOTE: a per-resolver minimum poll floor (`pacing_target.max(12)` whenever >1 path was live) was
+// tried here to fix the ~96%/4% query split across two resolvers, and REVERTED after measurement.
+// It did even the split out (61%/39%) but collapsed throughput from ~870 KB/s to ~0.1-0.3 KB/s:
+// forcing polls onto the cold secondary path makes picoquic schedule real data there, and that path
+// cannot deliver, so the whole connection stalls behind it. Balancing the share therefore needs the
+// secondary path's capacity to be established *before* it is given data (or data kept off it while
+// only polls warm it up) -- not a blind floor.
 // The no-progress/poll-backoff/cpu-throttle detector thresholds and decision logic live in the
 // stall module (see runtime/stall.rs) so they can be unit tested without a live connection.
 
