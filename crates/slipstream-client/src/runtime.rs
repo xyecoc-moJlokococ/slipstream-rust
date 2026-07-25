@@ -300,6 +300,18 @@ pub async fn run_client_with_control_and_liveness(
         if resolvers.is_empty() {
             return Err(ClientError::new("At least one resolver is required"));
         }
+        // Log the resolver set the engine actually built. Without this, a multi-resolver profile
+        // that silently arrives as one resolver is indistinguishable from one whose extra QUIC
+        // paths failed to probe: `add_paths` returns early and logs nothing when len <= 1.
+        info!(
+            "resolvers: count={} [{}]",
+            resolvers.len(),
+            resolvers
+                .iter()
+                .map(|resolver| format!("{}/{:?}", resolver.addr, resolver.mode))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
 
         let mut local_addr_storage =
             socket_addr_to_storage(dns_transport.local_addr().map_err(map_io)?);
