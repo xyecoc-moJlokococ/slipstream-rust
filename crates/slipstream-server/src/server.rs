@@ -759,11 +759,14 @@ async fn run_server_single(config: &ServerConfig) -> Result<i32, ServerError> {
             // re-prepare on later iterations; measured to cut the client's poll flood ~6x
             // (500 -> 85 q/s), which is what relieves the mobile return path, the radio and the
             // server. Anything with real data, an override, an rcode or a TCP responder never parks.
+            // Applies to the TCP carrier too (despite the env var's historical name): there the
+            // empty-poll churn is the same, the client's own poll timeout is 5s, and the recursive
+            // resolver's upstream query to us times out in seconds -- a 120ms hold is well inside
+            // both, while the server's DNS_TCP_RESPONSE_TIMEOUT (10s) still bounds the slot.
             if udp_lazy_hold_us > 0
                 && send_length == 0
                 && slot.payload_override.is_none()
                 && slot.rcode.is_none()
-                && slot.tcp_response.is_none()
                 && !slot.cnx.is_null()
                 && !cnx_dead
             {

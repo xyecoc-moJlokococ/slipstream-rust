@@ -998,11 +998,11 @@ async fn respond_slots(
         // instead of burning it on an empty answer, so the client doesn't have to spend another
         // query to collect whatever lands a moment later. Measured ~6x fewer client queries
         // (500 -> 85 q/s), relieving the mobile return path, the radio and the server.
+        // Covers the TCP carrier too — see the matching comment in server.rs::respond_slots.
         if udp_lazy_hold_us > 0
             && send_length == 0
             && slot.payload_override.is_none()
             && slot.rcode.is_none()
-            && slot.tcp_response.is_none()
             && !slot.cnx.is_null()
             && !cnx_dead
         {
