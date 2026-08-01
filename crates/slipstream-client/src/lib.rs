@@ -121,7 +121,7 @@ pub extern "system" fn JNI_OnLoad(vm: JavaVM, _reserved: *mut std::ffi::c_void) 
     #[cfg(target_os = "android")]
     {
         if let Ok(mut env) = vm.get_env() {
-            if let Ok(class) = env.find_class("app/slipnet/tunnel/SlipstreamBridge") {
+            if let Ok(class) = env.find_class("app/smugly/tunnel/SlipstreamBridge") {
                 platform::set_bridge_class(&mut env, class);
             }
         }
@@ -135,7 +135,7 @@ pub extern "system" fn JNI_OnLoad(vm: JavaVM, _reserved: *mut std::ffi::c_void) 
 }
 
 #[no_mangle]
-pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeSetDnsQueryType(
+pub extern "system" fn Java_app_smugly_tunnel_SlipstreamBridge_nativeSetDnsQueryType(
     _env: JNIEnv<'_>,
     _this: JObject<'_>,
     qtype: jint,
@@ -150,7 +150,7 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeSetDnsQuer
 }
 
 #[no_mangle]
-pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeSetDnsLabelLength(
+pub extern "system" fn Java_app_smugly_tunnel_SlipstreamBridge_nativeSetDnsLabelLength(
     _env: JNIEnv<'_>,
     _this: JObject<'_>,
     label_len: jint,
@@ -165,7 +165,7 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeSetDnsLabe
 }
 
 #[no_mangle]
-pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeSetDnsLabelLengthJitter(
+pub extern "system" fn Java_app_smugly_tunnel_SlipstreamBridge_nativeSetDnsLabelLengthJitter(
     _env: JNIEnv<'_>,
     _this: JObject<'_>,
     jitter: jint,
@@ -182,7 +182,7 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeSetDnsLabe
 }
 
 #[no_mangle]
-pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeSetMaxPollQps(
+pub extern "system" fn Java_app_smugly_tunnel_SlipstreamBridge_nativeSetMaxPollQps(
     _env: JNIEnv<'_>,
     _this: JObject<'_>,
     qps: jint,
@@ -193,7 +193,7 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeSetMaxPoll
 }
 
 #[no_mangle]
-pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeSetMaxDataQps(
+pub extern "system" fn Java_app_smugly_tunnel_SlipstreamBridge_nativeSetMaxDataQps(
     _env: JNIEnv<'_>,
     _this: JObject<'_>,
     qps: jint,
@@ -203,7 +203,7 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeSetMaxData
 }
 
 #[no_mangle]
-pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeSetBase64uEncoding(
+pub extern "system" fn Java_app_smugly_tunnel_SlipstreamBridge_nativeSetBase64uEncoding(
     _env: JNIEnv<'_>,
     _this: JObject<'_>,
     enabled: bool,
@@ -213,7 +213,7 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeSetBase64u
 
 #[no_mangle]
 #[allow(unused_mut)]
-pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeSetLogFilePath(
+pub extern "system" fn Java_app_smugly_tunnel_SlipstreamBridge_nativeSetLogFilePath(
     mut env: JNIEnv<'_>,
     _this: JObject<'_>,
     path: JString<'_>,
@@ -229,7 +229,7 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeSetLogFile
 
 #[allow(clippy::too_many_arguments)]
 #[no_mangle]
-pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeStartSlipstreamClient(
+pub extern "system" fn Java_app_smugly_tunnel_SlipstreamBridge_nativeStartSlipstreamClient(
     mut env: JNIEnv<'_>,
     _this: JObject<'_>,
     domain: JString<'_>,
@@ -420,7 +420,7 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeStartSlips
 
 #[allow(clippy::too_many_arguments)]
 #[no_mangle]
-pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeStartProbeClient(
+pub extern "system" fn Java_app_smugly_tunnel_SlipstreamBridge_nativeStartProbeClient(
     mut env: JNIEnv<'_>,
     _this: JObject<'_>,
     domain: JString<'_>,
@@ -606,7 +606,7 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeStartProbe
 }
 
 #[no_mangle]
-pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeStopSlipstreamClient(
+pub extern "system" fn Java_app_smugly_tunnel_SlipstreamBridge_nativeStopSlipstreamClient(
     _env: JNIEnv<'_>,
     _this: JObject<'_>,
 ) {
@@ -614,7 +614,7 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeStopSlipst
 }
 
 #[no_mangle]
-pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeStopProbeClient(
+pub extern "system" fn Java_app_smugly_tunnel_SlipstreamBridge_nativeStopProbeClient(
     _env: JNIEnv<'_>,
     _this: JObject<'_>,
     listen_port: jint,
@@ -627,7 +627,7 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeStopProbeC
 }
 
 #[no_mangle]
-pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeIsClientRunning(
+pub extern "system" fn Java_app_smugly_tunnel_SlipstreamBridge_nativeIsClientRunning(
     _env: JNIEnv<'_>,
     _this: JObject<'_>,
 ) -> bool {
@@ -635,7 +635,7 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeIsClientRu
 }
 
 #[no_mangle]
-pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeIsProbeRunning(
+pub extern "system" fn Java_app_smugly_tunnel_SlipstreamBridge_nativeIsProbeRunning(
     _env: JNIEnv<'_>,
     _this: JObject<'_>,
     listen_port: jint,
@@ -657,7 +657,7 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeIsProbeRun
 }
 
 #[no_mangle]
-pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeIsQuicReady(
+pub extern "system" fn Java_app_smugly_tunnel_SlipstreamBridge_nativeIsQuicReady(
     _env: JNIEnv<'_>,
     _this: JObject<'_>,
 ) -> bool {
@@ -665,7 +665,7 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeIsQuicRead
 }
 
 #[no_mangle]
-pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeIsProbeReady(
+pub extern "system" fn Java_app_smugly_tunnel_SlipstreamBridge_nativeIsProbeReady(
     _env: JNIEnv<'_>,
     _this: JObject<'_>,
     listen_port: jint,
@@ -687,7 +687,7 @@ pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeIsProbeRea
 }
 
 #[no_mangle]
-pub extern "system" fn Java_app_slipnet_tunnel_SlipstreamBridge_nativeGetLastError(
+pub extern "system" fn Java_app_smugly_tunnel_SlipstreamBridge_nativeGetLastError(
     env: JNIEnv<'_>,
     _this: JObject<'_>,
 ) -> jstring {
