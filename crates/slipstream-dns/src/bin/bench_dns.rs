@@ -1,7 +1,8 @@
 use slipstream_core::cli::init_logging;
 use slipstream_dns::{
     build_qname, decode_query, decode_response, encode_query, encode_response,
-    max_payload_len_for_domain, QueryParams, Question, ResponseParams, CLASS_IN, RR_TXT,
+    max_payload_len_for_domain, DataEncoding, QueryParams, Question, ResponseParams, CLASS_IN,
+    RR_TXT,
 };
 use std::env;
 use std::time::Instant;
@@ -77,6 +78,7 @@ fn main() {
         question: &question,
         payload: Some(&payload),
         rcode: None,
+        encoding: DataEncoding::Base32,
     };
     let response = encode_response(&response_params).expect("encode response");
 

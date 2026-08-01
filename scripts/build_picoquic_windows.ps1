@@ -292,10 +292,13 @@ function Invoke-CMakePicoquicBuild {
         throw "picotls Windows compatibility CMake overlay not found at $picotlsWindowsCompatOverlay"
     }
     $picotlsWindowsCompatOverlay = $picotlsWindowsCompatOverlay.Replace('\', '/')
+    # Let CMake auto-detect the installed Visual Studio generator instead of hardcoding a
+    # version: GitHub-hosted Windows runner images upgrade their bundled VS version over time
+    # (e.g. windows-2025 moving off "Visual Studio 17 2022"), so pinning here breaks builds
+    # whenever the runner image no longer ships that exact version.
     $cmakeArgs = @(
         "-S", $PicoquicDir,
         "-B", $BuildDir,
-        "-G", "Visual Studio 17 2022",
         "-A", $Platform,
         "-DPICOQUIC_FETCH_PTLS=ON",
         "-DBUILD_DEMO=OFF",

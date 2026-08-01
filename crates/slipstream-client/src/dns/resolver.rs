@@ -45,6 +45,7 @@ pub(crate) struct ResolverState {
     pub(crate) inflight_poll_ids: HashMap<u16, u64>,
     pub(crate) pacing_budget: Option<PacingPollBudget>,
     pub(crate) last_pacing_snapshot: Option<PacingBudgetSnapshot>,
+    pub(crate) high_throughput_until: u64,
     pub(crate) debug: DebugMetrics,
 }
 
@@ -62,6 +63,7 @@ pub(crate) fn resolve_resolvers(
     mtu: u32,
     debug_poll: bool,
     peer_addr_mode: PeerAddrMode,
+    pacing_gain_probe: f64,
 ) -> Result<Vec<ResolverState>, ClientError> {
     let mut resolved = Vec::with_capacity(resolvers.len());
     let mut seen = HashMap::new();
@@ -90,10 +92,11 @@ pub(crate) fn resolve_resolvers(
             pending_polls: 0,
             inflight_poll_ids: HashMap::new(),
             pacing_budget: match resolver.mode {
-                ResolverMode::Authoritative => Some(PacingPollBudget::new(mtu)),
+                ResolverMode::Authoritative => Some(PacingPollBudget::new(mtu, pacing_gain_probe)),
                 ResolverMode::Recursive => None,
             },
             last_pacing_snapshot: None,
+            high_throughput_until: 0,
             debug: DebugMetrics::new(debug_poll),
         });
     }
@@ -112,6 +115,7 @@ pub(crate) fn reset_resolver_path(resolver: &mut ResolverState) {
     resolver.pending_polls = 0;
     resolver.inflight_poll_ids.clear();
     resolver.last_pacing_snapshot = None;
+    resolver.high_throughput_until = 0;
     resolver.probe_attempts = 0;
     resolver.next_probe_at = 0;
 }
@@ -150,7 +154,7 @@ mod tests {
             },
         ];
 
-        match resolve_resolvers(&resolvers, 900, false, PeerAddrMode::DualStack) {
+        match resolve_resolvers(&resolvers, 900, false, PeerAddrMode::DualStack, 1.6) {
             Ok(_) => panic!("expected duplicate resolver error"),
             Err(err) => assert!(err.to_string().contains("Duplicate resolver address")),
         }
@@ -167,7 +171,7 @@ mod tests {
             mode: ResolverMode::Recursive,
         }];
 
-        let resolved = resolve_resolvers(&resolvers, 900, false, PeerAddrMode::Native)
+        let resolved = resolve_resolvers(&resolvers, 900, false, PeerAddrMode::Native, 1.6)
             .expect("resolve resolver");
         assert!(matches!(resolved[0].addr, SocketAddr::V4(_)));
     }

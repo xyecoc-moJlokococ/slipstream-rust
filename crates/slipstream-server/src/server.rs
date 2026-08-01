@@ -1,18 +1,28 @@
 use crate::config::{ensure_cert_key, load_or_create_reset_seed, ResetSeed};
+#[cfg(target_os = "linux")]
+use crate::mmsg::{recv_ready, send_batch, try_recv_once, RecvMmsgBatch, SendBatchScratch};
 use crate::udp_fallback::{handle_packet, FallbackManager, PacketContext, MAX_UDP_PACKET_SIZE};
 use slipstream_core::{
-    net::{bind_first_resolved_with_ipv4_fallback, bind_udp_socket_addr, is_transient_udp_error},
+    net::{
+        bind_first_resolved_with_ipv4_fallback, bind_tcp_listener_addr, bind_udp_socket_addr,
+        is_transient_udp_error,
+    },
     normalize_dual_stack_addr, resolve_host_port, HostPort,
 };
-use slipstream_dns::{encode_response, Question, Rcode, ResponseParams};
+use slipstream_dns::{
+    encode_response_with_ttl_into, DataEncoding, Question, Rcode, ResponseParams,
+};
+#[cfg(not(target_os = "linux"))]
+use slipstream_ffi::picoquic::PICOQUIC_PACKET_LOOP_RECV_MAX;
 use slipstream_ffi::picoquic::{
-    picoquic_cnx_t, picoquic_create, picoquic_current_time, picoquic_delete_cnx,
-    picoquic_get_first_cnx, picoquic_get_next_cnx, picoquic_prepare_packet_ex, picoquic_quic_t,
-    slipstream_has_ready_stream, slipstream_is_flow_blocked, slipstream_server_cc_algorithm,
-    PICOQUIC_MAX_PACKET_SIZE, PICOQUIC_PACKET_LOOP_RECV_MAX,
+    picoquic_close_immediate, picoquic_cnx_t, picoquic_create, picoquic_current_time,
+    picoquic_delete_cnx, picoquic_get_first_cnx, picoquic_get_next_cnx, picoquic_prepare_packet_ex,
+    picoquic_quic_t, slipstream_has_ready_stream, slipstream_is_flow_blocked,
+    slipstream_server_cc_algorithm, PICOQUIC_MAX_PACKET_SIZE,
 };
 use slipstream_ffi::{
-    configure_quic_with_custom, socket_addr_to_storage, take_crypto_errors, QuicGuard,
+    configure_quic_with_custom, set_server_half_open_retry_threshold, set_server_stream_data_control,
+    socket_addr_to_storage, take_crypto_errors, QuicGuard,
 };
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -22,28 +32,42 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::UdpSocket as TokioUdpSocket;
-use tokio::sync::mpsc;
-use tokio::time::sleep;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener as TokioTcpListener, TcpStream, UdpSocket as TokioUdpSocket};
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::{sleep, timeout};
 
 use crate::streams::{
     drain_commands, handle_command, handle_shutdown, maybe_report_command_stats,
     remove_connection_streams, server_callback, ServerState,
 };
+use crate::target::TargetMode;
 
 // Protocol defaults; see docs/config.md for details.
-const SLIPSTREAM_ALPN: &str = "picoquic_sample";
-const DNS_MAX_QUERY_SIZE: usize = 512;
-const IDLE_SLEEP_MS: u64 = 10;
+pub(crate) const SLIPSTREAM_ALPN: &str = "picoquic_sample";
+pub(crate) const DNS_MAX_QUERY_SIZE: usize = 512;
+const DNS_TCP_MAX_QUERY_SIZE: usize = 4096;
+const DNS_TCP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const IDLE_SLEEP_MS: u64 = 10;
 const IDLE_GC_INTERVAL: Duration = Duration::from_secs(1);
+// recvmmsg batch size (Linux only; see mmsg.rs) -- one syscall can pull up to this many
+// datagrams instead of one recv_from per datagram. Well above the old
+// PICOQUIC_PACKET_LOOP_RECV_MAX=10 per-select-iteration cap.
+#[cfg(target_os = "linux")]
+pub(crate) const RECVMMSG_BATCH: usize = 64;
 // Default QUIC MTU for server packets; see docs/config.md for details.
-const QUIC_MTU: u32 = 900;
+pub(crate) const QUIC_MTU: u32 = 900;
 pub(crate) const STREAM_READ_CHUNK_BYTES: usize = 4096;
 pub(crate) const DEFAULT_TCP_RCVBUF_BYTES: usize = 256 * 1024;
 pub(crate) const TARGET_WRITE_COALESCE_DEFAULT_BYTES: usize = 256 * 1024;
-const FLOW_BLOCKED_LOG_INTERVAL_US: u64 = 1_000_000;
+pub(crate) const FLOW_BLOCKED_LOG_INTERVAL_US: u64 = 1_000_000;
+// How long a per-connection last-sent-payload stays eligible for replay. Covers picoquic's own
+// client-side retransmission of an already-answered poll (observed ~215ms apart over a real
+// recursive-resolver relay with under-estimated RTT) without holding onto data long enough to
+// replay it into a later, genuinely-new empty poll.
+pub(crate) const RETRANSMIT_REPLAY_WINDOW: Duration = Duration::from_secs(2);
 
-static SHOULD_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+pub(crate) static SHOULD_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_sigterm(_signum: libc::c_int) {
     SHOULD_SHUTDOWN.store(true, Ordering::Relaxed);
@@ -80,9 +104,44 @@ pub struct ServerConfig {
     pub reset_seed_path: Option<String>,
     pub domains: Vec<String>,
     pub max_connections: u32,
+    /// Concurrent half-open (unvalidated) connections tolerated before picoquic starts requiring a
+    /// cheap Retry-token round-trip instead of a full crypto handshake for new connections. Guards
+    /// the single-threaded runtime against handshake-crypto bursts starving the accept loop
+    /// (upstream issues #71/#37). See `--max-half-open-connections` in main.rs for the default's
+    /// rationale.
+    pub max_half_open_connections: u32,
+    /// Ceiling on the QUIC packet size the server emits, i.e. how many tunnel bytes fit in ONE DNS
+    /// answer. Defaults to [`QUIC_MTU`] (900).
+    ///
+    /// Raising it trades round trips for response size: a client needs proportionally fewer DNS
+    /// queries per downloaded byte, which matters most where the return path is policed by *packet
+    /// rate* rather than volume (measured on a mobile operator: ~78% of answers delivered at 34
+    /// q/s but only ~24% at 225 q/s). Fewer, larger answers also cut the handset's radio airtime.
+    ///
+    /// Bounds come from vendored picoquic: `PICOQUIC_PRACTICAL_MAX_MTU` (1440) and the 1536-byte
+    /// `PICOQUIC_MAX_PACKET_SIZE` send buffer, so anything above ~1440 needs a vendor patch.
+    ///
+    /// **Carrier caveat:** safe to raise for a DNS-over-**TCP** carrier (RFC 7766 framing allows a
+    /// 64 KiB message). Over **UDP** the whole answer must still fit the advertised EDNS buffer
+    /// (`EDNS_UDP_PAYLOAD` = 1232) or resolvers truncate it, so keep UDP deployments at/below ~1150.
+    pub max_mtu: u32,
     pub idle_timeout_seconds: u64,
     pub debug_streams: bool,
     pub debug_commands: bool,
+    pub direct_socks_target: bool,
+    pub socks_proxy_target: bool,
+    // --- Anti-fingerprinting knobs (defaults preserve historical behavior) ---
+    /// Base answer TTL (seconds) in DNS responses (default 60).
+    pub response_ttl: u32,
+    /// If > 0, vary the answer TTL by `id % (jitter + 1)` so it isn't a constant (default 0).
+    pub response_ttl_jitter: u32,
+    /// DNS query type the server accepts in tunnel queries (default 16 = TXT). Must match the
+    /// client's `dns_query_type`. Non-TXT also needs per-type answer RDATA encoding (not implemented).
+    pub accepted_query_type: u16,
+    /// Number of independent worker threads, each with its own picoquic context and event loop.
+    /// `1` keeps the historical single-threaded path (default). `>1` enables userspace demux by
+    /// source IP so CPU-heavy DNS/QUIC work scales across cores. See `multi_worker.rs`.
+    pub workers: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -134,6 +193,7 @@ pub(crate) enum Command {
 
 pub(crate) struct Slot {
     pub(crate) peer: SocketAddr,
+    pub(crate) tcp_response: Option<oneshot::Sender<Vec<u8>>>,
     pub(crate) id: u16,
     pub(crate) rd: bool,
     pub(crate) cd: bool,
@@ -142,9 +202,27 @@ pub(crate) struct Slot {
     pub(crate) cnx: *mut picoquic_cnx_t,
     pub(crate) path_id: libc::c_int,
     pub(crate) payload_override: Option<Vec<u8>>,
+    /// Encoding the query used (see [`DataEncoding`]); mirrored back for CNAME/MX/SRV answers so
+    /// the client's own choice round-trips with no server-side coordination.
+    pub(crate) encoding: DataEncoding,
+}
+
+struct TcpDnsRequest {
+    packet: Vec<u8>,
+    peer: SocketAddr,
+    response_tx: oneshot::Sender<Vec<u8>>,
 }
 
 pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
+    if config.workers > 1 {
+        return crate::multi_worker::run_server_multi(config).await;
+    }
+    run_server_single(config).await
+}
+
+/// Historical single-threaded server path (workers == 1). Kept separate so the multi-worker
+/// demux path never pays channel/scheduling overhead on the common single-client deploy.
+async fn run_server_single(config: &ServerConfig) -> Result<i32, ServerError> {
     let cert_path = Path::new(&config.cert);
     let key_path = Path::new(&config.key);
     let generated = ensure_cert_key(cert_path, key_path).map_err(ServerError::new)?;
@@ -174,8 +252,19 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
         None
     };
 
-    let target_addr = resolve_host_port(&config.target_address)
-        .map_err(|err| ServerError::new(err.to_string()))?;
+    let target_mode = if config.socks_proxy_target {
+        TargetMode::SocksProxy(
+            resolve_host_port(&config.target_address)
+                .map_err(|err| ServerError::new(err.to_string()))?,
+        )
+    } else if config.direct_socks_target {
+        TargetMode::DirectSocks
+    } else {
+        TargetMode::Tcp(
+            resolve_host_port(&config.target_address)
+                .map_err(|err| ServerError::new(err.to_string()))?,
+        )
+    };
     let fallback_addr = match &config.fallback_address {
         Some(address) => {
             Some(resolve_host_port(address).map_err(|err| ServerError::new(err.to_string()))?)
@@ -194,7 +283,7 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
     let debug_commands = config.debug_commands;
     let idle_timeout = Duration::from_secs(config.idle_timeout_seconds);
     let mut state = Box::new(ServerState::new(
-        target_addr,
+        target_mode,
         command_tx,
         debug_streams,
         debug_commands,
@@ -243,11 +332,28 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
                 "Slipstream server congestion algorithm is unavailable",
             ));
         }
-        configure_quic_with_custom(quic, slipstream_server_cc_algorithm, QUIC_MTU);
+        configure_quic_with_custom(quic, slipstream_server_cc_algorithm, config.max_mtu);
+        // Server-only: raise per-stream initial window above stock ~64 KiB so peer upload streams
+        // (Telegram multi-stream) don't each stall waiting for poll-driven MAX_STREAM_DATA.
+        // Moderate 256 KiB — see SLIPSTREAM_MODERATE_STREAM_DATA_BYTES. Not applied on the client.
+        set_server_stream_data_control(quic);
+        // Server-only: lower picoquic's half-open retry threshold from its default of 64 so the
+        // adaptive Retry-token defense engages at realistic burst sizes on this single-threaded
+        // runtime, instead of letting concurrent full handshakes starve the accept loop
+        // (upstream issues #71/#37). Not applied to the client, which only ever opens one
+        // connection. Configurable via --max-half-open-connections.
+        set_server_half_open_retry_threshold(quic, config.max_half_open_connections);
     }
 
     let udp = Arc::new(bind_udp_socket(&config.dns_listen_host, config.dns_listen_port).await?);
+    let tcp = bind_tcp_listener(&config.dns_listen_host, config.dns_listen_port).await?;
     let udp_local_addr = udp.local_addr().map_err(map_io)?;
+    let tcp_local_addr = tcp.local_addr().map_err(map_io)?;
+    tracing::info!(
+        "DNS listeners ready udp={} tcp={}",
+        udp_local_addr,
+        tcp_local_addr
+    );
     let map_ipv4_peers = matches!(udp_local_addr, SocketAddr::V6(_));
     let local_addr_storage = socket_addr_to_storage(udp_local_addr);
     if let Some(addr) = fallback_addr {
@@ -272,16 +378,56 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
         libc::signal(libc::SIGTERM, handler);
     }
 
+    let (tcp_dns_tx, mut tcp_dns_rx) = mpsc::unbounded_channel();
+    tokio::spawn(accept_tcp_dns(tcp, tcp_dns_tx));
+
     let recv_buf_len = if fallback_mgr.is_some() {
         MAX_UDP_PACKET_SIZE
     } else {
         DNS_MAX_QUERY_SIZE
     };
+    // A/B testing / ops escape hatch: override the recvmmsg batch size at runtime
+    // without a rebuild. Unset (default) keeps the normal RECVMMSG_BATCH=64 behavior.
+    // Set to 1 to fall back to effectively one recvmmsg syscall per datagram (like the
+    // pre-recvmmsg code path) if this ever needs to be disabled in the field.
+    #[cfg(target_os = "linux")]
+    let recvmmsg_batch = std::env::var("SLIPSTREAM_RECVMMSG_BATCH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v >= 1)
+        .unwrap_or(RECVMMSG_BATCH);
+    #[cfg(target_os = "linux")]
+    tracing::info!("recvmmsg batch size = {}", recvmmsg_batch);
+    #[cfg(target_os = "linux")]
+    let mut recv_batch = RecvMmsgBatch::new(recvmmsg_batch, recv_buf_len);
+    #[cfg(not(target_os = "linux"))]
     let mut recv_buf = vec![0u8; recv_buf_len];
     let mut send_buf = vec![0u8; PICOQUIC_MAX_PACKET_SIZE];
     let mut last_seen = HashMap::new();
+    let mut last_response: HashMap<usize, (Instant, Vec<u8>)> = HashMap::new();
     let mut last_idle_gc = Instant::now();
     let mut last_flow_block_log_at: u64 = 0;
+    // Recycled DNS answer Vecs + sendmmsg scratch (cuts malloc under multi-kQPS).
+    let mut response_free: Vec<Vec<u8>> = Vec::with_capacity(256);
+    #[cfg(target_os = "linux")]
+    let mut send_scratch = SendBatchScratch::new();
+
+    // UDP lazy-response ("hold") window: park an empty poll up to this long so downlink data that
+    // arrives within it rides back on THIS poll instead of forcing the client to send a fresh one
+    // (which, under return-path loss on mobile, is what inflates interactive latency). Mirrors the
+    // TCP long-poll (DNS_TCP_RESPONSE_TIMEOUT) but far shorter, to stay under the recursive
+    // resolver's own timeout and picoquic's ~215ms poll retransmit (see RETRANSMIT_REPLAY_WINDOW).
+    // 0 = disabled (historical immediate-answer). Env-tunable so rollout/rollback is just a restart.
+    let udp_lazy_hold_us: u64 = std::env::var("SLIPSTREAM_UDP_LAZY_HOLD_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0)
+        .saturating_mul(1000);
+    const MAX_HELD_SLOTS: usize = 1024;
+    let mut held: Vec<(Slot, u64)> = Vec::new();
+    if udp_lazy_hold_us > 0 {
+        tracing::info!("UDP lazy-response hold enabled: {} us", udp_lazy_hold_us);
+    }
 
     loop {
         drain_commands(state_ptr, &mut command_rx);
@@ -298,6 +444,100 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
             manager.cleanup();
         }
 
+        #[cfg(target_os = "linux")]
+        tokio::select! {
+            command = command_rx.recv() => {
+                if let Some(command) = command {
+                    handle_command(state_ptr, command);
+                }
+            }
+            recv = recv_ready(&udp, &mut recv_batch) => {
+                match recv {
+                    Ok(n) => {
+                        let loop_time = unsafe { picoquic_current_time() };
+                        let context = PacketContext {
+                            domains: &domains,
+                            quic,
+                            current_time: loop_time,
+                            local_addr_storage: &local_addr_storage,
+                            accepted_query_type: config.accepted_query_type,
+                        };
+                        for i in 0..n {
+                            let (data, peer) = recv_batch.datagram(i);
+                            handle_packet(&mut slots, data, peer, &context, &mut fallback_mgr)
+                                .await?;
+                        }
+                        // Greedy drain when the batch was full (more packets likely waiting).
+                        if n == recvmmsg_batch {
+                            for _ in 0..8 {
+                                let more = match try_recv_once(&udp, &mut recv_batch) {
+                                    Ok(m) => m,
+                                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                                    Err(err) if is_transient_udp_error(&err) => break,
+                                    Err(err) => return Err(map_io(err)),
+                                };
+                                if more == 0 {
+                                    break;
+                                }
+                                let loop_time = unsafe { picoquic_current_time() };
+                                let context = PacketContext {
+                                    domains: &domains,
+                                    quic,
+                                    current_time: loop_time,
+                                    local_addr_storage: &local_addr_storage,
+                                    accepted_query_type: config.accepted_query_type,
+                                };
+                                for i in 0..more {
+                                    let (data, peer) = recv_batch.datagram(i);
+                                    handle_packet(
+                                        &mut slots,
+                                        data,
+                                        peer,
+                                        &context,
+                                        &mut fallback_mgr,
+                                    )
+                                    .await?;
+                                }
+                                if more < recvmmsg_batch {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        if !is_transient_udp_error(&err) {
+                            return Err(map_io(err));
+                        }
+                    }
+                }
+            }
+            tcp_request = tcp_dns_rx.recv() => {
+                if let Some(request) = tcp_request {
+                    let loop_time = unsafe { picoquic_current_time() };
+                    let context = PacketContext {
+                        domains: &domains,
+                        quic,
+                        current_time: loop_time,
+                        local_addr_storage: &local_addr_storage,
+                        accepted_query_type: config.accepted_query_type,
+                    };
+                    let slot_start = slots.len();
+                    handle_packet(
+                        &mut slots,
+                        &request.packet,
+                        request.peer,
+                        &context,
+                        &mut fallback_mgr,
+                    )
+                    .await?;
+                    if let Some(slot) = slots.get_mut(slot_start) {
+                        slot.tcp_response = Some(request.response_tx);
+                    }
+                }
+            }
+            _ = sleep(Duration::from_millis(IDLE_SLEEP_MS)) => {}
+        }
+        #[cfg(not(target_os = "linux"))]
         tokio::select! {
             command = command_rx.recv() => {
                 if let Some(command) = command {
@@ -313,6 +553,7 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
                             quic,
                             current_time: loop_time,
                             local_addr_storage: &local_addr_storage,
+                            accepted_query_type: config.accepted_query_type,
                         };
                         handle_packet(
                             &mut slots,
@@ -352,16 +593,45 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
                     }
                 }
             }
+            tcp_request = tcp_dns_rx.recv() => {
+                if let Some(request) = tcp_request {
+                    let loop_time = unsafe { picoquic_current_time() };
+                    let context = PacketContext {
+                        domains: &domains,
+                        quic,
+                        current_time: loop_time,
+                        local_addr_storage: &local_addr_storage,
+                        accepted_query_type: config.accepted_query_type,
+                    };
+                    let slot_start = slots.len();
+                    handle_packet(
+                        &mut slots,
+                        &request.packet,
+                        request.peer,
+                        &context,
+                        &mut fallback_mgr,
+                    )
+                    .await?;
+                    if let Some(slot) = slots.get_mut(slot_start) {
+                        slot.tcp_response = Some(request.response_tx);
+                    }
+                }
+            }
             _ = sleep(Duration::from_millis(IDLE_SLEEP_MS)) => {}
         }
 
         let now = Instant::now();
         if idle_timeout != Duration::ZERO {
-            note_active_connections(&mut last_seen, &slots, now);
+            // Borrow state only for the note pass; GC takes &mut separately below.
+            {
+                let state = unsafe { &*state_ptr };
+                note_active_connections(&mut last_seen, state, &slots, now);
+            }
             maybe_gc_idle_connections(
                 quic,
                 state_ptr,
                 &mut last_seen,
+                &mut last_response,
                 idle_timeout,
                 &mut last_idle_gc,
                 now,
@@ -371,19 +641,59 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
         drain_commands(state_ptr, &mut command_rx);
         maybe_report_command_stats(state_ptr);
 
-        if slots.is_empty() {
+        if slots.is_empty() && held.is_empty() {
             continue;
         }
 
-        let loop_time = unsafe { picoquic_current_time() };
+        // Live-connection set, built once per iteration, so a held poll never calls
+        // prepare_packet_ex on a cnx that idle-GC freed mid-hold. (A held poll implies activity
+        // within the hold window, so GC won't actually have reached it -- this just makes the
+        // raw-pointer use provably safe against a close/GC race.)
+        let live_cnxs: std::collections::HashSet<usize> =
+            if udp_lazy_hold_us > 0 && !held.is_empty() {
+                let mut set = std::collections::HashSet::with_capacity(held.len());
+                let mut c = unsafe { picoquic_get_first_cnx(quic) };
+                while !c.is_null() {
+                    set.insert(c as usize);
+                    c = unsafe { picoquic_get_next_cnx(c) };
+                }
+                set
+            } else {
+                std::collections::HashSet::new()
+            };
 
-        for slot in slots.iter_mut() {
+        let loop_time = unsafe { picoquic_current_time() };
+        #[cfg(target_os = "linux")]
+        let mut udp_responses: Vec<(Vec<u8>, SocketAddr)> =
+            Vec::with_capacity(slots.len() + held.len());
+
+        // Working set = carried-over held polls (each still carrying its deadline) + this
+        // iteration's fresh slots (deadline None until first parked). Survivors re-park in next_held.
+        let mut work: Vec<(Slot, Option<u64>)> = Vec::with_capacity(held.len() + slots.len());
+        for (slot, deadline) in held.drain(..) {
+            work.push((slot, Some(deadline)));
+        }
+        for slot in slots.drain(..) {
+            work.push((slot, None));
+        }
+        let mut next_held: Vec<(Slot, u64)> = Vec::new();
+
+        for (mut slot, carried_deadline) in work.drain(..) {
             let mut send_length = 0usize;
             let mut addr_to: slipstream_ffi::SockaddrStorage = unsafe { std::mem::zeroed() };
             let mut addr_from: slipstream_ffi::SockaddrStorage = unsafe { std::mem::zeroed() };
             let mut if_index: libc::c_int = 0;
 
-            if slot.payload_override.is_none() && slot.rcode.is_none() && !slot.cnx.is_null() {
+            // A carried held poll whose cnx vanished (close/GC) must never be prepared.
+            let cnx_dead = carried_deadline.is_some()
+                && !slot.cnx.is_null()
+                && !live_cnxs.contains(&(slot.cnx as usize));
+
+            if slot.payload_override.is_none()
+                && slot.rcode.is_none()
+                && !slot.cnx.is_null()
+                && !cnx_dead
+            {
                 let ret = unsafe {
                     picoquic_prepare_packet_ex(
                         slot.cnx,
@@ -443,34 +753,119 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
                 }
             }
 
-            let payload_override = slot.payload_override.as_deref();
-            let (payload, rcode) = if let Some(payload) = payload_override {
+            // LAZY HOLD (v1): picoquic had nothing at all to send for this poll, so answering now
+            // would burn the poll on an empty answer and force the client to spend another query to
+            // pick up whatever lands a moment later. Park it instead (up to udp_lazy_hold_us) and
+            // re-prepare on later iterations; measured to cut the client's poll flood ~6x
+            // (500 -> 85 q/s), which is what relieves the mobile return path, the radio and the
+            // server. Anything with real data, an override, an rcode or a TCP responder never parks.
+            // Applies to the TCP carrier too (despite the env var's historical name): there the
+            // empty-poll churn is the same, the client's own poll timeout is 5s, and the recursive
+            // resolver's upstream query to us times out in seconds -- a 120ms hold is well inside
+            // both, while the server's DNS_TCP_RESPONSE_TIMEOUT (10s) still bounds the slot.
+            if udp_lazy_hold_us > 0
+                && send_length == 0
+                && slot.payload_override.is_none()
+                && slot.rcode.is_none()
+                && !slot.cnx.is_null()
+                && !cnx_dead
+            {
+                let deadline =
+                    carried_deadline.unwrap_or_else(|| loop_time.saturating_add(udp_lazy_hold_us));
+                if loop_time < deadline && next_held.len() < MAX_HELD_SLOTS {
+                    next_held.push((slot, deadline));
+                    continue;
+                }
+                // Deadline reached (or hold cap hit): fall through and answer empty now.
+            }
+
+            let cnx_id = slot.cnx as usize;
+            if slot.payload_override.is_none() && send_length > 0 {
+                let bytes = &send_buf[..send_length];
+                let entry = last_response
+                    .entry(cnx_id)
+                    .or_insert_with(|| (Instant::now(), Vec::with_capacity(bytes.len())));
+                entry.0 = Instant::now();
+                entry.1.clear();
+                entry.1.extend_from_slice(bytes);
+            }
+            // picoquic had nothing new to prepare → usually idle poll; may need retransmit replay
+            // of last real response (see RETRANSMIT_REPLAY_WINDOW).
+            let (payload, rcode) = if let Some(payload) = slot.payload_override.as_deref() {
                 (Some(payload), slot.rcode)
             } else if send_length > 0 {
-                (Some(&send_buf[..send_length]), slot.rcode)
+                (
+                    last_response.get(&cnx_id).map(|(_, v)| v.as_slice()),
+                    slot.rcode,
+                )
             } else if slot.rcode.is_none() {
-                // No QUIC payload ready; still answer the poll with NOERROR and empty payload to clear it.
-                (None, Some(slipstream_dns::Rcode::Ok))
+                match last_response.get(&cnx_id) {
+                    Some((sent_at, cached)) if sent_at.elapsed() < RETRANSMIT_REPLAY_WINDOW => {
+                        (Some(cached.as_slice()), Some(slipstream_dns::Rcode::Ok))
+                    }
+                    _ => (None, Some(slipstream_dns::Rcode::Ok)),
+                }
             } else {
                 (None, slot.rcode)
             };
-            let response = encode_response(&ResponseParams {
-                id: slot.id,
-                rd: slot.rd,
-                cd: slot.cd,
-                question: &slot.question,
-                payload,
-                rcode,
-            })
-            .map_err(|err| ServerError::new(err.to_string()))?;
-            let peer = if map_ipv4_peers {
-                normalize_dual_stack_addr(slot.peer)
+            let answer_ttl = if config.response_ttl_jitter > 0 {
+                config
+                    .response_ttl
+                    .saturating_add((slot.id as u32) % (config.response_ttl_jitter + 1))
             } else {
-                slot.peer
+                config.response_ttl
             };
-            if let Err(err) = udp.send_to(&response, peer).await {
-                if !is_transient_udp_error(&err) {
-                    return Err(map_io(err));
+            let mut response = response_free.pop().unwrap_or_else(|| Vec::with_capacity(512));
+            encode_response_with_ttl_into(
+                &ResponseParams {
+                    id: slot.id,
+                    rd: slot.rd,
+                    cd: slot.cd,
+                    question: &slot.question,
+                    payload,
+                    rcode,
+                    encoding: slot.encoding,
+                },
+                answer_ttl,
+                &mut response,
+            )
+            .map_err(|err| ServerError::new(err.to_string()))?;
+            if let Some(response_tx) = slot.tcp_response.take() {
+                let _ = response_tx.send(response);
+            } else {
+                let peer = if map_ipv4_peers {
+                    normalize_dual_stack_addr(slot.peer)
+                } else {
+                    slot.peer
+                };
+                #[cfg(target_os = "linux")]
+                {
+                    udp_responses.push((response, peer));
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    if let Err(err) = udp.send_to(&response, peer).await {
+                        if !is_transient_udp_error(&err) {
+                            return Err(map_io(err));
+                        }
+                    }
+                    if response_free.len() < 256 {
+                        response.clear();
+                        response_free.push(response);
+                    }
+                }
+            }
+        }
+        held = next_held;
+        #[cfg(target_os = "linux")]
+        {
+            send_batch(&udp, &mut udp_responses, &mut send_scratch)
+                .await
+                .map_err(map_io)?;
+            for (mut buf, _) in udp_responses.drain(..) {
+                if response_free.len() < 256 && buf.capacity() <= 4096 {
+                    buf.clear();
+                    response_free.push(buf);
                 }
             }
         }
@@ -479,7 +874,14 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
     Ok(0)
 }
 
-async fn bind_udp_socket(host: &str, port: u16) -> Result<TokioUdpSocket, ServerError> {
+pub(crate) async fn bind_tcp_listener(host: &str, port: u16) -> Result<TokioTcpListener, ServerError> {
+    bind_first_resolved_with_ipv4_fallback(host, port, bind_tcp_listener_addr, "TCP listener")
+        .await
+        .map(|(listener, _)| listener)
+        .map_err(map_io)
+}
+
+pub(crate) async fn bind_udp_socket(host: &str, port: u16) -> Result<TokioUdpSocket, ServerError> {
     bind_first_resolved_with_ipv4_fallback(
         host,
         port,
@@ -491,15 +893,112 @@ async fn bind_udp_socket(host: &str, port: u16) -> Result<TokioUdpSocket, Server
     .map_err(map_io)
 }
 
+async fn accept_tcp_dns(listener: TokioTcpListener, tx: mpsc::UnboundedSender<TcpDnsRequest>) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, peer)) => {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = handle_tcp_dns_connection(stream, peer, tx).await {
+                        tracing::debug!("DNS TCP connection {} closed: {}", peer, err);
+                    }
+                });
+            }
+            Err(err) => {
+                tracing::warn!("DNS TCP accept failed: {}", err);
+                sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+async fn handle_tcp_dns_connection(
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    tx: mpsc::UnboundedSender<TcpDnsRequest>,
+) -> Result<(), std::io::Error> {
+    loop {
+        let mut len_buf = [0u8; 2];
+        match stream.read_exact(&mut len_buf).await {
+            Ok(_) => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        }
+        let len = u16::from_be_bytes(len_buf) as usize;
+        if len == 0 || len > DNS_TCP_MAX_QUERY_SIZE {
+            tracing::warn!("Rejecting DNS TCP query from {} with length {}", peer, len);
+            return Ok(());
+        }
+
+        let mut packet = vec![0u8; len];
+        stream.read_exact(&mut packet).await?;
+        let (response_tx, response_rx) = oneshot::channel();
+        if tx
+            .send(TcpDnsRequest {
+                packet,
+                peer,
+                response_tx,
+            })
+            .is_err()
+        {
+            return Ok(());
+        }
+        let response = match timeout(DNS_TCP_RESPONSE_TIMEOUT, response_rx).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => return Ok(()),
+            Err(_) => {
+                tracing::warn!("DNS TCP response timed out for {}", peer);
+                return Ok(());
+            }
+        };
+        if response.len() > u16::MAX as usize {
+            tracing::warn!(
+                "DNS TCP response too large for {}: {} bytes",
+                peer,
+                response.len()
+            );
+            return Ok(());
+        }
+        let mut frame = Vec::with_capacity(response.len() + 2);
+        frame.extend_from_slice(&(response.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&response);
+        stream.write_all(&frame).await?;
+    }
+}
+
 pub(crate) fn map_io(err: std::io::Error) -> ServerError {
     ServerError::new(err.to_string())
 }
 
-fn note_active_connections(last_seen: &mut HashMap<usize, Instant>, slots: &[Slot], now: Instant) {
+/// Track connections for idle GC.
+///
+/// - First packet that associates a slot with a QUIC cnx *registers* the connection (starts the
+///   idle timer) but does **not** keep refreshing it on every subsequent DNS poll.
+/// - Only real application stream activity refreshes the timer. Continuous client DNS polls /
+///   QUIC keepalives must not prevent idle GC, or idle_timeout becomes a no-op while a client
+///   is sitting on an open tunnel with no TCP streams.
+pub(crate) fn note_active_connections(
+    last_seen: &mut HashMap<usize, Instant>,
+    state: &ServerState,
+    slots: &[Slot],
+    now: Instant,
+) {
     for slot in slots {
         if !slot.cnx.is_null() {
-            last_seen.insert(slot.cnx as usize, now);
+            last_seen.entry(slot.cnx as usize).or_insert(now);
         }
+    }
+    for cnx_id in state.connection_ids_with_streams() {
+        last_seen.insert(cnx_id, now);
     }
 }
 
@@ -529,10 +1028,11 @@ fn prune_and_collect_idle<T>(
     idle
 }
 
-fn maybe_gc_idle_connections(
+pub(crate) fn maybe_gc_idle_connections(
     quic: *mut picoquic_quic_t,
     state_ptr: *mut ServerState,
     last_seen: &mut HashMap<usize, Instant>,
+    last_response: &mut HashMap<usize, (Instant, Vec<u8>)>,
     idle_timeout: Duration,
     last_gc: &mut Instant,
     now: Instant,
@@ -547,6 +1047,7 @@ fn maybe_gc_idle_connections(
     let active = collect_active_connections(quic);
     if active.is_empty() {
         last_seen.clear();
+        last_response.clear();
         *last_gc = now;
         return;
     }
@@ -557,6 +1058,7 @@ fn maybe_gc_idle_connections(
     }
 
     let idle = prune_and_collect_idle(last_seen, &active, idle_timeout, now);
+    last_response.retain(|cnx_id, _| active.contains_key(cnx_id));
 
     if idle.is_empty() {
         *last_gc = now;
@@ -568,22 +1070,27 @@ fn maybe_gc_idle_connections(
         if let Some(&cnx) = active.get(&cnx_id) {
             remove_connection_streams(state, cnx_id);
             if let Some(last) = last_seen.get(&cnx_id) {
-                tracing::debug!(
+                // info (not debug): idle_gc_e2e and ops both need to observe this without RUST_LOG=debug.
+                tracing::info!(
                     "idle gc: closing connection cnx_id={} idle_for_ms={}",
                     cnx_id,
                     now.duration_since(*last).as_millis()
                 );
             }
+            // close_immediate first so subsequent client packets can still elicit a reset/close
+            // rather than silently vanishing; then free the cnx.
             unsafe {
+                picoquic_close_immediate(cnx);
                 picoquic_delete_cnx(cnx);
             }
             last_seen.remove(&cnx_id);
+            last_response.remove(&cnx_id);
         }
     }
     *last_gc = now;
 }
 
-fn warn_overlapping_domains(domains: &[String]) {
+pub(crate) fn warn_overlapping_domains(domains: &[String]) {
     if domains.len() < 2 {
         return;
     }

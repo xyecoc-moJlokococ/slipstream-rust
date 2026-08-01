@@ -16,8 +16,10 @@ Common flags:
 - --tcp-listen-host <HOST> (default: ::)
 - --tcp-listen-port <PORT> (default: 5201)
 - --congestion-control <bbr|dcubic> (optional; overrides congestion control for all resolvers)
-- --cert <PATH> (optional; PEM-encoded server certificate for strict leaf pinning)
+- --cert <PATH> (optional; PEM-encoded server certificate for strict leaf pinning; mutually exclusive with --verify-system-ca)
+- --verify-system-ca (optional; verify the server's certificate chain against the OS's default CA bundle, like a normal HTTPS client; mutually exclusive with --cert)
 - --authoritative <IP:PORT> (repeatable; mark a resolver path as authoritative and use pacing-based polling)
+- --resolver-transport <udp|tcp> (default: udp; TCP mode uses the first resolver only)
 - --gso (currently not implemented in the Rust loop; prints a warning)
 - --keep-alive-interval <MILLISECONDS> (default: 400)
 
@@ -37,10 +39,11 @@ Notes:
 - IPv6 resolvers must be bracketed, for example: [2001:db8::1]:53.
 - When IPv6 is unavailable, slipstream falls back to `0.0.0.0` for the default `--tcp-listen-host ::` listener and for its local UDP socket.
 - When IPv6 is available, slipstream uses an IPv6 dual-stack UDP socket for mixed-family resolver support; if `IPV6_V6ONLY=0` is disallowed, some OSes may still require sysctl changes. In IPv4-only fallback mode, only IPv4 resolvers are usable.
-- Provide --cert to enable strict leaf pinning; omit it for legacy/no-verification behavior.
-- The pinned certificate must match the server leaf exactly; CA bundles are not supported.
+- Provide --cert to enable strict leaf pinning, --verify-system-ca for standard CA-chain + hostname verification against the OS's default trust store, or neither for legacy/no-verification behavior. --cert and --verify-system-ca are mutually exclusive; passing both is a startup error.
+- The pinned certificate (--cert) must match the server leaf exactly; it does not accept a CA bundle. --verify-system-ca needs a single bundle *file* on the host (e.g. `/etc/ssl/certs/ca-certificates.crt`); a system that only has a hashed cert directory isn't supported yet.
 - Resolver order follows the CLI; the first resolver becomes path 0.
 - Resolver addresses must be unique; duplicates are rejected.
+- `--resolver-transport tcp` keeps one persistent DNS-over-TCP connection to the first resolver and ignores any additional resolver paths.
 - --authoritative keeps the DNS wire format unchanged and remains C interop safe.
 - Use --authoritative only when you control the resolver/server path and can absorb high QPS bursts.
 - When --congestion-control is omitted, authoritative paths default to bbr and recursive paths default to dcubic.
@@ -67,6 +70,7 @@ Common flags:
 - --fallback <HOST:PORT> (optional; forward non-DNS packets to this UDP endpoint)
 - --idle-timeout-seconds <SECONDS> (default: 60; set to 0 to disable)
 - --reset-seed <PATH> (optional; 32 hex chars / 16 bytes; auto-created if missing)
+- --workers <N> (default: 1; multi-worker mode for multi-client CPU scale-out)
 - When binding the default `--dns-listen-host ::`, slipstream falls back to `0.0.0.0` if IPv6 is unavailable on the host.
 - When binding to `::`, slipstream still attempts to enable dual-stack (IPV6_V6ONLY=0); if your OS disallows it, IPv4 DNS clients require sysctl changes or binding to an IPv4 address.
 - With --fallback enabled, peers that have recently sent DNS stay DNS-only; while active they switch to fallback only after 16 consecutive non-DNS packets to avoid diverting DNS on stray traffic. DNS-only classification expires after an idle timeout without DNS traffic.
@@ -84,6 +88,22 @@ Example:
   --key ./key.pem \
   --reset-seed ./reset-seed
 ```
+
+Multi-worker example (scale DNS/QUIC CPU across cores for several concurrent clients):
+
+```
+./target/release/slipstream-server \
+  --dns-listen-port 53 \
+  --target-address 127.0.0.1:1090 \
+  --domain ns2w.smugvpn.com \
+  --cert ./cert.pem \
+  --key ./key.pem \
+  --reset-seed ./reset-seed \
+  --workers 4
+```
+
+`--workers 1` (default) keeps the original single-threaded path. See docs/config.md for
+affinity semantics and limits.
 
 For quick tests you can use the sample certs in `fixtures/certs/` (test-only).
 If the configured cert/key paths are missing, the server auto-generates a

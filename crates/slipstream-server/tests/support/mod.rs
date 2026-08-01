@@ -30,6 +30,27 @@ impl ChildGuard {
             Err(_) => true,
         }
     }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+/// Pause the process without killing it (SIGSTOP) -- simulates a resolver that goes completely
+/// silent (no error, no FIN/RST, nothing) rather than one that crashes or refuses connections.
+/// Unix only: there is no equivalent safe, dependency-free primitive on Windows.
+#[cfg(unix)]
+pub fn suspend_process(child: &ChildGuard) {
+    unsafe {
+        let _ = libc::kill(child.pid() as i32, libc::SIGSTOP);
+    }
+}
+
+#[cfg(unix)]
+pub fn resume_process(child: &ChildGuard) {
+    unsafe {
+        let _ = libc::kill(child.pid() as i32, libc::SIGCONT);
+    }
 }
 
 pub fn terminate_process(child: &mut ChildGuard, timeout: Duration) {
@@ -105,6 +126,7 @@ pub struct ServerArgs<'a> {
     pub reset_seed_path: Option<&'a Path>,
     pub fallback_addr: Option<SocketAddr>,
     pub idle_timeout_seconds: Option<u64>,
+    pub max_half_open_connections: Option<u32>,
     pub envs: &'a [(&'a str, &'a str)],
     pub rust_log: &'a str,
     pub capture_logs: bool,
@@ -197,6 +219,10 @@ pub fn spawn_server(args: ServerArgs<'_>) -> (ChildGuard, Option<LogCapture>) {
     if let Some(idle_timeout) = args.idle_timeout_seconds {
         cmd.arg("--idle-timeout-seconds")
             .arg(idle_timeout.to_string());
+    }
+    if let Some(max_half_open) = args.max_half_open_connections {
+        cmd.arg("--max-half-open-connections")
+            .arg(max_half_open.to_string());
     }
     for (key, value) in args.envs {
         cmd.env(key, value);

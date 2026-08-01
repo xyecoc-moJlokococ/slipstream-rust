@@ -1,21 +1,26 @@
 use crate::error::ClientError;
-use slipstream_dns::decode_response;
+use slipstream_dns::{decode_response_with_encoding, DataEncoding};
 use slipstream_ffi::picoquic::{
     picoquic_cnx_t, picoquic_current_time, picoquic_incoming_packet_ex, picoquic_quic_t,
-    PICOQUIC_PACKET_LOOP_RECV_MAX,
 };
 use slipstream_ffi::{socket_addr_to_storage, ResolverMode};
 use std::net::SocketAddr;
 
 use super::resolver::{PeerAddrMode, ResolverState};
 
-const MAX_POLL_BURST: usize = PICOQUIC_PACKET_LOOP_RECV_MAX;
+const AUTHORITATIVE_HIGH_THROUGHPUT_WINDOW_US: u64 = 2_000_000;
+const AUTHORITATIVE_HIGH_THROUGHPUT_PAYLOAD_MIN: usize = 512;
 
 pub(crate) struct DnsResponseContext<'a> {
     pub(crate) quic: *mut picoquic_quic_t,
     pub(crate) local_addr_storage: &'a slipstream_ffi::SockaddrStorage,
     pub(crate) peer_addr_mode: PeerAddrMode,
     pub(crate) resolvers: &'a mut [ResolverState],
+    pub(crate) recursive_poll_credit: usize,
+    pub(crate) recursive_poll_burst_max: usize,
+    /// Must match whatever encoding this client's own queries used (see
+    /// [`crate::dns::data_encoding`]) so CNAME/MX/SRV answers decode correctly.
+    pub(crate) encoding: DataEncoding,
 }
 
 pub(crate) fn handle_dns_response(
@@ -25,7 +30,7 @@ pub(crate) fn handle_dns_response(
 ) -> Result<(), ClientError> {
     let peer = ctx.peer_addr_mode.canonicalize(peer);
     let response_id = dns_response_id(buf);
-    if let Some(payload) = decode_response(buf) {
+    if let Some(payload) = decode_response_with_encoding(buf, ctx.encoding) {
         let resolver_index = ctx
             .resolvers
             .iter()
@@ -76,9 +81,17 @@ pub(crate) fn handle_dns_response(
                     resolver.inflight_poll_ids.remove(&response_id);
                 }
             }
+            if resolver.mode == ResolverMode::Authoritative
+                && payload.len() >= AUTHORITATIVE_HIGH_THROUGHPUT_PAYLOAD_MIN
+            {
+                resolver.high_throughput_until =
+                    current_time.saturating_add(AUTHORITATIVE_HIGH_THROUGHPUT_WINDOW_US);
+            }
             if resolver.mode == ResolverMode::Recursive {
+                let credit = ctx.recursive_poll_credit.max(1);
+                let burst_max = ctx.recursive_poll_burst_max.max(1);
                 resolver.pending_polls =
-                    resolver.pending_polls.saturating_add(1).min(MAX_POLL_BURST);
+                    resolver.pending_polls.saturating_add(credit).min(burst_max);
             }
         }
     } else if let Some(response_id) = response_id {

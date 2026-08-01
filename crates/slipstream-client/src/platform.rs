@@ -1,0 +1,252 @@
+#![cfg(target_os = "android")]
+
+use jni::objects::{GlobalRef, JClass, JValue};
+use jni::sys::jclass;
+use jni::{JNIEnv, JavaVM};
+use std::fs::OpenOptions;
+use std::io::{self, Write};
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{warn, Level};
+use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::EnvFilter;
+
+static JAVA_VM: OnceLock<JavaVM> = OnceLock::new();
+static BRIDGE_CLASS: OnceLock<GlobalRef> = OnceLock::new();
+static LOG_FILE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+const MAX_NATIVE_LOG_BYTES: u64 = 8 * 1024 * 1024;
+
+pub(crate) fn set_java_vm(vm: JavaVM) {
+    let _ = JAVA_VM.set(vm);
+}
+
+pub(crate) fn set_bridge_class(env: &mut JNIEnv<'_>, class: JClass<'_>) {
+    match env.new_global_ref(class) {
+        Ok(class_ref) => {
+            let _ = BRIDGE_CLASS.set(class_ref);
+        }
+        Err(err) => {
+            warn!("Failed to store SlipstreamBridge class ref: {}", err);
+        }
+    }
+}
+
+pub(crate) fn init_android_logging() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(
+            "info,slipstream::dns::debug=debug,slipstream::streams::command_dispatch=debug,hyper=info,mio=info,tokio=info,rustls=info,openssl=info",
+        )
+    });
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(AndroidLogWriterFactory)
+        .with_ansi(false)
+        .with_target(true)
+        .without_time()
+        .try_init();
+}
+
+/// Persist the panic thread/location/message to the native log file BEFORE the process aborts (this
+/// crate is built with panic="abort", and the client is compiled with `invariant-panic`). Without
+/// this, an engine panic surfaces only as a bare SIGABRT that the hev-socks5-tunnel C signal handler
+/// mislabels as `component=hev-socks5-tunnel` with no message, hiding the real fault site.
+pub(crate) fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown location>".to_string());
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+        let thread = std::thread::current()
+            .name()
+            .unwrap_or("<unnamed>")
+            .to_string();
+        let line = format!("RUST PANIC thread='{thread}' at {loc}: {msg}");
+        write_native_log(6, &line);
+        // Also append to a dedicated, never-truncated file. The native log file (vaydns-debug.log)
+        // is recreated per app session, so the auto-restart after the abort wipes this line before
+        // it can be read; this persistent append-only file (mirroring the C crash log) survives.
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_millis())
+            .unwrap_or(0);
+        for path in [
+            "/data/data/app.vaydns/files/rust-panic.log",
+            "/data/user/0/app.vaydns/files/rust-panic.log",
+        ] {
+            if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+                let _ = file.write_all(format!("{ts} {line}\n").as_bytes());
+                break;
+            }
+        }
+        default(info);
+    }));
+}
+
+pub(crate) fn set_log_file_path(path: Option<String>) {
+    let slot = LOG_FILE.get_or_init(|| Mutex::new(None));
+    if let Ok(mut value) = slot.lock() {
+        *value = path
+            .filter(|path| !path.trim().is_empty())
+            .map(PathBuf::from);
+    }
+}
+
+pub(crate) fn protect_socket_fd(fd: i32) -> bool {
+    let Some(vm) = JAVA_VM.get() else {
+        warn!(
+            "Android socket protection requested before JNI_OnLoad; continuing because SlipNet excludes itself from the VPN"
+        );
+        return true;
+    };
+    let mut env = match vm.attach_current_thread() {
+        Ok(env) => env,
+        Err(err) => {
+            warn!(
+                "Could not attach thread for Android socket protection: {}; continuing because SlipNet excludes itself from the VPN",
+                err
+            );
+            return true;
+        }
+    };
+    let Some(bridge_class) = BRIDGE_CLASS.get() else {
+        warn!("Android socket protection requested before bridge class ref was initialized");
+        return false;
+    };
+    let class = unsafe { JClass::from_raw(bridge_class.as_raw() as jclass) };
+    let result = env.call_static_method(class, "protectSocket", "(I)Z", &[JValue::Int(fd)]);
+    match result {
+        Ok(value) => match value.z() {
+            Ok(true) => true,
+            Ok(false) => {
+                warn!("Android VpnService.protect({}) returned false", fd);
+                false
+            }
+            Err(err) => {
+                warn!(
+                    "Android socket protection returned a non-boolean result for fd {}: {}",
+                    fd, err
+                );
+                false
+            }
+        },
+        Err(err) => {
+            warn!("Android socket protection failed for fd {}: {}", fd, err);
+            if env.exception_check().unwrap_or(false) {
+                let _ = env.exception_clear();
+            }
+            false
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AndroidLogWriterFactory;
+
+impl<'a> MakeWriter<'a> for AndroidLogWriterFactory {
+    type Writer = AndroidLogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        AndroidLogWriter {
+            priority: 3,
+            buffer: Vec::with_capacity(512),
+        }
+    }
+
+    fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> Self::Writer {
+        AndroidLogWriter {
+            priority: android_priority(meta.level()),
+            buffer: Vec::with_capacity(512),
+        }
+    }
+}
+
+struct AndroidLogWriter {
+    priority: i32,
+    buffer: Vec<u8>,
+}
+
+impl Write for AndroidLogWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buffer.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.emit();
+        Ok(())
+    }
+}
+
+impl Drop for AndroidLogWriter {
+    fn drop(&mut self) {
+        self.emit();
+    }
+}
+
+impl AndroidLogWriter {
+    fn emit(&mut self) {
+        if self.buffer.is_empty() {
+            return;
+        }
+        let message = String::from_utf8_lossy(&self.buffer).trim().to_string();
+        self.buffer.clear();
+        if !message.is_empty() {
+            write_native_log(self.priority, &message);
+        }
+    }
+}
+
+fn android_priority(level: &Level) -> i32 {
+    match *level {
+        Level::ERROR => 6,
+        Level::WARN => 5,
+        Level::INFO => 4,
+        Level::DEBUG => 3,
+        Level::TRACE => 2,
+    }
+}
+
+fn write_native_log(priority: i32, message: &str) {
+    let level = match priority {
+        6 => "E",
+        5 => "W",
+        4 => "I",
+        3 => "D",
+        _ => "V",
+    };
+    let ts_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or(0);
+    let line = format!("{} {} SlipstreamNative: {}\n", ts_ms, level, message);
+    let path = LOG_FILE
+        .get()
+        .and_then(|slot| slot.lock().ok().and_then(|value| value.clone()));
+    if let Some(path) = path {
+        if path
+            .metadata()
+            .map(|metadata| metadata.len() > MAX_NATIVE_LOG_BYTES)
+            .unwrap_or(false)
+        {
+            let _ = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .and_then(|mut file| file.write_all(b"native log rotated\n"));
+        }
+        let _ = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut file| file.write_all(line.as_bytes()));
+    }
+}

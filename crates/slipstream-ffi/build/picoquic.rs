@@ -96,10 +96,11 @@ pub(crate) fn locate_picoquic_include_dir() -> Option<PathBuf> {
 
 pub(crate) fn locate_picoquic_lib_dir(is_windows: bool, target: &str) -> Option<PathBuf> {
     if let Ok(dir) = env::var("PICOQUIC_LIB_DIR") {
+        // Explicit override: authoritative. If it doesn't pan out, report "not
+        // found" rather than silently falling through to an unrelated (and
+        // possibly stale) directory found via the defaults below.
         let candidate = PathBuf::from(dir);
-        if has_picoquic_libs(&candidate) {
-            return Some(candidate);
-        }
+        return has_picoquic_libs(&candidate).then_some(candidate);
     }
 
     if let Ok(dir) = env::var("PICOQUIC_BUILD_DIR") {
@@ -118,6 +119,10 @@ pub(crate) fn locate_picoquic_lib_dir(is_windows: bool, target: &str) -> Option<
         if has_picoquic_libs(&candidate) {
             return Some(candidate);
         }
+        // Same reasoning as PICOQUIC_LIB_DIR above: an explicit
+        // PICOQUIC_BUILD_DIR with no libs yet means "build here", not
+        // "fall back to whatever .picoquic-build already happens to exist".
+        return None;
     }
 
     if let Some(root) = locate_repo_root() {
@@ -265,6 +270,39 @@ fn windows_stage_candidates(dir: &Path, target: &str) -> Vec<PathBuf> {
 
 fn has_picoquic_libs(dir: &Path) -> bool {
     resolve_picoquic_libs(dir).is_some()
+}
+
+/// True if `source_dir` (the vendored picoquic sources) contains a file newer
+/// than anything built in `lib_dir`. Our own cc/*.c shims recompile against
+/// picoquic_internal.h on every build (tracked via rerun-if-changed), but a
+/// prebuilt `lib_dir` is only regenerated when it's missing libs entirely --
+/// so after a `vendor/picoquic` submodule bump this is the only thing that
+/// notices the prebuilt library now disagrees with the current struct
+/// layout. Only used for auto-discovered lib dirs; an explicit
+/// PICOQUIC_LIB_DIR/PICOQUIC_INCLUDE_DIR override is trusted as-is.
+pub(crate) fn is_picoquic_lib_dir_stale(lib_dir: &Path, source_dir: &Path) -> bool {
+    let (Some(lib_mtime), Some(source_mtime)) = (
+        newest_mtime(lib_dir, &["a", "lib"]),
+        newest_mtime(source_dir, &["c", "h"]),
+    ) else {
+        return false;
+    };
+    source_mtime > lib_mtime
+}
+
+fn newest_mtime(dir: &Path, extensions: &[&str]) -> Option<std::time::SystemTime> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| extensions.contains(&ext))
+        })
+        .filter_map(|entry| entry.metadata().ok()?.modified().ok())
+        .max()
 }
 
 fn resolve_picoquic_libs_single_dir(dir: &Path) -> Option<Vec<&'static str>> {

@@ -83,19 +83,38 @@ pub(crate) fn add_paths(
                 &mut path_id,
             )
         };
-        if ret == 0 && path_id >= 0 {
+        // A filled path_id means picoquic has a usable path for this peer, whether it just created
+        // one (ret == 0) or found it already present (ret == -1 from the "this path already exists"
+        // branch, which also restores it if it had been disabled). Treating that -1 as a failure is
+        // what produced an add -> lose -> re-probe churn: every retry answered "already exists", so
+        // the resolver was parked behind an ever-growing backoff (observed climbing past attempt 30,
+        // capped at 10s) while its path sat there perfectly usable, and the second resolver's share
+        // of queries fell to ~0. Adopt it instead, and clear the backoff so a later genuine loss
+        // starts probing again promptly.
+        if path_id >= 0 {
             resolver.added = true;
             resolver.path_id = path_id;
-            info!("Added path {}", resolver.addr);
+            resolver.probe_attempts = 0;
+            resolver.next_probe_at = 0;
+            if ret == 0 {
+                info!("Added path {}", resolver.addr);
+            } else {
+                info!("Adopted existing path {} (probe ret={})", resolver.addr, ret);
+            }
             continue;
         }
         resolver.probe_attempts = resolver.probe_attempts.saturating_add(1);
         let delay = path_probe_backoff(resolver.probe_attempts);
         resolver.next_probe_at = now.saturating_add(delay);
+        // ret/path_id are what distinguish the failure modes here (path-id budget exhausted by
+        // add/abandon churn vs. probe rejected outright); without them the warning says only "it
+        // failed" and a repeating add->lose->re-probe cycle is indistinguishable from never adding.
         warn!(
-            "Failed adding path {} (attempt {}), retrying in {}ms",
+            "Failed adding path {} (attempt {}, ret={} path_id={}), retrying in {}ms",
             resolver.addr,
             resolver.probe_attempts,
+            ret,
+            path_id,
             delay / 1000
         );
     }

@@ -30,6 +30,8 @@ pub(crate) struct PacketContext<'a> {
     pub(crate) quic: *mut picoquic_quic_t,
     pub(crate) current_time: u64,
     pub(crate) local_addr_storage: &'a slipstream_ffi::SockaddrStorage,
+    /// DNS query type the server accepts for tunnel queries (default 16 = TXT).
+    pub(crate) accepted_query_type: u16,
 }
 
 /// Tracks per-peer routing for UDP fallback based on DNS decoding outcomes.

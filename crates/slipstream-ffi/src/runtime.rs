@@ -4,10 +4,11 @@ use crate::picoquic::{
     picoquic_reset_stream, picoquic_set_cookie_mode, picoquic_set_default_congestion_algorithm,
     picoquic_set_default_congestion_algorithm_by_name, picoquic_set_default_multipath_option,
     picoquic_set_default_priority, picoquic_set_initial_send_mtu,
-    picoquic_set_key_log_file_from_env, picoquic_set_max_data_control, picoquic_set_mtu_max,
+    picoquic_set_key_log_file_from_env, picoquic_set_max_data_control,
+    picoquic_set_max_half_open_retry_threshold, picoquic_set_mtu_max,
     picoquic_set_preemptive_repeat_policy, picoquic_set_stream_data_consumption_mode,
-    picoquic_stop_sending, slipstream_take_stateless_packet_for_cid, SockaddrStorage,
-    PICOQUIC_MAX_PACKET_SIZE,
+    picoquic_stop_sending, slipstream_set_default_stream_data_control,
+    slipstream_take_stateless_packet_for_cid, SockaddrStorage, PICOQUIC_MAX_PACKET_SIZE,
 };
 use libc::{c_char, c_int, c_ulong, size_t};
 use slipstream_core::tcp::stream_write_buffer_bytes;
@@ -21,6 +22,12 @@ use winapi::shared::ws2ipdef::SOCKADDR_IN6_LH;
 
 pub const SLIPSTREAM_INTERNAL_ERROR: u64 = 0x101;
 pub const SLIPSTREAM_FILE_CANCEL_ERROR: u64 = 0x105;
+pub const SLIPSTREAM_MAX_DATA_CONTROL_BYTES: u64 = 64 * 1024 * 1024;
+/// Moderate per-stream initial window (stock picoquic is ~64 KiB). Upload stalls on the DNS
+/// carrier when streams hit the ceiling and wait for poll-driven MAX_STREAM_DATA.
+/// 2 MiB covers typical Telegram short videos (~1–2 MB) on a single stream without needing a
+/// window update; multi-stream load stays acceptable on a 1 GB VPS. Applied server-side only.
+pub const SLIPSTREAM_MODERATE_STREAM_DATA_BYTES: u64 = 2 * 1024 * 1024;
 
 extern "C" {
     fn ERR_error_string_n(e: c_ulong, buf: *mut c_char, len: size_t);
@@ -66,9 +73,9 @@ pub unsafe fn configure_quic_with_custom(
 }
 
 /// Configure shared QUIC defaults.
-/// Connection-level `max_data` is still configured. Stream handlers apply a small reserve in
-/// single-stream mode, then switch to per-stream caps with STOP_SENDING + discard when multiple
-/// streams are active to avoid connection-wide stalls.
+/// Connection-level `max_data` is intentionally larger than the per-stream write buffer.
+/// Upload aborts can leave reset streams draining in the QUIC connection window; keeping a wider
+/// connection window lets fresh small streams keep moving instead of waiting behind that tail.
 ///
 /// # Safety
 /// `quic` must be a valid picoquic context and `mtu` must be non-zero.
@@ -79,10 +86,50 @@ unsafe fn configure_quic_common(quic: *mut picoquic_quic_t, mtu: u32) {
     picoquic_set_preemptive_repeat_policy(quic, 1);
     picoquic_disable_port_blocking(quic, 1);
     picoquic_set_stream_data_consumption_mode(quic, 1);
-    picoquic_set_max_data_control(quic, stream_write_buffer_bytes() as u64);
+    let max_data = (stream_write_buffer_bytes() as u64).max(SLIPSTREAM_MAX_DATA_CONTROL_BYTES);
+    picoquic_set_max_data_control(quic, max_data);
+    // Per-stream window is NOT raised here (shared with the client). A too-large client-side
+    // receive window can amplify download buffering; the server applies a moderate raise via
+    // [`set_server_stream_data_control`] so peer-initiated upload streams get more than stock 64KiB.
     picoquic_set_mtu_max(quic, mtu);
     picoquic_set_initial_send_mtu(quic, mtu, mtu);
     picoquic_set_key_log_file_from_env(quic);
+}
+
+/// Raise the server's default per-stream flow-control windows to
+/// [`SLIPSTREAM_MODERATE_STREAM_DATA_BYTES`].
+///
+/// Call only on the **server** QUIC context, after `configure_quic*`. This is what lets a peer
+/// (phone) send more than ~64 KiB on each newly opened bidi stream before waiting for a
+/// MAX_STREAM_DATA update — critical on the DNS-poll carrier where those updates only leave the
+/// server in a response to a client poll. Kept off the shared configure path so the client
+/// retains stock defaults (download-path isolation).
+///
+/// # Safety
+/// `quic` must be a valid picoquic context returned by `picoquic_create`.
+pub unsafe fn set_server_stream_data_control(quic: *mut picoquic_quic_t) {
+    slipstream_set_default_stream_data_control(quic, SLIPSTREAM_MODERATE_STREAM_DATA_BYTES);
+}
+
+/// Lower picoquic's half-open (unvalidated) connection threshold on a **server** QUIC context.
+///
+/// Once the number of concurrent half-open connections reaches `threshold`, picoquic requires a
+/// cheap Retry-token round-trip for new connections instead of running a full, CPU-heavy crypto
+/// handshake for each one (it self-adjusts back down as load drops). picoquic's default threshold
+/// is 64 (`PICOQUIC_DEFAULT_HALF_OPEN_RETRY_THRESHOLD`), which is far too high to help on a
+/// single-threaded server where a small burst of simultaneous handshakes can starve the accept
+/// loop -- see upstream issues #71/#37 ("server unresponsive after a burst of connection
+/// establishment requests").
+///
+/// This is intentionally **not** part of [`configure_quic_common`] (which is shared with the
+/// client). A client only ever initiates one connection, so this knob is meaningless there; wiring
+/// it into the shared helper would needlessly change client behavior. Call this only from the
+/// server, on the server's own QUIC context, right after `configure_quic*` runs.
+///
+/// # Safety
+/// `quic` must be a valid picoquic context returned by `picoquic_create`.
+pub unsafe fn set_server_half_open_retry_threshold(quic: *mut picoquic_quic_t, threshold: u32) {
+    picoquic_set_max_half_open_retry_threshold(quic, threshold);
 }
 
 pub fn take_crypto_errors() -> Vec<String> {
@@ -394,5 +441,61 @@ mod tests {
         let storage = socket_addr_to_storage(addr);
 
         assert_eq!(sockaddr_storage_to_socket_addr(&storage).unwrap(), addr);
+    }
+
+    /// Discriminating regression coverage for #71/#37: prove that
+    /// [`set_server_half_open_retry_threshold`] actually writes the half-open retry threshold onto a
+    /// real picoquic context, rather than the loopback burst e2e test (which reaches "Connection
+    /// ready" for every client regardless of whether the knob was applied, so it passes even if the
+    /// FFI plumbing is a no-op). A fresh context must report picoquic's built-in default; after the
+    /// setter it must report our value.
+    #[test]
+    fn server_half_open_retry_threshold_is_applied_to_context() {
+        use crate::picoquic::{
+            picoquic_create, picoquic_current_time, picoquic_get_max_half_open_retry_threshold,
+        };
+        use std::ffi::CString;
+
+        // ALPN only needs to be a valid C string; this context never runs a handshake.
+        let alpn = CString::new("slipstream-halfopen-test").expect("alpn cstring");
+        // SAFETY: build a minimal context the same way the client does (null cert/key/callbacks),
+        // read/mutate one struct field, then free it via QuicGuard on scope exit.
+        unsafe {
+            let quic = picoquic_create(
+                8,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                alpn.as_ptr(),
+                None,
+                std::ptr::null_mut(),
+                None,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                picoquic_current_time(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+            );
+            assert!(!quic.is_null(), "picoquic_create returned null");
+            let _guard = QuicGuard::new(quic);
+
+            // A fresh context sits at picoquic's built-in default (64). If the FFI binding were
+            // mis-wired or a no-op, the post-set read below would still be this default and the
+            // test would fail -- which is exactly the discrimination the e2e burst test lacks.
+            let before = picoquic_get_max_half_open_retry_threshold(quic);
+            assert_eq!(
+                before, 64,
+                "unexpected picoquic default half-open retry threshold"
+            );
+
+            set_server_half_open_retry_threshold(quic, 4);
+            assert_eq!(
+                picoquic_get_max_half_open_retry_threshold(quic),
+                4,
+                "setter did not apply the half-open retry threshold to the context"
+            );
+        }
     }
 }

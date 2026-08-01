@@ -66,13 +66,12 @@ impl FallbackManager {
             }
         }
 
-        let socket = if let Some(session) = self.sessions.get_mut(&peer) {
+        let socket = {
+            let session = self.sessions.get_mut(&peer)?;
             if let Ok(mut last_seen) = session.last_seen.lock() {
                 *last_seen = Instant::now();
             }
             session.socket.clone()
-        } else {
-            return None;
         };
 
         Some(socket)

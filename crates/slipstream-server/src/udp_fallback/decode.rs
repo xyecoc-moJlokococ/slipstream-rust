@@ -1,6 +1,6 @@
 use super::{dummy_sockaddr_storage, FallbackManager, PacketContext};
 use crate::server::{ServerError, Slot};
-use slipstream_dns::{decode_query_with_domains, DecodeQueryError};
+use slipstream_dns::{decode_query_with_domains_and_qtype, DataEncoding, DecodeQueryError};
 use slipstream_ffi::picoquic::{
     picoquic_cnx_t, picoquic_incoming_packet_ex, picoquic_quic_t, slipstream_disable_ack_delay,
 };
@@ -34,6 +34,7 @@ pub(crate) async fn handle_packet(
         context.quic,
         context.current_time,
         context.local_addr_storage,
+        context.accepted_query_type,
     )? {
         DecodeSlotOutcome::Slot(slot) => {
             if let Some(manager) = fallback_mgr.as_mut() {
@@ -56,6 +57,7 @@ pub(crate) async fn handle_packet(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_slot(
     packet: &[u8],
     peer: SocketAddr,
@@ -63,8 +65,9 @@ fn decode_slot(
     quic: *mut picoquic_quic_t,
     current_time: u64,
     local_addr_storage: &slipstream_ffi::SockaddrStorage,
+    accepted_query_type: u16,
 ) -> Result<DecodeSlotOutcome, ServerError> {
-    match decode_query_with_domains(packet, domains) {
+    match decode_query_with_domains_and_qtype(packet, domains, accepted_query_type) {
         Ok(query) => {
             let mut peer_storage = dummy_sockaddr_storage();
             let mut local_storage = unsafe { std::ptr::read(local_addr_storage) };
@@ -94,6 +97,7 @@ fn decode_slot(
                     if !payload.is_empty() {
                         return Ok(DecodeSlotOutcome::Slot(Slot {
                             peer,
+                            tcp_response: None,
                             id: query.id,
                             rd: query.rd,
                             cd: query.cd,
@@ -102,6 +106,7 @@ fn decode_slot(
                             cnx: std::ptr::null_mut(),
                             path_id: -1,
                             payload_override: Some(payload),
+                            encoding: query.encoding,
                         }));
                     }
                 }
@@ -112,6 +117,7 @@ fn decode_slot(
             }
             Ok(DecodeSlotOutcome::Slot(Slot {
                 peer,
+                tcp_response: None,
                 id: query.id,
                 rd: query.rd,
                 cd: query.cd,
@@ -120,6 +126,7 @@ fn decode_slot(
                 cnx: first_cnx,
                 path_id: first_path,
                 payload_override: None,
+                encoding: query.encoding,
             }))
         }
         Err(DecodeQueryError::Drop) => Ok(DecodeSlotOutcome::Drop),
@@ -136,6 +143,7 @@ fn decode_slot(
             };
             Ok(DecodeSlotOutcome::Slot(Slot {
                 peer,
+                tcp_response: None,
                 id,
                 rd,
                 cd,
@@ -144,6 +152,8 @@ fn decode_slot(
                 cnx: std::ptr::null_mut(),
                 path_id: -1,
                 payload_override: None,
+                // No payload will be encoded for an error reply, so the choice here is moot.
+                encoding: DataEncoding::default(),
             }))
         }
     }

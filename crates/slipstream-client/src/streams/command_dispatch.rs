@@ -2,7 +2,7 @@ use super::invariants::check_stream_invariants;
 use super::io_tasks::{spawn_client_reader, spawn_client_writer, STREAM_READ_CHUNK_BYTES};
 use super::state::{
     ClientState, ClientStream, Command, StreamRecvState, StreamSendState,
-    CLIENT_WRITE_COALESCE_DEFAULT_BYTES, DEFAULT_TCP_RCVBUF_BYTES,
+    CLIENT_WRITE_COALESCE_DEFAULT_BYTES, DEFAULT_TCP_RCVBUF_BYTES, TCP_HALF_CLOSED_MAX_US,
 };
 #[cfg(test)]
 use super::test_hooks;
@@ -13,7 +13,8 @@ use slipstream_core::flow_control::{
 use slipstream_core::tcp::{stream_read_limit_chunks, tcp_send_buffer_bytes};
 use slipstream_ffi::picoquic::{
     picoquic_add_to_stream, picoquic_cnx_t, picoquic_current_time,
-    picoquic_get_next_local_stream_id, picoquic_mark_active_stream, picoquic_stream_data_consumed,
+    picoquic_get_next_local_stream_id, picoquic_mark_active_stream, picoquic_stop_sending,
+    picoquic_stream_data_consumed,
 };
 use slipstream_ffi::{abort_stream_bidi, SLIPSTREAM_INTERNAL_ERROR};
 use tokio::sync::{mpsc, oneshot};
@@ -48,6 +49,7 @@ pub(crate) fn drain_commands(
 pub(crate) fn drain_stream_data(cnx: *mut picoquic_cnx_t, state_ptr: *mut ClientState) {
     let mut pending = Vec::new();
     let mut closed_streams = Vec::new();
+    let now_us = unsafe { picoquic_current_time() };
     {
         let state = unsafe { &mut *state_ptr };
         slipstream_core::drain_stream_data!(state.streams, data_rx, pending, closed_streams);
@@ -55,6 +57,10 @@ pub(crate) fn drain_stream_data(cnx: *mut picoquic_cnx_t, state_ptr: *mut Client
             if let Some(stream) = state.streams.get_mut(stream_id) {
                 if stream.send_state == StreamSendState::Open {
                     stream.send_state = StreamSendState::Closing;
+                }
+                // Local SOCKS peer FINed: arm the CLOSE-WAIT reaper clock.
+                if stream.tcp_local_eof_at_us.is_none() {
+                    stream.tcp_local_eof_at_us = Some(now_us);
                 }
             }
         }
@@ -64,6 +70,39 @@ pub(crate) fn drain_stream_data(cnx: *mut picoquic_cnx_t, state_ptr: *mut Client
     }
     for stream_id in closed_streams {
         handle_command(cnx, state_ptr, Command::StreamClosed { stream_id });
+    }
+}
+
+/// Force-close accepted TCP sockets that have been half-closed (peer FIN) longer than
+/// [TCP_HALF_CLOSED_MAX_US] without the QUIC half finishing. Without this, CLOSE-WAIT fds
+/// accumulate on the native SOCKS listen port under a slow/dead DNS carrier.
+pub(crate) fn reap_half_closed_tcp_streams(
+    cnx: *mut picoquic_cnx_t,
+    state_ptr: *mut ClientState,
+    now_us: u64,
+) {
+    let stale = {
+        let state = unsafe { &*state_ptr };
+        state.stale_half_closed_tcp_streams(now_us, TCP_HALF_CLOSED_MAX_US)
+    };
+    if stale.is_empty() {
+        return;
+    }
+    warn!(
+        "reaping {} half-closed TCP stream(s) past {}ms (CLOSE-WAIT guard)",
+        stale.len(),
+        TCP_HALF_CLOSED_MAX_US / 1_000
+    );
+    for stream_id in stale {
+        warn!(
+            "stream {}: reaping half-closed TCP (local peer FIN, remote QUIC still open)",
+            stream_id
+        );
+        if !cnx.is_null() {
+            unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
+        }
+        let state = unsafe { &mut *state_ptr };
+        state.remove_stream(stream_id);
     }
 }
 
@@ -153,8 +192,10 @@ pub(crate) fn handle_command(
                     recv_state: StreamRecvState::Open,
                     send_state: StreamSendState::Open,
                     flow: FlowControlState::default(),
+                    tcp_local_eof_at_us: None,
                 },
             );
+            state.debug_last_enqueue_at = unsafe { picoquic_current_time() };
             spawn_client_reader(
                 stream_id,
                 read_half,
@@ -213,7 +254,7 @@ pub(crate) fn handle_command(
                     data.len()
                 );
                 unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
-                state.streams.remove(&stream_id);
+                state.remove_stream(stream_id);
             } else if let Some(stream) = state.streams.get_mut(&stream_id) {
                 stream.tx_bytes = stream.tx_bytes.saturating_add(data.len() as u64);
                 let now = unsafe { picoquic_current_time() };
@@ -222,6 +263,23 @@ pub(crate) fn handle_command(
                 state.debug_last_enqueue_at = now;
             }
             check_stream_invariants(state, stream_id, "StreamData");
+        }
+        Command::StreamLocalTcpEof {
+            stream_id,
+            generation,
+        } => {
+            if !command_generation_matches(state, stream_id, generation, "StreamLocalTcpEof") {
+                return;
+            }
+            if let Some(stream) = state.streams.get_mut(&stream_id) {
+                // Only arm the clock here. Do NOT flip send_state to Closing while data_rx is
+                // still live -- that violates the "closed send with data_rx" invariant. Closing
+                // is applied when drain_stream_data sees data_tx drop (Disconnected).
+                if stream.tcp_local_eof_at_us.is_none() {
+                    stream.tcp_local_eof_at_us = Some(unsafe { picoquic_current_time() });
+                }
+            }
+            check_stream_invariants(state, stream_id, "StreamLocalTcpEof");
         }
         Command::StreamClosed { stream_id } => {
             let should_send_fin = state
@@ -247,6 +305,7 @@ pub(crate) fn handle_command(
             };
             #[cfg(not(test))]
             let ret = unsafe { picoquic_add_to_stream(cnx, stream_id, std::ptr::null(), 0, 1) };
+            state.debug_last_enqueue_at = unsafe { picoquic_current_time() };
             if ret < 0 {
                 warn!(
                     "stream {}: add_to_stream(fin) failed ret={}",
@@ -255,11 +314,14 @@ pub(crate) fn handle_command(
                 if !forced_failure {
                     unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
                 }
-                state.streams.remove(&stream_id);
+                state.remove_stream(stream_id);
             } else if let Some(stream) = state.streams.get_mut(&stream_id) {
                 stream.send_state = StreamSendState::FinQueued;
+                if stream.tcp_local_eof_at_us.is_none() {
+                    stream.tcp_local_eof_at_us = Some(unsafe { picoquic_current_time() });
+                }
                 if stream.recv_state.is_closed() && stream.flow.queued_bytes == 0 {
-                    state.streams.remove(&stream_id);
+                    state.remove_stream(stream_id);
                 }
             }
             check_stream_invariants(state, stream_id, "StreamClosed");
@@ -271,7 +333,7 @@ pub(crate) fn handle_command(
             if !command_generation_matches(state, stream_id, generation, "StreamReadError") {
                 return;
             }
-            if let Some(stream) = state.streams.remove(&stream_id) {
+            if let Some(stream) = state.remove_stream(stream_id) {
                 warn!(
                     "stream {}: tcp read error rx_bytes={} tx_bytes={} queued={} consumed_offset={} fin_offset={:?}",
                     stream_id,
@@ -293,7 +355,16 @@ pub(crate) fn handle_command(
             if !command_generation_matches(state, stream_id, generation, "StreamWriteError") {
                 return;
             }
-            if let Some(stream) = state.streams.remove(&stream_id) {
+            // Issue #60 (STOP_SENDING vs RESET_STREAM): an EPIPE-class local write failure only
+            // means we can no longer deliver INBOUND (remote->local) data to the local peer. It
+            // does NOT mean the local peer has stopped SENDING upstream, so this is a half-close,
+            // not a full bidi abort. Keep the stream alive (do NOT remove_stream) so the
+            // local->remote upload direction can finish via the normal StreamClosed /
+            // StreamLocalTcpEof path; mark it discarding so further inbound QUIC data is dropped
+            // instead of re-delivered to the dead write channel; and send picoquic_stop_sending
+            // (receiver-side abort) -- NOT picoquic_reset_stream, which would also kill our own
+            // send direction.
+            if let Some(stream) = state.streams.get_mut(&stream_id) {
                 warn!(
                     "stream {}: tcp write error rx_bytes={} tx_bytes={} queued={} consumed_offset={} fin_offset={:?}",
                     stream_id,
@@ -303,10 +374,13 @@ pub(crate) fn handle_command(
                     stream.flow.consumed_offset,
                     stream.flow.fin_offset
                 );
+                if stream.mark_write_error_half_closed() {
+                    unsafe { picoquic_stop_sending(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
+                }
             } else {
                 warn!("stream {}: tcp write error (unknown stream)", stream_id);
             }
-            unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
+            check_stream_invariants(state, stream_id, "StreamWriteError");
         }
         Command::StreamWriteDrained {
             stream_id,
@@ -343,7 +417,7 @@ pub(crate) fn handle_command(
                         },
                     ) {
                         unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
-                        state.streams.remove(&stream_id);
+                        state.remove_stream(stream_id);
                         return;
                     }
                 }
@@ -355,7 +429,7 @@ pub(crate) fn handle_command(
                 }
             }
             if remove_stream {
-                state.streams.remove(&stream_id);
+                state.remove_stream(stream_id);
             }
             check_stream_invariants(state, stream_id, "StreamWriteDrained");
         }

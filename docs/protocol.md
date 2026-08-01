@@ -23,12 +23,15 @@ codec is intentionally minimal and focused on speed and compatibility.
 - QTYPE: TXT (RR_TXT)
 - QCLASS: IN (CLASS_IN)
 - QDCOUNT: 1
-- ARCOUNT: 1 with EDNS0 OPT record:
+- For UDP resolver transport, ARCOUNT: 1 with EDNS0 OPT record:
   - name: "."
   - type: RR_OPT (41)
   - class: 65535
   - ttl: 0
   - udp_payload: 1232
+- For TCP resolver transport, QNAME upstream encoding may omit the OPT record.
+- EDNS raw upstream encoding always uses an EDNS0 OPT record and carries the
+  upstream payload in the Slipstream EDNS option.
 - RD is set. Other flags default.
 - ID is a 16-bit value (random in C; any 16-bit value is valid for interop).
 
@@ -102,8 +105,9 @@ Otherwise, the response is ignored (including NAME_ERROR, which signals no data)
   cap (SLIPSTREAM_STREAM_QUEUE_MAX_BYTES). On overflow, the receiver sends
   STOP_SENDING, discards data for that stream, and continues consuming to
   avoid connection-level stalls.
-- Once a connection enters multi-stream mode it stays there for the remainder
-  of the connection.
+- Once a connection enters multi-stream mode it uses consume-on-receive until
+  all active streams close. A later single stream returns to single-stream
+  TCP-style backpressure instead of inheriting a degraded multi-stream state.
 
 ## Path handling
 
@@ -115,8 +119,10 @@ Otherwise, the response is ignored (including NAME_ERROR, which signals no data)
 
 - MAX_DNS_QUERY_SIZE is 512 bytes (traditional DNS UDP limit).
 - Inline dots ensure label length <= 57 chars.
-- EDNS0 is always included on outbound messages and advertises udp_payload=1232;
-  incoming messages are accepted regardless of OPT presence.
+- UDP QNAME queries and all responses include EDNS0 and advertise
+  udp_payload=1232; incoming messages are accepted regardless of OPT presence.
+- TCP QNAME queries may use compact encoding without EDNS0. EDNS raw queries
+  always include EDNS0 because the payload is carried in an EDNS option.
 - Client MTU is derived from the domain length: floor((240 - domain_len) / 1.6).
 - Server MTU is fixed at 900.
 

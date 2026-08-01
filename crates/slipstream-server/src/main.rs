@@ -1,5 +1,10 @@
+mod buf_pool;
 mod config;
+#[cfg(target_os = "linux")]
+mod mmsg;
+mod multi_worker;
 mod server;
+mod socks_target;
 mod streams;
 mod target;
 mod udp_fallback;
@@ -41,12 +46,65 @@ struct Args {
     domains: Vec<String>,
     #[arg(long = "max-connections", default_value_t = 256, value_parser = parse_max_connections)]
     max_connections: u32,
+    /// Concurrent half-open (unvalidated) connections tolerated before picoquic starts requiring a
+    /// cheap Retry-token round-trip instead of a full crypto handshake for new connections (an
+    /// adaptive, self-adjusting DoS defense). picoquic's built-in default is 64, which is far too
+    /// high to help on this single-threaded server: a small burst of simultaneous handshakes can
+    /// monopolize the one runtime thread and starve the TCP accept loop, dropping/refusing
+    /// concurrent connection attempts (upstream issues #71/#37).
+    ///
+    /// picoquic starts demanding a Retry for a new initial once `current_number_half_open >=
+    /// threshold` (vendor/picoquic packet.c), so to actually engage at the empirically reproduced
+    /// ~5-concurrent failure point the default must be <= 5. 4 makes the defense kick in on the 5th
+    /// simultaneous handshake (4 already half-open) while still clearing ordinary legitimate
+    /// concurrency -- a couple of users reconnecting at once or a client's multipath resolver-path
+    /// probes (~2-3 connections) -- so those don't pay an extra retry RTT. A default of 8 (or any
+    /// value > 5) would leave the defense inert at exactly the load that triggered the bug. It is
+    /// configurable (CLI --max-half-open-connections or the SIP003 `max-half-open-connections`
+    /// plugin option) so ops can raise it if legitimate concurrency is higher, or lower it further,
+    /// without a rebuild.
+    #[arg(long = "max-half-open-connections", default_value_t = 4, value_parser = parse_max_half_open_connections)]
+    max_half_open_connections: u32,
+    /// Max QUIC packet size the server emits = tunnel bytes carried by ONE DNS answer (default 900).
+    ///
+    /// Higher means fewer DNS round trips per downloaded byte, which is the lever where the return
+    /// path is policed by packet *rate* (a mobile operator measured ~78% of answers delivered at
+    /// 34 q/s vs ~24% at 225 q/s) and it also cuts handset radio airtime. Upper bound 1440 is
+    /// vendored picoquic's `PICOQUIC_PRACTICAL_MAX_MTU` (its send buffer is 1536).
+    ///
+    /// Only raise past ~1150 when clients use the DNS-over-**TCP** carrier: over UDP the answer must
+    /// still fit the advertised EDNS buffer (1232) or resolvers truncate it. SIP003 option: `max-mtu`.
+    #[arg(long = "max-mtu", default_value_t = server::QUIC_MTU, value_parser = parse_max_mtu)]
+    max_mtu: u32,
     #[arg(long = "idle-timeout-seconds", default_value_t = 60)]
     idle_timeout_seconds: u64,
     #[arg(long = "debug-streams")]
     debug_streams: bool,
     #[arg(long = "debug-commands")]
     debug_commands: bool,
+    #[arg(long = "direct-socks-target")]
+    direct_socks_target: bool,
+    #[arg(long = "socks-proxy-target")]
+    socks_proxy_target: bool,
+    /// Base answer TTL (seconds) in DNS responses (default 60). Anti-fingerprinting knob.
+    #[arg(long = "response-ttl", default_value_t = 60)]
+    response_ttl: u32,
+    /// If > 0, vary the answer TTL by id%(jitter+1) so it isn't constant (default 0).
+    #[arg(long = "response-ttl-jitter", default_value_t = 0)]
+    response_ttl_jitter: u32,
+    /// Extra DNS query type to accept for tunnel queries, beyond the types already supported
+    /// unconditionally (TXT/HTTPS/A/AAAA/CNAME/MX/SRV/NULL -- the client's --dns-query-type just
+    /// needs to be one of those, no server config needed). Only useful for allowing some other,
+    /// not-yet-implemented type without a code change.
+    #[arg(long = "accepted-query-type", default_value_t = 16)]
+    accepted_query_type: u16,
+    /// Number of independent server worker threads (each with its own picoquic context).
+    /// Default 1 preserves the historical single-threaded path. Values >1 enable userspace
+    /// demux by source IP so DNS/QUIC CPU scales across cores for multi-client load. Do not use
+    /// kernel SO_REUSEPORT alone for this — client/resolver source-port spray would split one
+    /// QUIC connection across workers. SIP003 option: `workers`.
+    #[arg(long = "workers", default_value_t = 1, value_parser = parse_workers)]
+    workers: usize,
 }
 
 fn main() {
@@ -146,6 +204,41 @@ fn main() {
     } else {
         args.max_connections
     };
+    // Threaded through the SIP003 plugin-options path just like max-connections above: under a
+    // SIP003 plugin manager the operator has no CLI, so without this branch the half-open retry
+    // threshold would be stuck at its default in exactly the deployment mode where production
+    // tuning happens (see #71/#37 review).
+    let max_half_open_connections = if cli_provided(&matches, "max_half_open_connections") {
+        args.max_half_open_connections
+    } else if let Some(value) =
+        sip003::last_option_value(&sip003_env.plugin_options, "max-half-open-connections")
+    {
+        unwrap_or_exit(
+            parse_max_half_open_connections(&value),
+            "SIP003 env error",
+            2,
+        )
+    } else {
+        args.max_half_open_connections
+    };
+
+    // Same SIP003 reasoning as max-half-open-connections above: under a plugin manager there is no
+    // CLI, and response size is exactly the knob an operator needs to tune per carrier.
+    let max_mtu = if cli_provided(&matches, "max_mtu") {
+        args.max_mtu
+    } else if let Some(value) = sip003::last_option_value(&sip003_env.plugin_options, "max-mtu") {
+        unwrap_or_exit(parse_max_mtu(&value), "SIP003 env error", 2)
+    } else {
+        args.max_mtu
+    };
+
+    let workers = if cli_provided(&matches, "workers") {
+        args.workers
+    } else if let Some(value) = sip003::last_option_value(&sip003_env.plugin_options, "workers") {
+        unwrap_or_exit(parse_workers(&value), "SIP003 env error", 2)
+    } else {
+        args.workers
+    };
 
     let config = ServerConfig {
         dns_listen_host,
@@ -157,9 +250,17 @@ fn main() {
         reset_seed_path,
         domains,
         max_connections,
+        max_half_open_connections,
+        max_mtu,
         idle_timeout_seconds: args.idle_timeout_seconds,
         debug_streams: args.debug_streams,
         debug_commands: args.debug_commands,
+        direct_socks_target: args.direct_socks_target,
+        socks_proxy_target: args.socks_proxy_target,
+        response_ttl: args.response_ttl,
+        response_ttl_jitter: args.response_ttl_jitter,
+        accepted_query_type: args.accepted_query_type,
+        workers,
     };
 
     let runtime = Builder::new_current_thread()
@@ -200,6 +301,53 @@ fn parse_max_connections(input: &str) -> Result<u32, String> {
     Ok(value)
 }
 
+fn parse_max_half_open_connections(input: &str) -> Result<u32, String> {
+    let trimmed = input.trim();
+    let value = trimmed
+        .parse::<u32>()
+        .map_err(|_| format!("Invalid max-half-open-connections value: {}", trimmed))?;
+    // 0 would force a Retry-token round-trip on every single connection (adding an RTT even to the
+    // common isolated-client case), which is what cookie_mode's force-retry bit is for; require at
+    // least 1 so this knob only ever engages once concurrency actually appears.
+    if value == 0 {
+        return Err("max-half-open-connections must be at least 1".to_string());
+    }
+    Ok(value)
+}
+
+/// Lower bound 512 keeps a raise from silently *shrinking* answers below the historical 900 by
+/// typo; upper bound 1440 is vendored picoquic's `PICOQUIC_PRACTICAL_MAX_MTU` — beyond it picoquic's
+/// own 1536-byte packet buffer and MTU logic would need patching, so reject rather than pretend.
+fn parse_max_mtu(input: &str) -> Result<u32, String> {
+    let trimmed = input.trim();
+    let value = trimmed
+        .parse::<u32>()
+        .map_err(|_| format!("Invalid max-mtu value: {}", trimmed))?;
+    if !(512..=1440).contains(&value) {
+        return Err(format!(
+            "max-mtu must be between 512 and 1440 (vendored picoquic PICOQUIC_PRACTICAL_MAX_MTU); got {}",
+            value
+        ));
+    }
+    Ok(value)
+}
+
+fn parse_workers(input: &str) -> Result<usize, String> {
+    let trimmed = input.trim();
+    let value = trimmed
+        .parse::<usize>()
+        .map_err(|_| format!("Invalid workers value: {}", trimmed))?;
+    if value == 0 {
+        return Err("workers must be at least 1".to_string());
+    }
+    // Soft cap: more than a few dozen picoquic contexts is almost never useful on a VPS and
+    // multiplies memory (cert/TLS tables per context). Raise via code if a real need appears.
+    if value > 64 {
+        return Err("workers must be at most 64".to_string());
+    }
+    Ok(value)
+}
+
 fn cli_provided(matches: &clap::ArgMatches, id: &str) -> bool {
     matches.value_source(id) == Some(ValueSource::CommandLine)
 }
@@ -221,4 +369,77 @@ fn parse_domains_from_options(options: &[sip003::Sip003Option]) -> Result<Vec<St
         }
     }
     Ok(domains.unwrap_or_default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The production default for the half-open retry threshold. If this changes, revisit the
+    /// rationale documented on the `--max-half-open-connections` flag in `Args`.
+    const EXPECTED_DEFAULT_MAX_HALF_OPEN: u32 = 4;
+
+    fn parse_args(extra: &[&str]) -> Result<Args, clap::Error> {
+        let mut argv = vec!["slipstream-server"];
+        argv.extend_from_slice(extra);
+        Args::try_parse_from(argv)
+    }
+
+    #[test]
+    fn max_half_open_connections_defaults_to_expected() {
+        let args = parse_args(&[]).expect("defaults parse");
+        assert_eq!(
+            args.max_half_open_connections,
+            EXPECTED_DEFAULT_MAX_HALF_OPEN
+        );
+    }
+
+    #[test]
+    fn max_half_open_connections_flag_overrides_default() {
+        let args = parse_args(&["--max-half-open-connections", "2"]).expect("flag parses");
+        assert_eq!(args.max_half_open_connections, 2);
+    }
+
+    #[test]
+    fn max_half_open_connections_rejects_zero() {
+        let err =
+            parse_args(&["--max-half-open-connections", "0"]).expect_err("zero must be rejected");
+        assert!(
+            err.to_string().contains("at least 1"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn max_half_open_connections_rejects_non_numeric() {
+        assert!(parse_args(&["--max-half-open-connections", "abc"]).is_err());
+    }
+
+    #[test]
+    fn parse_max_half_open_connections_validates_bounds() {
+        assert_eq!(parse_max_half_open_connections("1"), Ok(1));
+        assert_eq!(parse_max_half_open_connections("  16 "), Ok(16));
+        assert!(parse_max_half_open_connections("0").is_err());
+        assert!(parse_max_half_open_connections("nope").is_err());
+    }
+
+    #[test]
+    fn workers_defaults_to_one() {
+        let args = parse_args(&[]).expect("defaults parse");
+        assert_eq!(args.workers, 1);
+    }
+
+    #[test]
+    fn workers_flag_overrides_default() {
+        let args = parse_args(&["--workers", "4"]).expect("flag parses");
+        assert_eq!(args.workers, 4);
+    }
+
+    #[test]
+    fn workers_rejects_zero_and_too_large() {
+        assert!(parse_args(&["--workers", "0"]).is_err());
+        assert!(parse_args(&["--workers", "65"]).is_err());
+        assert_eq!(parse_workers("8"), Ok(8));
+    }
 }

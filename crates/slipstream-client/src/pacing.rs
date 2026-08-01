@@ -1,9 +1,14 @@
 use slipstream_ffi::picoquic::picoquic_path_quality_t;
 
 // Pacing gain tuning for the poll-based pacing loop.
+pub(crate) const DEFAULT_PACING_GAIN_PROBE: f64 = 1.4;
 const PACING_GAIN_BASE: f64 = 1.0;
-const PACING_GAIN_PROBE: f64 = 1.25;
 const PACING_GAIN_EPSILON: f64 = 0.05;
+const PACING_GAIN_PROBE_MIN: f64 = 1.0;
+const PACING_GAIN_PROBE_MAX: f64 = 4.0;
+const MIN_AUTHORITATIVE_TARGET_INFLIGHT: usize = 16;
+const MAX_AUTHORITATIVE_TARGET_INFLIGHT: usize = 64;
+pub(crate) const MAX_ACTIVE_AUTHORITATIVE_TARGET_INFLIGHT: usize = 384;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct PacingBudgetSnapshot {
@@ -17,15 +22,17 @@ pub(crate) struct PacingPollBudget {
     payload_bytes: f64,
     mtu: u32,
     last_pacing_rate: u64,
+    probe_gain: f64,
 }
 
 impl PacingPollBudget {
-    pub(crate) fn new(mtu: u32) -> Self {
+    pub(crate) fn new(mtu: u32, probe_gain: f64) -> Self {
         debug_assert!(mtu > 0, "PacingPollBudget::new expects MTU > 0");
         Self {
             payload_bytes: mtu.max(1) as f64,
             mtu,
             last_pacing_rate: 0,
+            probe_gain: sanitize_pacing_gain_probe(probe_gain),
         }
     }
 
@@ -33,11 +40,16 @@ impl PacingPollBudget {
         &mut self,
         quality: &picoquic_path_quality_t,
         rtt_proxy_us: u64,
+        max_target_inflight: usize,
     ) -> PacingBudgetSnapshot {
         let pacing_rate = quality.pacing_rate;
         let rtt_seconds = (self.derive_rtt_us(quality.rtt, rtt_proxy_us) as f64) / 1_000_000.0;
         if pacing_rate == 0 {
-            let target_inflight = cwnd_target_polls(quality.cwin, self.mtu);
+            let target_inflight = clamp_authoritative_target_with_max(
+                cwnd_target_polls(quality.cwin, self.mtu),
+                self.mtu,
+                max_target_inflight,
+            );
             let qps = target_inflight as f64 / rtt_seconds;
             self.last_pacing_rate = 0;
             return PacingBudgetSnapshot {
@@ -50,7 +62,11 @@ impl PacingPollBudget {
 
         let gain = self.next_gain(pacing_rate);
         let qps = (pacing_rate as f64 / self.payload_bytes) * gain;
-        let target_inflight = (qps * rtt_seconds).ceil().min(usize::MAX as f64) as usize;
+        let target_inflight = clamp_authoritative_target_with_max(
+            (qps * rtt_seconds).ceil().min(usize::MAX as f64) as usize,
+            self.mtu,
+            max_target_inflight,
+        );
 
         PacingBudgetSnapshot {
             pacing_rate,
@@ -69,12 +85,34 @@ impl PacingPollBudget {
     fn next_gain(&mut self, pacing_rate: u64) -> f64 {
         let gain =
             if pacing_rate as f64 > (self.last_pacing_rate as f64) * (1.0 + PACING_GAIN_EPSILON) {
-                PACING_GAIN_PROBE
+                self.probe_gain
             } else {
                 PACING_GAIN_BASE
             };
         self.last_pacing_rate = pacing_rate;
         gain
+    }
+}
+
+pub(crate) fn clamp_authoritative_target(target: usize, _mtu: u32) -> usize {
+    clamp_authoritative_target_with_max(target, _mtu, MAX_AUTHORITATIVE_TARGET_INFLIGHT)
+}
+
+pub(crate) fn clamp_authoritative_target_with_max(
+    target: usize,
+    _mtu: u32,
+    max_target_inflight: usize,
+) -> usize {
+    target
+        .max(MIN_AUTHORITATIVE_TARGET_INFLIGHT)
+        .min(max_target_inflight.max(MIN_AUTHORITATIVE_TARGET_INFLIGHT))
+}
+
+pub(crate) fn sanitize_pacing_gain_probe(value: f64) -> f64 {
+    if value.is_finite() && value >= PACING_GAIN_PROBE_MIN {
+        value.min(PACING_GAIN_PROBE_MAX)
+    } else {
+        DEFAULT_PACING_GAIN_PROBE
     }
 }
 

@@ -1,15 +1,18 @@
 use crate::error::ClientError;
-use slipstream_core::net::is_transient_udp_error;
-use slipstream_dns::{build_qname, encode_query, QueryParams, CLASS_IN, RR_TXT};
+use slipstream_dns::{
+    build_edns_raw_qname, build_qname_with_encoding, encode_query, encode_query_compact,
+    encode_query_edns_raw, QueryParams, CLASS_IN,
+};
 use slipstream_ffi::picoquic::{
     picoquic_cnx_t, picoquic_current_time, picoquic_prepare_packet_ex, slipstream_request_poll,
 };
-use slipstream_ffi::{ClientConfig, ResolverMode};
+use slipstream_ffi::{ClientConfig, ResolverMode, ResolverTransport, UpstreamEncoding};
 use std::collections::HashMap;
-use tokio::net::UdpSocket as TokioUdpSocket;
 
 use super::path::refresh_resolver_path;
 use super::resolver::{sockaddr_storage_to_socket_addr, PeerAddrMode, ResolverState};
+use super::transport::DnsTransport;
+use super::txid::TxidGen;
 
 const AUTHORITATIVE_POLL_TIMEOUT_US: u64 = 5_000_000;
 
@@ -32,10 +35,10 @@ pub(crate) fn expire_inflight_polls(inflight_poll_ids: &mut HashMap<u16, u64>, n
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_poll_queries(
     cnx: *mut picoquic_cnx_t,
-    udp: &TokioUdpSocket,
+    dns_transport: &mut DnsTransport,
     config: &ClientConfig<'_>,
     local_addr_storage: &mut slipstream_ffi::SockaddrStorage,
-    dns_id: &mut u16,
+    txid: &mut TxidGen,
     resolver: &mut ResolverState,
     peer_addr_mode: PeerAddrMode,
     remaining: &mut usize,
@@ -86,26 +89,45 @@ pub(crate) async fn send_poll_queries(
         resolver.debug.send_bytes = resolver.debug.send_bytes.saturating_add(send_length as u64);
         resolver.debug.polls_sent = resolver.debug.polls_sent.saturating_add(1);
 
-        let poll_id = *dns_id;
-        let qname = build_qname(&send_buf[..send_length], config.domain)
-            .map_err(|err| ClientError::new(err.to_string()))?;
-        let params = QueryParams {
-            id: poll_id,
-            qname: &qname,
-            qtype: RR_TXT,
-            qclass: CLASS_IN,
-            rd: true,
-            cd: false,
-            qdcount: 1,
-            is_query: true,
+        let poll_id = txid.next_id();
+        let label_length = super::pick_label_length(config, txid);
+        let packet = match config.upstream_encoding {
+            UpstreamEncoding::Qname => {
+                let qname = build_qname_with_encoding(
+                    &send_buf[..send_length],
+                    config.domain,
+                    label_length,
+                    super::data_encoding(config),
+                )
+                .map_err(|err| ClientError::new(err.to_string()))?;
+                let params = QueryParams {
+                    id: poll_id,
+                    qname: &qname,
+                    qtype: config.dns_query_type,
+                    qclass: CLASS_IN,
+                    rd: true,
+                    cd: false,
+                    qdcount: 1,
+                    is_query: true,
+                };
+                match config.resolver_transport {
+                    ResolverTransport::Udp => encode_query(&params),
+                    ResolverTransport::Tcp => encode_query_compact(&params),
+                }
+                .map_err(|err| ClientError::new(err.to_string()))?
+            }
+            UpstreamEncoding::EdnsRaw => {
+                let qname = build_edns_raw_qname(config.domain)
+                    .map_err(|err| ClientError::new(err.to_string()))?;
+                encode_query_edns_raw(poll_id, &qname, &send_buf[..send_length], true, false)
+                    .map_err(|err| ClientError::new(err.to_string()))?
+            }
         };
-        *dns_id = dns_id.wrapping_add(1);
-        let packet = encode_query(&params).map_err(|err| ClientError::new(err.to_string()))?;
 
         let dest = sockaddr_storage_to_socket_addr(&addr_to)?;
         let dest = peer_addr_mode.canonicalize(dest);
-        if let Err(err) = udp.send_to(&packet, dest).await {
-            if is_transient_udp_error(&err) {
+        if let Err(err) = dns_transport.send_to(&packet, dest).await {
+            if dns_transport.is_transient_recv_error(&err) {
                 remaining_count = remaining_count.saturating_add(1);
                 *remaining = remaining_count;
                 break;

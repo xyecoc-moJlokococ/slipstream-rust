@@ -633,6 +633,13 @@ run_case() {
     --log "${case_dir}/target.jsonl" \
     >"${case_dir}/target.log" 2>&1 &
   TARGET_PID=$!
+  # Wait for the TCP target to actually accept before starting slipstream-server, otherwise the
+  # first stream sees "target connect failed ... Connection refused" and poll_backoff can engage,
+  # which tanks resolver-mode download rates on GHA.
+  if ! wait_for_log "TCP target (${case_name})" "${case_dir}/target.jsonl" '"event": "listening"'; then
+    echo "Target ${case_name} server failed to start listening." >&2
+    return 1
+  fi
 
   "${ROOT_DIR}/target/release/slipstream-server" \
     --dns-listen-port "${DNS_LISTEN_PORT}" \
@@ -656,7 +663,11 @@ run_case() {
   else
     echo "Running ${case_name} benchmark..."
   fi
-  sleep 2
+  if ! wait_for_log "Rust client (${case_name})" "${case_dir}/client.log" "Listening on TCP port"; then
+    echo "Client ${case_name} failed to start listening." >&2
+    return 1
+  fi
+  sleep 1
 
   python3 "${ROOT_DIR}/scripts/bench/tcp_bench.py" client \
     --connect "127.0.0.1:${CLIENT_TCP_PORT}" \

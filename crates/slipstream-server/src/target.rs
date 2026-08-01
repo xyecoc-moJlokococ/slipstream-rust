@@ -11,13 +11,43 @@ use tokio::net::TcpStream as TokioTcpStream;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, warn};
 
+#[derive(Clone, Copy)]
+pub(crate) enum TargetMode {
+    Tcp(SocketAddr),
+    DirectSocks,
+    SocksProxy(SocketAddr),
+}
+
 pub(crate) fn spawn_target_connector(
     key: StreamKey,
-    target_addr: SocketAddr,
+    target_mode: TargetMode,
     command_tx: mpsc::UnboundedSender<Command>,
     debug_streams: bool,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
+    if matches!(target_mode, TargetMode::DirectSocks) {
+        crate::socks_target::spawn_direct_socks_target(
+            key,
+            None,
+            command_tx,
+            debug_streams,
+            shutdown_rx,
+        );
+        return;
+    }
+    if let TargetMode::SocksProxy(proxy_addr) = target_mode {
+        crate::socks_target::spawn_direct_socks_target(
+            key,
+            Some(proxy_addr),
+            command_tx,
+            debug_streams,
+            shutdown_rx,
+        );
+        return;
+    }
+    let TargetMode::Tcp(target_addr) = target_mode else {
+        return;
+    };
     tokio::spawn(async move {
         if *shutdown_rx.borrow() {
             return;

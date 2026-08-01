@@ -1,19 +1,27 @@
+mod data_qps;
 mod dns;
 mod error;
 mod pacing;
 mod pinning;
+mod platform;
 mod runtime;
 mod streams;
+mod system_ca;
 
-use clap::{parser::ValueSource, ArgGroup, CommandFactory, FromArgMatches, Parser};
+use clap::{parser::ValueSource, ArgGroup, CommandFactory, FromArgMatches, Parser, ValueEnum};
+use serde::Deserialize;
 use slipstream_core::{
     cli::{exit_with_error, exit_with_message, init_logging, unwrap_or_exit},
     normalize_domain, parse_host_port, parse_host_port_parts, sip003, AddressKind, HostPort,
 };
-use slipstream_ffi::{ClientConfig, ResolverMode, ResolverSpec};
+use slipstream_ffi::{
+    ClientConfig, ResolverMode, ResolverSpec, ResolverTransport, UpstreamEncoding,
+};
 use tokio::runtime::Builder;
 
-use runtime::run_client;
+use pacing::DEFAULT_PACING_GAIN_PROBE;
+use runtime::run_client_with_control;
+use runtime::DEFAULT_DNS_TCP_PACKET_LOOP_BURST;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -26,6 +34,10 @@ use runtime::run_client;
     )
 )]
 struct Args {
+    /// Load settings from a JSON config file. Fields omitted from the file use the built-in
+    /// defaults; any CLI flag explicitly passed overrides the file. Standalone from SIP003.
+    #[arg(long = "config", value_name = "PATH")]
+    config: Option<String>,
     #[arg(long = "tcp-listen-host", default_value = "::")]
     tcp_listen_host: String,
     #[arg(long = "tcp-listen-port", short = 'l', default_value_t = 5201)]
@@ -52,18 +64,87 @@ struct Args {
     domain: Option<String>,
     #[arg(long = "cert", value_name = "PATH")]
     cert: Option<String>,
+    /// Verify the server's certificate against the OS's default CA bundle (full chain + hostname
+    /// check), like a normal HTTPS client. Mutually exclusive with --cert (leaf pinning).
+    #[arg(long = "verify-system-ca")]
+    verify_system_ca: bool,
     #[arg(long = "keep-alive-interval", short = 't', default_value_t = 400)]
     keep_alive_interval: u16,
     #[arg(long = "debug-poll")]
     debug_poll: bool,
     #[arg(long = "debug-streams")]
     debug_streams: bool,
+    #[arg(long = "resolver-transport", value_enum, default_value_t = ResolverTransportArg::Udp)]
+    resolver_transport: ResolverTransportArg,
+    #[arg(long = "pacing-gain-probe", default_value_t = DEFAULT_PACING_GAIN_PROBE)]
+    pacing_gain_probe: f64,
+    #[arg(long = "dns-tcp-packet-loop-burst", default_value_t = DEFAULT_DNS_TCP_PACKET_LOOP_BURST)]
+    dns_tcp_packet_loop_burst: usize,
+    #[arg(long = "upstream-encoding", value_enum, default_value_t = UpstreamEncodingArg::Qname)]
+    upstream_encoding: UpstreamEncodingArg,
+    #[arg(long = "qname-mtu", default_value_t = 0)]
+    qname_mtu: u32,
+    /// DNS query type to send (default 16 = TXT). Purely a client choice; the server accepts every
+    /// type it knows how to answer unconditionally, no matching server config needed.
+    #[arg(long = "dns-query-type", default_value_t = 16)]
+    dns_query_type: u16,
+    /// Label length (chars, 1..=63) for the encoded subdomain (default 57). Client-only fingerprint knob.
+    #[arg(long = "dns-label-length", default_value_t = 57)]
+    dns_label_length: usize,
+    /// Per-query jitter (chars) applied below --dns-label-length (default 0 = off, constant length).
+    /// When > 0, each query's label length is chosen in [dns-label-length - N, dns-label-length] so
+    /// labels aren't all identical length. Client-only; slightly lowers MTU when enabled.
+    #[arg(long = "dns-label-length-jitter", default_value_t = 0)]
+    dns_label_length_jitter: u32,
+    /// Cap on DNS poll queries per second (0 = unlimited). Lowers the query-rate fingerprint at the cost of throughput.
+    #[arg(long = "max-poll-qps", default_value_t = 0)]
+    max_poll_qps: u32,
+    /// Encode the tunnel payload with base64u instead of base32 (default false). ~20% denser, but
+    /// case-sensitive -- only enable once the resolver path is confirmed to preserve label case
+    /// end to end. Purely a client choice, no server config needed.
+    #[arg(long = "base64u-encoding")]
+    base64u_encoding: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ResolverTransportArg {
+    Udp,
+    Tcp,
+}
+
+impl From<ResolverTransportArg> for ResolverTransport {
+    fn from(value: ResolverTransportArg) -> Self {
+        match value {
+            ResolverTransportArg::Udp => ResolverTransport::Udp,
+            ResolverTransportArg::Tcp => ResolverTransport::Tcp,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum UpstreamEncodingArg {
+    Qname,
+    EdnsRaw,
+}
+
+impl From<UpstreamEncodingArg> for UpstreamEncoding {
+    fn from(value: UpstreamEncodingArg) -> Self {
+        match value {
+            UpstreamEncodingArg::Qname => UpstreamEncoding::Qname,
+            UpstreamEncodingArg::EdnsRaw => UpstreamEncoding::EdnsRaw,
+        }
+    }
 }
 
 fn main() {
     init_logging();
     let matches = Args::command().get_matches();
     let args = Args::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
+
+    if let Some(path) = args.config.clone() {
+        run_from_config_file(&path, &args, &matches);
+    }
+
     let sip003_env = unwrap_or_exit(sip003::read_sip003_env(), "SIP003 env error", 2);
     if sip003_env.is_present() {
         tracing::info!("SIP003 env detected; applying SS_* overrides with CLI precedence");
@@ -100,8 +181,19 @@ fn main() {
         }
     };
 
+    let resolver_transport = if cli_provided(&matches, "resolver_transport") {
+        ResolverTransport::from(args.resolver_transport)
+    } else {
+        unwrap_or_exit(
+            parse_resolver_transport(&sip003_env.plugin_options),
+            "SIP003 env error",
+            2,
+        )
+        .unwrap_or_else(|| ResolverTransport::from(args.resolver_transport))
+    };
+
     let cli_has_resolvers = has_cli_resolvers(&matches);
-    let resolvers = if cli_has_resolvers {
+    let mut resolvers = if cli_has_resolvers {
         unwrap_or_exit(build_resolvers(&matches, true), "Resolver error", 2)
     } else {
         let resolver_options = unwrap_or_exit(
@@ -138,6 +230,7 @@ fn main() {
             }
         }
     };
+    apply_resolver_transport(&mut resolvers, resolver_transport);
 
     let congestion_control = if args.congestion_control.is_some() {
         args.congestion_control.clone()
@@ -154,9 +247,15 @@ fn main() {
     } else {
         sip003::last_option_value(&sip003_env.plugin_options, "cert")
     };
-    if cert.is_none() {
+    if cert.is_some() && args.verify_system_ca {
+        exit_with_message(
+            "--cert (leaf pinning) and --verify-system-ca are mutually exclusive; pick one",
+            2,
+        );
+    }
+    if cert.is_none() && !args.verify_system_ca {
         tracing::warn!(
-            "Server certificate pinning is disabled; this allows MITM. Provide --cert to pin the server leaf, or dismiss this if your underlying tunnel provides authentication."
+            "Server certificate pinning is disabled; this allows MITM. Provide --cert to pin the server leaf, --verify-system-ca to verify against the OS trust store, or dismiss this if your underlying tunnel provides authentication."
         );
     }
 
@@ -179,9 +278,20 @@ fn main() {
         gso: args.gso,
         domain: &domain,
         cert: cert.as_deref(),
+        verify_system_ca: args.verify_system_ca,
         keep_alive_interval: keep_alive_interval as usize,
+        resolver_transport,
+        upstream_encoding: UpstreamEncoding::from(args.upstream_encoding),
+        qname_mtu: args.qname_mtu,
+        pacing_gain_probe: args.pacing_gain_probe,
+        dns_tcp_packet_loop_burst: args.dns_tcp_packet_loop_burst,
+        dns_query_type: args.dns_query_type,
+        dns_label_length: args.dns_label_length,
+        dns_label_length_jitter: args.dns_label_length_jitter,
+        max_poll_qps: args.max_poll_qps,
         debug_poll: args.debug_poll,
         debug_streams: args.debug_streams,
+        base64u_encoding: args.base64u_encoding,
     };
 
     let runtime = Builder::new_current_thread()
@@ -189,9 +299,283 @@ fn main() {
         .enable_time()
         .build()
         .expect("Failed to build Tokio runtime");
-    match runtime.block_on(run_client(&config)) {
+    match runtime.block_on(run_client_with_control(&config, None, None)) {
         Ok(code) => std::process::exit(code),
         Err(err) => exit_with_error("Client error", err, 1),
+    }
+}
+
+/// JSON config-file schema for slipstream-client. Deliberately flat and 1:1 with `ClientConfig` —
+/// the client is a single fixed tunnel, so there is no xray-style inbound/outbound/routing model.
+/// Every field is optional; omitted fields fall back to the CLI default.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ClientFileConfig {
+    tcp_listen_host: Option<String>,
+    tcp_listen_port: Option<u16>,
+    resolvers: Vec<ResolverEntry>,
+    congestion_control: Option<String>,
+    gso: Option<bool>,
+    domain: Option<String>,
+    cert: Option<String>,
+    verify_system_ca: Option<bool>,
+    keep_alive_interval: Option<u16>,
+    /// "udp" or "tcp".
+    resolver_transport: Option<String>,
+    /// "qname" or "edns-raw".
+    upstream_encoding: Option<String>,
+    qname_mtu: Option<u32>,
+    pacing_gain_probe: Option<f64>,
+    dns_tcp_packet_loop_burst: Option<usize>,
+    dns_query_type: Option<u16>,
+    dns_label_length: Option<usize>,
+    dns_label_length_jitter: Option<u32>,
+    max_poll_qps: Option<u32>,
+    debug_poll: Option<bool>,
+    debug_streams: Option<bool>,
+    base64u_encoding: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolverEntry {
+    addr: String,
+    #[serde(default)]
+    authoritative: bool,
+}
+
+/// Load a JSON config file, merge it with the CLI (explicit flags win, then file, then defaults),
+/// and run the client. Runs the process to completion and never returns.
+fn run_from_config_file(path: &str, args: &Args, matches: &clap::ArgMatches) -> ! {
+    let text = unwrap_or_exit(
+        std::fs::read_to_string(path).map_err(|err| format!("{}: {}", path, err)),
+        "Failed to read config file",
+        2,
+    );
+    let file: ClientFileConfig = unwrap_or_exit(
+        serde_json::from_str(&text).map_err(|err| err.to_string()),
+        "Invalid config file",
+        2,
+    );
+
+    // Explicit CLI flag > file value > built-in default. `args.<field>` already holds the clap
+    // default when the flag was not passed, so it doubles as the default source.
+    let tcp_listen_host = if cli_provided(matches, "tcp_listen_host") {
+        args.tcp_listen_host.clone()
+    } else {
+        file.tcp_listen_host
+            .clone()
+            .unwrap_or_else(|| args.tcp_listen_host.clone())
+    };
+    let tcp_listen_port = if cli_provided(matches, "tcp_listen_port") {
+        args.tcp_listen_port
+    } else {
+        file.tcp_listen_port.unwrap_or(args.tcp_listen_port)
+    };
+    let keep_alive_interval = if cli_provided(matches, "keep_alive_interval") {
+        args.keep_alive_interval
+    } else {
+        file.keep_alive_interval.unwrap_or(args.keep_alive_interval)
+    };
+    let gso = if cli_provided(matches, "gso") {
+        args.gso
+    } else {
+        file.gso.unwrap_or(args.gso)
+    };
+    let qname_mtu = if cli_provided(matches, "qname_mtu") {
+        args.qname_mtu
+    } else {
+        file.qname_mtu.unwrap_or(args.qname_mtu)
+    };
+    let pacing_gain_probe = if cli_provided(matches, "pacing_gain_probe") {
+        args.pacing_gain_probe
+    } else {
+        file.pacing_gain_probe.unwrap_or(args.pacing_gain_probe)
+    };
+    let dns_tcp_packet_loop_burst = if cli_provided(matches, "dns_tcp_packet_loop_burst") {
+        args.dns_tcp_packet_loop_burst
+    } else {
+        file.dns_tcp_packet_loop_burst
+            .unwrap_or(args.dns_tcp_packet_loop_burst)
+    };
+    let dns_query_type = if cli_provided(matches, "dns_query_type") {
+        args.dns_query_type
+    } else {
+        file.dns_query_type.unwrap_or(args.dns_query_type)
+    };
+    let dns_label_length = if cli_provided(matches, "dns_label_length") {
+        args.dns_label_length
+    } else {
+        file.dns_label_length.unwrap_or(args.dns_label_length)
+    };
+    let dns_label_length_jitter = if cli_provided(matches, "dns_label_length_jitter") {
+        args.dns_label_length_jitter
+    } else {
+        file.dns_label_length_jitter
+            .unwrap_or(args.dns_label_length_jitter)
+    };
+    let max_poll_qps = if cli_provided(matches, "max_poll_qps") {
+        args.max_poll_qps
+    } else {
+        file.max_poll_qps.unwrap_or(args.max_poll_qps)
+    };
+    let debug_poll = if cli_provided(matches, "debug_poll") {
+        args.debug_poll
+    } else {
+        file.debug_poll.unwrap_or(args.debug_poll)
+    };
+    let debug_streams = if cli_provided(matches, "debug_streams") {
+        args.debug_streams
+    } else {
+        file.debug_streams.unwrap_or(args.debug_streams)
+    };
+    let base64u_encoding = if cli_provided(matches, "base64u_encoding") {
+        args.base64u_encoding
+    } else {
+        file.base64u_encoding.unwrap_or(args.base64u_encoding)
+    };
+    let verify_system_ca = if cli_provided(matches, "verify_system_ca") {
+        args.verify_system_ca
+    } else {
+        file.verify_system_ca.unwrap_or(args.verify_system_ca)
+    };
+
+    let resolver_transport = if cli_provided(matches, "resolver_transport") {
+        ResolverTransport::from(args.resolver_transport)
+    } else if let Some(value) = file.resolver_transport.as_deref() {
+        unwrap_or_exit(parse_transport_str(value), "Invalid config", 2)
+    } else {
+        ResolverTransport::from(args.resolver_transport)
+    };
+    let upstream_encoding = if cli_provided(matches, "upstream_encoding") {
+        UpstreamEncoding::from(args.upstream_encoding)
+    } else if let Some(value) = file.upstream_encoding.as_deref() {
+        unwrap_or_exit(parse_encoding_str(value), "Invalid config", 2)
+    } else {
+        UpstreamEncoding::from(args.upstream_encoding)
+    };
+
+    let domain = if let Some(domain) = args.domain.clone() {
+        domain
+    } else if let Some(domain) = file.domain.as_deref() {
+        unwrap_or_exit(
+            normalize_domain(domain).map_err(|err| err.to_string()),
+            "Invalid config domain",
+            2,
+        )
+    } else {
+        exit_with_message("A domain is required (config `domain` or --domain)", 2);
+    };
+
+    let congestion_control = if cli_provided(matches, "congestion_control") {
+        args.congestion_control.clone()
+    } else {
+        file.congestion_control.clone()
+    };
+    if let Some(value) = congestion_control.as_deref() {
+        if value != "bbr" && value != "dcubic" {
+            exit_with_message(&format!("Invalid congestion_control value: {}", value), 2);
+        }
+    }
+    let cert = if cli_provided(matches, "cert") {
+        args.cert.clone()
+    } else {
+        file.cert.clone()
+    };
+    if cert.is_some() && verify_system_ca {
+        exit_with_message(
+            "cert (leaf pinning) and verify_system_ca are mutually exclusive; pick one",
+            2,
+        );
+    }
+    if cert.is_none() && !verify_system_ca {
+        tracing::warn!(
+            "Server certificate pinning is disabled; this allows MITM. Set `cert` (or --cert) to pin the server leaf, `verify_system_ca` (or --verify-system-ca) to verify against the OS trust store, or dismiss this if your underlying tunnel provides authentication."
+        );
+    }
+
+    let mut resolvers = if has_cli_resolvers(matches) {
+        unwrap_or_exit(build_resolvers(matches, true), "Resolver error", 2)
+    } else {
+        let specs = unwrap_or_exit(
+            file_resolvers(&file.resolvers),
+            "Invalid config resolver",
+            2,
+        );
+        if specs.is_empty() {
+            exit_with_message(
+                "At least one resolver is required (config `resolvers` or --resolver)",
+                2,
+            );
+        }
+        specs
+    };
+    apply_resolver_transport(&mut resolvers, resolver_transport);
+
+    let config = ClientConfig {
+        tcp_listen_host: &tcp_listen_host,
+        tcp_listen_port,
+        resolvers: &resolvers,
+        congestion_control: congestion_control.as_deref(),
+        gso,
+        domain: &domain,
+        cert: cert.as_deref(),
+        verify_system_ca,
+        keep_alive_interval: keep_alive_interval as usize,
+        resolver_transport,
+        upstream_encoding,
+        qname_mtu,
+        pacing_gain_probe,
+        dns_tcp_packet_loop_burst,
+        dns_query_type,
+        dns_label_length,
+        dns_label_length_jitter,
+        max_poll_qps,
+        debug_poll,
+        debug_streams,
+        base64u_encoding,
+    };
+
+    let runtime = Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .expect("Failed to build Tokio runtime");
+    match runtime.block_on(run_client_with_control(&config, None, None)) {
+        Ok(code) => std::process::exit(code),
+        Err(err) => exit_with_error("Client error", err, 1),
+    }
+}
+
+fn file_resolvers(entries: &[ResolverEntry]) -> Result<Vec<ResolverSpec>, String> {
+    entries
+        .iter()
+        .map(|entry| {
+            let resolver = parse_host_port(&entry.addr, 53, AddressKind::Resolver)
+                .map_err(|err| err.to_string())?;
+            let mode = if entry.authoritative {
+                ResolverMode::Authoritative
+            } else {
+                ResolverMode::Recursive
+            };
+            Ok(ResolverSpec { resolver, mode })
+        })
+        .collect()
+}
+
+fn parse_transport_str(value: &str) -> Result<ResolverTransport, String> {
+    match value {
+        "udp" => Ok(ResolverTransport::Udp),
+        "tcp" => Ok(ResolverTransport::Tcp),
+        _ => Err(format!("Invalid resolver_transport value: {}", value)),
+    }
+}
+
+fn parse_encoding_str(value: &str) -> Result<UpstreamEncoding, String> {
+    match value {
+        "qname" => Ok(UpstreamEncoding::Qname),
+        "edns-raw" | "ednsraw" => Ok(UpstreamEncoding::EdnsRaw),
+        _ => Err(format!("Invalid upstream_encoding value: {}", value)),
     }
 }
 
@@ -344,6 +728,33 @@ fn parse_keep_alive_interval(options: &[sip003::Sip003Option]) -> Result<Option<
     Ok(last)
 }
 
+fn parse_resolver_transport(
+    options: &[sip003::Sip003Option],
+) -> Result<Option<ResolverTransport>, String> {
+    let mut last = None;
+    for option in options {
+        if option.key == "resolver-transport" {
+            let value = option.value.trim();
+            last = Some(match value {
+                "udp" => ResolverTransport::Udp,
+                "tcp" => ResolverTransport::Tcp,
+                _ => return Err(format!("Invalid resolver-transport value: {}", value)),
+            });
+        }
+    }
+    Ok(last)
+}
+
+fn apply_resolver_transport(resolvers: &mut Vec<ResolverSpec>, transport: ResolverTransport) {
+    if transport == ResolverTransport::Tcp && resolvers.len() > 1 {
+        tracing::warn!(
+            "TCP resolver transport uses a single resolver; ignoring {} extra resolver(s)",
+            resolvers.len() - 1
+        );
+        resolvers.truncate(1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,5 +879,42 @@ mod tests {
         let parsed = parse_resolvers_from_options(&options).expect("options should parse");
         assert!(parsed.resolvers.is_empty());
         assert!(parsed.authoritative_remote);
+    }
+
+    #[test]
+    fn parses_plugin_resolver_transport() {
+        let options = vec![sip003::Sip003Option {
+            key: "resolver-transport".to_string(),
+            value: "tcp".to_string(),
+        }];
+        assert_eq!(
+            parse_resolver_transport(&options).expect("transport should parse"),
+            Some(ResolverTransport::Tcp)
+        );
+    }
+
+    #[test]
+    fn tcp_transport_keeps_only_first_resolver() {
+        let mut resolvers = vec![
+            ResolverSpec {
+                resolver: HostPort {
+                    host: "1.1.1.1".to_string(),
+                    port: 53,
+                    family: slipstream_core::AddressFamily::V4,
+                },
+                mode: ResolverMode::Recursive,
+            },
+            ResolverSpec {
+                resolver: HostPort {
+                    host: "2.2.2.2".to_string(),
+                    port: 53,
+                    family: slipstream_core::AddressFamily::V4,
+                },
+                mode: ResolverMode::Recursive,
+            },
+        ];
+        apply_resolver_transport(&mut resolvers, ResolverTransport::Tcp);
+        assert_eq!(resolvers.len(), 1);
+        assert_eq!(resolvers[0].resolver.host, "1.1.1.1");
     }
 }

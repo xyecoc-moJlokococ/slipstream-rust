@@ -1,25 +1,37 @@
 mod path;
 mod setup;
+mod stall;
 
 use self::path::{
     apply_path_mode, drain_path_events, fetch_path_quality, find_resolver_by_addr_mut,
     loop_burst_total, path_poll_burst_max,
 };
 use self::setup::{bind_tcp_listener, bind_udp_socket, compute_mtu, map_io};
+use self::stall::{
+    StallDetector, StallInput, DOWNLOAD_POLL_KEEPALIVE_INFLIGHT, DOWNLOAD_POLL_RESERVE_QPS,
+    FLOW_BLOCKED_MAX_INFLIGHT, FLOW_BLOCKED_MAX_POLL_QPS,
+};
 use crate::dns::{
-    add_paths, expire_inflight_polls, handle_dns_response, maybe_report_debug,
-    refresh_resolver_path, resolve_resolvers, resolver_mode_to_c, send_poll_queries,
-    sockaddr_storage_to_socket_addr, DnsResponseContext, PeerAddrMode,
+    add_paths, data_encoding, expire_inflight_polls, handle_dns_response, maybe_report_debug,
+    min_label_length, pick_label_length, refresh_resolver_path, resolve_resolvers,
+    resolver_mode_to_c, send_poll_queries, sockaddr_storage_to_socket_addr, DnsResponseContext,
+    DnsTransport, PeerAddrMode, TxidGen,
 };
 use crate::error::ClientError;
-use crate::pacing::{cwnd_target_polls, inflight_packet_estimate};
+use crate::pacing::{
+    clamp_authoritative_target, clamp_authoritative_target_with_max, cwnd_target_polls,
+    inflight_packet_estimate, sanitize_pacing_gain_probe, MAX_ACTIVE_AUTHORITATIVE_TARGET_INFLIGHT,
+};
 use crate::pinning::configure_pinned_certificate;
 use crate::streams::{
     acceptor::ClientAcceptor, client_callback, drain_commands, drain_stream_data, handle_command,
-    ClientState, Command,
+    reap_half_closed_tcp_streams, ClientState, Command,
 };
-use slipstream_core::net::is_transient_udp_error;
-use slipstream_dns::{build_qname, encode_query, QueryParams, CLASS_IN, RR_TXT};
+use crate::system_ca::find_system_ca_bundle;
+use slipstream_dns::{
+    build_edns_raw_qname, build_qname_with_encoding, encode_query, encode_query_compact,
+    encode_query_edns_raw, QueryParams, CLASS_IN, EDNS_UDP_PAYLOAD,
+};
 use slipstream_ffi::{
     configure_quic_with_custom,
     picoquic::{
@@ -27,14 +39,17 @@ use slipstream_ffi::{
         picoquic_create_client_cnx, picoquic_current_time, picoquic_disable_keep_alive,
         picoquic_enable_keep_alive, picoquic_enable_path_callbacks,
         picoquic_enable_path_callbacks_default, picoquic_get_next_wake_delay,
-        picoquic_prepare_next_packet_ex, picoquic_set_callback, slipstream_has_ready_stream,
-        slipstream_is_flow_blocked, slipstream_mixed_cc_algorithm, slipstream_set_cc_override,
-        slipstream_set_default_path_mode, PICOQUIC_CONNECTION_ID_MAX_SIZE,
-        PICOQUIC_MAX_PACKET_SIZE, PICOQUIC_PACKET_LOOP_RECV_MAX, PICOQUIC_PACKET_LOOP_SEND_MAX,
+        picoquic_prepare_next_packet_ex, picoquic_set_callback, slipstream_get_flow_debug,
+        slipstream_has_ready_stream, slipstream_is_flow_blocked, slipstream_mixed_cc_algorithm,
+        slipstream_set_cc_override, slipstream_set_default_path_mode,
+        PICOQUIC_CONNECTION_ID_MAX_SIZE, PICOQUIC_MAX_PACKET_SIZE,
     },
     socket_addr_to_storage, take_crypto_errors, ClientConfig, QuicGuard, ResolverMode,
+    ResolverTransport, UpstreamEncoding,
 };
 use std::ffi::CString;
+use std::future::pending;
+use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
@@ -46,9 +61,87 @@ const SLIPSTREAM_ALPN: &str = "picoquic_sample";
 const SLIPSTREAM_SNI: &str = "test.example.com";
 const DNS_WAKE_DELAY_MAX_US: i64 = 10_000_000;
 const DNS_POLL_SLICE_US: u64 = 50_000;
+// Floor for the has_work poll slice. picoquic_get_next_wake_delay can return 0 while there is still
+// "work" (a pacing/poll deficit) that cannot actually make progress yet (cwnd/pacing exhausted, or
+// the carrier is saturated under a connection burst). Sleeping 1µs there turns the loop into a
+// ~1M-iterations/s busy-wait that pegs a core at 100% CPU for no benefit. During real transfers the
+// loop is woken by recv_from (DNS responses) and data_notify (new upload bytes), not this sleep, so a
+// small floor caps the idle-spin rate without throttling throughput.
+const DNS_ACTIVE_SLEEP_MIN_US: u64 = 250;
+const DNS_IDLE_SLEEP_MIN_US: u64 = 50_000;
+pub(crate) const DEFAULT_DNS_TCP_PACKET_LOOP_BURST: usize = 64;
+const DNS_TCP_PACKET_LOOP_BURST_MIN: usize = 1;
+const DNS_TCP_PACKET_LOOP_BURST_MAX: usize = 512;
+const DNS_TCP_RECURSIVE_POLL_CREDIT: usize = 4;
+const DNS_TCP_RECURSIVE_POLL_SEED: usize = 16;
+const DNS_UDP_RECURSIVE_POLL_CREDIT: usize = 1;
+const DNS_UDP_RECURSIVE_POLL_SEED: usize = 1;
 const RECONNECT_SLEEP_MIN_MS: u64 = 250;
 const RECONNECT_SLEEP_MAX_MS: u64 = 5_000;
 const FLOW_BLOCKED_LOG_INTERVAL_US: u64 = 1_000_000;
+const MAX_UPSTREAM_BUFFERED_BYTES: u64 = 16 * 1024 * 1024;
+const UPSTREAM_BACKPRESSURE_RECENT_US: u64 = 2_000_000;
+const STREAM_ACTIVE_POLL_GRACE_US: u64 = 2_000_000;
+// Only applies after streams go quiet. Active transfers still use the normal burst/pacing path.
+const IDLE_STREAM_POLL_INTERVAL_US: u64 = 2_000_000;
+// NOTE: a per-resolver minimum poll floor (`pacing_target.max(12)` whenever >1 path was live) was
+// tried here to fix the ~96%/4% query split across two resolvers, and REVERTED after measurement.
+// It did even the split out (61%/39%) but collapsed throughput from ~870 KB/s to ~0.1-0.3 KB/s:
+// forcing polls onto the cold secondary path makes picoquic schedule real data there, and that path
+// cannot deliver, so the whole connection stalls behind it. Balancing the share therefore needs the
+// secondary path's capacity to be established *before* it is given data (or data kept off it while
+// only polls warm it up) -- not a blind floor.
+// The no-progress/poll-backoff/cpu-throttle detector thresholds and decision logic live in the
+// stall module (see runtime/stall.rs) so they can be unit tested without a live connection.
+
+#[derive(Debug, Default, Clone, Copy)]
+struct FlowDebugSnapshot {
+    maxdata_remote: u64,
+    data_sent: u64,
+    maxdata_local: u64,
+    data_consumed: u64,
+}
+
+impl FlowDebugSnapshot {
+    fn tx_window(self) -> u64 {
+        self.maxdata_remote.saturating_sub(self.data_sent)
+    }
+
+    fn rx_window(self) -> u64 {
+        self.maxdata_local.saturating_sub(self.data_consumed)
+    }
+}
+
+unsafe fn flow_debug_snapshot(cnx: *mut picoquic_cnx_t) -> FlowDebugSnapshot {
+    let mut snapshot = FlowDebugSnapshot::default();
+    unsafe {
+        slipstream_get_flow_debug(
+            cnx,
+            &mut snapshot.maxdata_remote,
+            &mut snapshot.data_sent,
+            &mut snapshot.maxdata_local,
+            &mut snapshot.data_consumed,
+        );
+    }
+    snapshot
+}
+
+unsafe fn upstream_backpressure_bytes(
+    state_ptr: *mut ClientState,
+    cnx: *mut picoquic_cnx_t,
+    now: u64,
+) -> Option<u64> {
+    let (enqueued_bytes, last_enqueue_at) = unsafe { (*state_ptr).debug_snapshot() };
+    let sent_bytes = unsafe { flow_debug_snapshot(cnx) }.data_sent;
+    let buffered = enqueued_bytes.saturating_sub(sent_bytes);
+    let recent_enqueue = last_enqueue_at != 0
+        && now.saturating_sub(last_enqueue_at) < UPSTREAM_BACKPRESSURE_RECENT_US;
+    if recent_enqueue && buffered >= MAX_UPSTREAM_BUFFERED_BYTES {
+        Some(buffered)
+    } else {
+        None
+    }
+}
 
 fn drain_disconnected_commands(command_rx: &mut mpsc::UnboundedReceiver<Command>) -> usize {
     let mut dropped = 0usize;
@@ -61,12 +154,110 @@ fn drain_disconnected_commands(command_rx: &mut mpsc::UnboundedReceiver<Command>
     dropped
 }
 
-pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
-    let domain_len = config.domain.len();
-    let mtu = compute_mtu(domain_len)?;
-    let udp = bind_udp_socket().await?;
-    let udp_local_addr = udp.local_addr().map_err(map_io)?;
-    let peer_addr_mode = PeerAddrMode::from_local_addr(udp_local_addr);
+pub(crate) fn sanitize_dns_tcp_packet_loop_burst(value: usize) -> usize {
+    value.clamp(DNS_TCP_PACKET_LOOP_BURST_MIN, DNS_TCP_PACKET_LOOP_BURST_MAX)
+}
+
+fn compute_transport_mtu(config: &ClientConfig<'_>) -> Result<u32, ClientError> {
+    match config.upstream_encoding {
+        UpstreamEncoding::Qname => {
+            // Size at the *minimum* label length a query might use (see `min_label_length`): with
+            // label-length jitter on, a shorter label means more dots and thus a longer name for the
+            // same payload, so the worst case must fit the 253-byte limit.
+            let max_mtu = compute_mtu(
+                config.domain,
+                min_label_length(config),
+                data_encoding(config),
+            )?;
+            if config.qname_mtu == 0 {
+                Ok(max_mtu)
+            } else {
+                Ok(config.qname_mtu.clamp(1, max_mtu))
+            }
+        }
+        UpstreamEncoding::EdnsRaw => Ok(EDNS_UDP_PAYLOAD as u32),
+    }
+}
+
+pub async fn run_client_with_control(
+    config: &ClientConfig<'_>,
+    mut shutdown_rx: Option<mpsc::UnboundedReceiver<()>>,
+    ready_tx: Option<std_mpsc::Sender<bool>>,
+) -> Result<i32, ClientError> {
+    run_client_with_control_and_liveness(config, shutdown_rx.take(), ready_tx, None).await
+}
+
+/// Same as [`run_client_with_control`], plus an optional `stale` predicate. When `stale()` returns
+/// true the loop returns promptly from EVERY hot spot (outer loop, inner recv/send bursts, reconnect
+/// sleep), even if the mpsc stop signal is never observed. This is the belt-and-suspenders reap for
+/// the "detached native thread spins at 100% CPU forever" wedge: the JNI stop path only sends a
+/// per-thread mpsc `stop_tx` and then *detaches* the thread if it doesn't join within the 10s
+/// timeout; a thread stuck busy-processing packets never sees that signal, so it orphans and pegs a
+/// core until the whole app is killed. Wiring `stale` to a global generation counter (bumped on
+/// every start AND stop) means any client whose generation is no longer current terminates itself.
+pub async fn run_client_with_control_and_liveness(
+    config: &ClientConfig<'_>,
+    mut shutdown_rx: Option<mpsc::UnboundedReceiver<()>>,
+    ready_tx: Option<std_mpsc::Sender<bool>>,
+    stale: Option<Box<dyn Fn() -> bool + Send>>,
+) -> Result<i32, ClientError> {
+    let is_stale = || stale.as_ref().is_some_and(|f| f());
+    report_ready(&ready_tx, false);
+    let mtu = compute_transport_mtu(config)?;
+    info!(
+        "QNAME transport mtu={} domain={} upstream={:?}",
+        mtu, config.domain, config.upstream_encoding
+    );
+    let dns_tcp_packet_loop_burst =
+        sanitize_dns_tcp_packet_loop_burst(config.dns_tcp_packet_loop_burst);
+    let pacing_gain_probe = sanitize_pacing_gain_probe(config.pacing_gain_probe);
+    let (packet_loop_send_base, packet_loop_recv_base, recursive_poll_credit, recursive_poll_seed) =
+        match config.resolver_transport {
+            ResolverTransport::Tcp => (
+                dns_tcp_packet_loop_burst,
+                dns_tcp_packet_loop_burst,
+                DNS_TCP_RECURSIVE_POLL_CREDIT,
+                DNS_TCP_RECURSIVE_POLL_SEED,
+            ),
+            ResolverTransport::Udp => (
+                // Historically capped at picoquic's stock PICOQUIC_PACKET_LOOP_SEND/RECV_MAX=10
+                // per loop iteration, while TCP already got the full dns_tcp_packet_loop_burst
+                // (default 64). That 10 was never a UDP-specific tuning choice, just the
+                // untouched picoquic default -- reusing the same burst TCP already gets lets a
+                // fresh/idle connection ramp up to its target inflight in ~1 loop iteration
+                // instead of ~7, which otherwise adds real wall-clock latency to every
+                // request that starts from idle (measured: ~555-615ms steady-state ping on
+                // UDP/Beeline before this change, dominated by this ramp-up, not raw RTT).
+                dns_tcp_packet_loop_burst,
+                dns_tcp_packet_loop_burst,
+                DNS_UDP_RECURSIVE_POLL_CREDIT,
+                DNS_UDP_RECURSIVE_POLL_SEED,
+            ),
+        };
+    let (mut dns_transport, peer_addr_mode) = match config.resolver_transport {
+        ResolverTransport::Udp => {
+            let udp = bind_udp_socket().await?;
+            let udp_local_addr = udp.local_addr().map_err(map_io)?;
+            (
+                DnsTransport::udp(udp),
+                PeerAddrMode::from_local_addr(udp_local_addr),
+            )
+        }
+        ResolverTransport::Tcp => {
+            let peer_addr_mode = PeerAddrMode::Native;
+            let resolvers = resolve_resolvers(
+                config.resolvers,
+                mtu,
+                config.debug_poll,
+                peer_addr_mode,
+                pacing_gain_probe,
+            )?;
+            if resolvers.is_empty() {
+                return Err(ClientError::new("At least one resolver is required"));
+            }
+            (DnsTransport::tcp(resolvers[0].addr).await?, peer_addr_mode)
+        }
+    };
 
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();
     let data_notify = Arc::new(Notify::new());
@@ -103,13 +294,40 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
     let mut reconnect_delay = Duration::from_millis(RECONNECT_SLEEP_MIN_MS);
 
     loop {
-        let mut resolvers =
-            resolve_resolvers(config.resolvers, mtu, config.debug_poll, peer_addr_mode)?;
+        if shutdown_requested(&mut shutdown_rx) || is_stale() {
+            return Ok(0);
+        }
+        let mut resolvers = resolve_resolvers(
+            config.resolvers,
+            mtu,
+            config.debug_poll,
+            peer_addr_mode,
+            pacing_gain_probe,
+        )?;
         if resolvers.is_empty() {
             return Err(ClientError::new("At least one resolver is required"));
         }
+        // Log the resolver set the engine actually built. Without this, a multi-resolver profile
+        // that silently arrives as one resolver is indistinguishable from one whose extra QUIC
+        // paths failed to probe: `add_paths` returns early and logs nothing when len <= 1.
+        info!(
+            "resolvers: count={} [{}]",
+            resolvers.len(),
+            resolvers
+                .iter()
+                .map(|resolver| format!("{}/{:?}", resolver.addr, resolver.mode))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
 
-        let mut local_addr_storage = socket_addr_to_storage(udp_local_addr);
+        let mut local_addr_storage =
+            socket_addr_to_storage(dns_transport.local_addr().map_err(map_io)?);
+
+        let system_ca_bundle = if config.verify_system_ca {
+            Some(find_system_ca_bundle().map_err(ClientError::new)?)
+        } else {
+            None
+        };
 
         let current_time = unsafe { picoquic_current_time() };
         let quic = unsafe {
@@ -117,7 +335,10 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 8,
                 std::ptr::null(),
                 std::ptr::null(),
-                std::ptr::null(),
+                system_ca_bundle
+                    .as_ref()
+                    .map(|cstr| cstr.as_ptr())
+                    .unwrap_or(std::ptr::null()),
                 alpn.as_ptr(),
                 Some(client_callback),
                 state_ptr as *mut _,
@@ -195,19 +416,55 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             warn!("GSO is not implemented in the Rust client loop yet.");
         }
 
-        let mut dns_id = 1u16;
+        // Non-sequential DNS transaction IDs (RFC 5452), like a normal randomizing stub resolver.
+        // The old monotonic 1,2,3,... counter was a trivial DPI signature for the tunnel.
+        let mut txid = TxidGen::new();
         let mut recv_buf = vec![0u8; 4096];
         let mut send_buf = vec![0u8; PICOQUIC_MAX_PACKET_SIZE];
-        let packet_loop_send_max = loop_burst_total(&resolvers, PICOQUIC_PACKET_LOOP_SEND_MAX);
-        let packet_loop_recv_max = loop_burst_total(&resolvers, PICOQUIC_PACKET_LOOP_RECV_MAX);
+        let packet_loop_send_max = loop_burst_total(&resolvers, packet_loop_send_base);
+        let packet_loop_recv_max = loop_burst_total(&resolvers, packet_loop_recv_base);
+        let recursive_poll_burst_max = packet_loop_send_base;
         let mut zero_send_loops = 0u64;
         let mut zero_send_with_streams = 0u64;
         let mut last_flow_block_log_at = 0u64;
+        let mut dns_send_bytes_total = 0u64;
+        let mut last_idle_stream_poll_at = 0u64;
+        let mut ready_reported = false;
+        let mut fatal_no_progress: Option<String> = None;
+        let mut stall = StallDetector::new();
+        // Rolling 1-second window for the optional DNS poll-rate cap (config.max_poll_qps).
+        // Only used when max_poll_qps > 0; otherwise these stay untouched and impose no limit.
+        let mut poll_window_start_us = 0u64;
+        let mut poll_window_sent: u32 = 0;
+        // Fixed data-bearing DNS QPS cap (no thrash-adaptive). 0 = unlimited.
+        let mut data_window_start_us = 0u64;
+        let mut data_window_sent: u32 = 0;
+        let mut data_qps_cap = crate::data_qps::resolve_max_data_qps();
+        if data_qps_cap > 0 || config.max_poll_qps > 0 {
+            warn!(
+                "split DNS budgets: upload_data_qps={} download_poll_qps={} (0=unlimited; polls reserved during upload)",
+                data_qps_cap, config.max_poll_qps
+            );
+        }
 
         loop {
+            if shutdown_requested(&mut shutdown_rx) || is_stale() {
+                return Ok(0);
+            }
             let current_time = unsafe { picoquic_current_time() };
             drain_commands(cnx, state_ptr, &mut command_rx);
-            drain_stream_data(cnx, state_ptr);
+            if let Some(upstream_buffered) =
+                unsafe { upstream_backpressure_bytes(state_ptr, cnx, current_time) }
+            {
+                debug!(
+                    "upstream backpressure: buffered={} limit={}; pausing local TCP drain",
+                    upstream_buffered, MAX_UPSTREAM_BUFFERED_BYTES
+                );
+            } else {
+                drain_stream_data(cnx, state_ptr);
+            }
+            // Bound CLOSE-WAIT on the local SOCKS accept port when peer FINed but QUIC never does.
+            reap_half_closed_tcp_streams(cnx, state_ptr, current_time);
             let closing = unsafe { (*state_ptr).is_closing() };
             if closing {
                 break;
@@ -215,6 +472,10 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
 
             let ready = unsafe { (*state_ptr).is_ready() };
             if ready {
+                if !ready_reported {
+                    report_ready(&ready_tx, true);
+                    ready_reported = true;
+                }
                 unsafe {
                     (*state_ptr).update_acceptor_limit(cnx);
                 }
@@ -240,25 +501,87 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 unsafe { picoquic_get_next_wake_delay(quic, current_time, DNS_WAKE_DELAY_MAX_US) };
             let delay_us = if delay_us < 0 { 0 } else { delay_us as u64 };
             let streams_len_for_sleep = unsafe { (*state_ptr).streams_len() };
-            let mut has_work = streams_len_for_sleep > 0;
+            let (_, last_enqueue_at_for_sleep) = unsafe { (*state_ptr).debug_snapshot() };
+            let has_recent_stream_activity_for_sleep = streams_len_for_sleep > 0
+                && (last_enqueue_at_for_sleep == 0
+                    || current_time.saturating_sub(last_enqueue_at_for_sleep)
+                        < STREAM_ACTIVE_POLL_GRACE_US);
+            let idle_stream_poll_due_for_sleep = streams_len_for_sleep > 0
+                && !has_recent_stream_activity_for_sleep
+                && current_time.saturating_sub(last_idle_stream_poll_at)
+                    >= IDLE_STREAM_POLL_INTERVAL_US;
+            let mut has_work = false;
             for resolver in resolvers.iter_mut() {
                 if !refresh_resolver_path(cnx, resolver) {
                     continue;
                 }
                 let pending_for_sleep = match resolver.mode {
                     ResolverMode::Authoritative => {
-                        let quality = fetch_path_quality(cnx, resolver);
-                        let snapshot = resolver
-                            .pacing_budget
-                            .as_mut()
-                            .map(|budget| budget.target_inflight(&quality, delay_us.max(1)));
-                        resolver.last_pacing_snapshot = snapshot;
-                        let target = snapshot
-                            .map(|snapshot| snapshot.target_inflight)
-                            .unwrap_or_else(|| cwnd_target_polls(quality.cwin, mtu));
-                        let inflight_packets =
-                            inflight_packet_estimate(quality.bytes_in_transit, mtu);
-                        target.saturating_sub(inflight_packets)
+                        // Demand-driven polls only. (Old Megafon path forced steady max_poll_qps
+                        // whenever any stream was open and disabled poll_backoff — that idle-firehosed
+                        // the server at ~1–4k qps with Telegram open. Megafon ~50 qps is unusable
+                        // for Slipstream anyway.)
+                        if ready
+                            && streams_len_for_sleep > 0
+                            && (has_recent_stream_activity_for_sleep
+                                || idle_stream_poll_due_for_sleep
+                                || unsafe { slipstream_is_flow_blocked(cnx) != 0 })
+                        {
+                            let quality = fetch_path_quality(cnx, resolver);
+                            let flow_blocked_for_sleep =
+                                unsafe { slipstream_is_flow_blocked(cnx) != 0 };
+                            // Full ~384 only on real activity / high-throughput, not because
+                            // max_poll_qps is set.
+                            let max_target = if current_time < resolver.high_throughput_until
+                                || has_recent_stream_activity_for_sleep
+                            {
+                                MAX_ACTIVE_AUTHORITATIVE_TARGET_INFLIGHT
+                            } else if flow_blocked_for_sleep {
+                                FLOW_BLOCKED_MAX_INFLIGHT
+                            } else {
+                                // Streams open but quiet (e.g. TG idle): modest target; backoff may
+                                // shrink further via unproductive_inflight_cap (24 -> 6 -> 2 as the
+                                // quiet lengthens).
+                                64
+                            };
+                            let snapshot = resolver.pacing_budget.as_mut().map(|budget| {
+                                if max_target > 0 {
+                                    budget.target_inflight(&quality, delay_us.max(1), max_target)
+                                } else {
+                                    budget.target_inflight(&quality, delay_us.max(1), 64)
+                                }
+                            });
+                            resolver.last_pacing_snapshot = snapshot;
+                            let target = snapshot
+                                .map(|snapshot| snapshot.target_inflight)
+                                .unwrap_or_else(|| {
+                                    clamp_authoritative_target(
+                                        cwnd_target_polls(quality.cwin, mtu),
+                                        mtu,
+                                    )
+                                });
+                            // Always apply poll_backoff when unproductive (including max_poll_qps>0).
+                            let target = if flow_blocked_for_sleep {
+                                target.min(FLOW_BLOCKED_MAX_INFLIGHT)
+                            } else if stall.poll_backoff_active() {
+                                target.min(stall.unproductive_inflight_cap(current_time))
+                            } else {
+                                target
+                            };
+                            let inflight_packets =
+                                inflight_packet_estimate(quality.bytes_in_transit, mtu);
+                            let deficit = target.saturating_sub(
+                                inflight_packets.saturating_add(resolver.inflight_poll_ids.len()),
+                            );
+                            if has_recent_stream_activity_for_sleep || flow_blocked_for_sleep {
+                                deficit
+                            } else {
+                                deficit.min(1)
+                            }
+                        } else {
+                            resolver.last_pacing_snapshot = None;
+                            0
+                        }
                     }
                     ResolverMode::Recursive => resolver.pending_polls,
                 };
@@ -272,8 +595,12 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 }
             }
             // Avoid a tight poll loop when idle, but keep the short slice during active transfers.
-            let timeout_us = if has_work {
-                delay_us.clamp(1, DNS_POLL_SLICE_US)
+            // cpu_throttle_active means has_work has been true with no real progress for
+            // CPU_THROTTLE_NO_PROGRESS_US straight; fall back to the idle floor until progress resumes.
+            let timeout_us = if has_work && !stall.cpu_throttle_active() {
+                delay_us.clamp(DNS_ACTIVE_SLEEP_MIN_US, DNS_POLL_SLICE_US)
+            } else if ready {
+                delay_us.max(DNS_IDLE_SLEEP_MIN_US)
             } else {
                 delay_us.max(1)
             };
@@ -285,26 +612,68 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                         handle_command(cnx, state_ptr, command);
                     }
                 }
+                _ = wait_for_shutdown(&mut shutdown_rx) => {
+                    return Ok(0);
+                }
                 _ = data_notify.notified() => {}
-                recv = udp.recv_from(&mut recv_buf) => {
+                recv = dns_transport.recv_from(&mut recv_buf) => {
                     match recv {
                         Ok((size, peer)) => {
-                            let mut response_ctx = DnsResponseContext {
-                                quic,
-                                local_addr_storage: &local_addr_storage,
-                                peer_addr_mode,
-                                resolvers: &mut resolvers,
-                            };
-                            handle_dns_response(&recv_buf[..size], peer, &mut response_ctx)?;
+                            local_addr_storage =
+                                socket_addr_to_storage(dns_transport.local_addr().map_err(map_io)?);
+                            handle_dns_response(
+                                &recv_buf[..size],
+                                peer,
+                                &mut DnsResponseContext {
+                                    quic,
+                                    local_addr_storage: &local_addr_storage,
+                                    peer_addr_mode,
+                                    resolvers: &mut resolvers,
+                                    recursive_poll_credit,
+                                    recursive_poll_burst_max,
+                                    encoding: data_encoding(config),
+                                },
+                            )?;
+                            // Apply consumes deferred by the stream-data callback, now that we are
+                            // OUTSIDE picoquic's callback loop (avoids the re-entrant stream delete /
+                            // double-recycle). See ClientState::drain_pending_consumes.
+                            unsafe { (*state_ptr).drain_pending_consumes(cnx) };
                             for _ in 1..packet_loop_recv_max {
-                                match udp.try_recv_from(&mut recv_buf) {
-                                    Ok((size, peer)) => {
-                                        handle_dns_response(&recv_buf[..size], peer, &mut response_ctx)?;
+                                // Same hazard as the send burst below: draining a backlog of
+                                // already-buffered responses (e.g. a bloated per-stream reassembly
+                                // queue when local egress has stalled) can make handle_dns_response
+                                // expensive enough that this loop runs for seconds without yielding.
+                                // That delays the shutdown-aware select! past the JNI stop-join
+                                // deadline, so the thread gets detached while still holding the
+                                // local listen socket -- and, since detaching leaves this loop
+                                // running forever with no one left to signal it, the orphaned
+                                // thread pegs a CPU core indefinitely. Bail promptly instead.
+                                if shutdown_requested(&mut shutdown_rx) || is_stale() {
+                                    return Ok(0);
+                                }
+                                match dns_transport.try_recv_from(&mut recv_buf) {
+                                    Ok(Some((size, peer))) => {
+                                        local_addr_storage =
+                                            socket_addr_to_storage(dns_transport.local_addr().map_err(map_io)?);
+                                        handle_dns_response(
+                                            &recv_buf[..size],
+                                            peer,
+                                            &mut DnsResponseContext {
+                                                quic,
+                                                local_addr_storage: &local_addr_storage,
+                                                peer_addr_mode,
+                                                resolvers: &mut resolvers,
+                                                recursive_poll_credit,
+                                                recursive_poll_burst_max,
+                                                encoding: data_encoding(config),
+                                            },
+                                        )?;
+                                        // Apply deferred consumes outside picoquic's callback loop.
+                                        unsafe { (*state_ptr).drain_pending_consumes(cnx) };
                                     }
-                                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
-                                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                                    Ok(None) => break,
                                     Err(err) => {
-                                        if is_transient_udp_error(&err) {
+                                        if dns_transport.is_transient_recv_error(&err) {
                                             break;
                                         }
                                         return Err(map_io(err));
@@ -313,7 +682,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                             }
                         }
                         Err(err) => {
-                            if !is_transient_udp_error(&err) {
+                            if !dns_transport.is_transient_recv_error(&err) {
                                 return Err(map_io(err));
                             }
                         }
@@ -323,11 +692,44 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             }
 
             drain_commands(cnx, state_ptr, &mut command_rx);
-            drain_stream_data(cnx, state_ptr);
+            let current_time = unsafe { picoquic_current_time() };
+            if let Some(upstream_buffered) =
+                unsafe { upstream_backpressure_bytes(state_ptr, cnx, current_time) }
+            {
+                debug!(
+                    "upstream backpressure: buffered={} limit={}; pausing local TCP drain",
+                    upstream_buffered, MAX_UPSTREAM_BUFFERED_BYTES
+                );
+            } else {
+                drain_stream_data(cnx, state_ptr);
+            }
+            reap_half_closed_tcp_streams(cnx, state_ptr, current_time);
             drain_path_events(cnx, &mut resolvers, state_ptr, peer_addr_mode);
 
             for _ in 0..packet_loop_send_max {
+                // Under heavy upload this loop can spend seconds grinding through paced DNS sends
+                // before control returns to the shutdown-aware `select!` below. A stop request that
+                // lands mid-burst would otherwise wait out the whole burst; if that pushes the
+                // native thread past the JNI stop-join deadline it gets detached while still holding
+                // the local listen socket, and the next start fails with EADDRINUSE. Bail promptly.
+                if shutdown_requested(&mut shutdown_rx) || is_stale() {
+                    return Ok(0);
+                }
                 let current_time = unsafe { picoquic_current_time() };
+                if data_window_start_us == 0
+                    || current_time.saturating_sub(data_window_start_us) >= 1_000_000
+                {
+                    data_window_start_us = current_time;
+                    data_window_sent = 0;
+                    let new_cap = crate::data_qps::resolve_max_data_qps();
+                    if new_cap != data_qps_cap {
+                        warn!("data_qps_cap {} -> {}", data_qps_cap, new_cap);
+                        data_qps_cap = new_cap;
+                    }
+                }
+                if data_qps_cap > 0 && data_window_sent >= data_qps_cap {
+                    break;
+                }
                 let mut send_length: libc::size_t = 0;
                 let mut addr_to: slipstream_ffi::SockaddrStorage = unsafe { std::mem::zeroed() };
                 let mut addr_from: slipstream_ffi::SockaddrStorage = unsafe { std::mem::zeroed() };
@@ -365,7 +767,10 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                         if flow_blocked {
                             for resolver in resolvers.iter_mut() {
                                 if resolver.mode == ResolverMode::Recursive && resolver.added {
-                                    resolver.pending_polls = resolver.pending_polls.max(1);
+                                    resolver.pending_polls = resolver
+                                        .pending_polls
+                                        .max(recursive_poll_seed)
+                                        .min(recursive_poll_burst_max);
                                 }
                             }
                         }
@@ -388,28 +793,54 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     }
                 }
 
-                let qname = build_qname(&send_buf[..send_length], config.domain)
-                    .map_err(|err| ClientError::new(err.to_string()))?;
-                let params = QueryParams {
-                    id: dns_id,
-                    qname: &qname,
-                    qtype: RR_TXT,
-                    qclass: CLASS_IN,
-                    rd: true,
-                    cd: false,
-                    qdcount: 1,
-                    is_query: true,
+                let dns_id = txid.next_id();
+                let label_length = pick_label_length(config, &mut txid);
+                let packet = match config.upstream_encoding {
+                    UpstreamEncoding::Qname => {
+                        let qname = build_qname_with_encoding(
+                            &send_buf[..send_length],
+                            config.domain,
+                            label_length,
+                            data_encoding(config),
+                        )
+                        .map_err(|err| ClientError::new(err.to_string()))?;
+                        let params = QueryParams {
+                            id: dns_id,
+                            qname: &qname,
+                            qtype: config.dns_query_type,
+                            qclass: CLASS_IN,
+                            rd: true,
+                            cd: false,
+                            qdcount: 1,
+                            is_query: true,
+                        };
+                        match config.resolver_transport {
+                            ResolverTransport::Udp => encode_query(&params),
+                            ResolverTransport::Tcp => encode_query_compact(&params),
+                        }
+                        .map_err(|err| ClientError::new(err.to_string()))?
+                    }
+                    UpstreamEncoding::EdnsRaw => {
+                        let qname = build_edns_raw_qname(config.domain)
+                            .map_err(|err| ClientError::new(err.to_string()))?;
+                        encode_query_edns_raw(dns_id, &qname, &send_buf[..send_length], true, false)
+                            .map_err(|err| ClientError::new(err.to_string()))?
+                    }
                 };
-                dns_id = dns_id.wrapping_add(1);
-                let packet =
-                    encode_query(&params).map_err(|err| ClientError::new(err.to_string()))?;
 
                 let dest = sockaddr_storage_to_socket_addr(&addr_to)?;
                 let dest = peer_addr_mode.canonicalize(dest);
                 local_addr_storage = addr_from;
-                if let Err(err) = udp.send_to(&packet, dest).await {
-                    if !is_transient_udp_error(&err) {
-                        return Err(map_io(err));
+                match dns_transport.send_to(&packet, dest).await {
+                    Ok(()) => {
+                        dns_send_bytes_total =
+                            dns_send_bytes_total.saturating_add(packet.len() as u64);
+                        data_window_sent = data_window_sent.saturating_add(1);
+                    }
+                    Err(err) => {
+                        if !dns_transport.is_transient_recv_error(&err) {
+                            return Err(map_io(err));
+                        }
                     }
                 }
             }
@@ -417,37 +848,109 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             let has_ready_stream = unsafe { slipstream_has_ready_stream(cnx) != 0 };
             let flow_blocked = unsafe { slipstream_is_flow_blocked(cnx) != 0 };
             let streams_len = unsafe { (*state_ptr).streams_len() };
-            if streams_len > 0 && has_ready_stream && flow_blocked {
-                let now = unsafe { picoquic_current_time() };
-                if now.saturating_sub(last_flow_block_log_at) >= FLOW_BLOCKED_LOG_INTERVAL_US {
-                    let metrics = unsafe { (*state_ptr).stream_debug_metrics() };
-                    let backlog = unsafe { (*state_ptr).stream_backlog_summaries(8) };
-                    let (enqueued_bytes, last_enqueue_at) =
-                        unsafe { (*state_ptr).debug_snapshot() };
-                    let last_enqueue_ms = if last_enqueue_at == 0 {
-                        0
-                    } else {
-                        now.saturating_sub(last_enqueue_at) / 1_000
-                    };
+            let metrics = unsafe { (*state_ptr).stream_debug_metrics() };
+            let (enqueued_bytes, last_enqueue_at) = unsafe { (*state_ptr).debug_snapshot() };
+            let now = unsafe { picoquic_current_time() };
+            // Demand-driven poll throttle / cpu_throttle / no-progress detection all live in
+            // stall::StallDetector below -- see runtime/stall.rs for the decision logic and its
+            // unit tests.
+            let data_consumed = unsafe { flow_debug_snapshot(cnx) }.data_consumed;
+            let dns_responses_total: u64 = resolvers
+                .iter()
+                .map(|resolver| resolver.debug.dns_responses)
+                .sum();
+            let has_recent_stream_activity = streams_len > 0
+                && (last_enqueue_at == 0
+                    || now.saturating_sub(last_enqueue_at) < STREAM_ACTIVE_POLL_GRACE_US);
+            let idle_stream_poll_due = streams_len > 0
+                && !has_recent_stream_activity
+                && now.saturating_sub(last_idle_stream_poll_at) >= IDLE_STREAM_POLL_INTERVAL_US;
+            let last_enqueue_ms = if last_enqueue_at == 0 {
+                0
+            } else {
+                now.saturating_sub(last_enqueue_at) / 1_000
+            };
+            if streams_len > 0
+                && now.saturating_sub(last_flow_block_log_at) >= FLOW_BLOCKED_LOG_INTERVAL_US
+            {
+                let backlog = unsafe { (*state_ptr).stream_backlog_summaries(cnx, 8) };
+                let flow_debug = unsafe { flow_debug_snapshot(cnx) };
+                if flow_blocked {
                     error!(
-                        "connection flow blocked: streams={} streams_with_rx_queued={} queued_bytes_total={} streams_with_recv_fin={} streams_with_send_fin={} streams_discarding={} streams_with_unconsumed_rx={} enqueued_bytes={} last_enqueue_ms={} zero_send_with_streams={} zero_send_loops={} flow_blocked={} has_ready_stream={} backlog={:?}",
+                        "transfer_debug: streams={} streams_with_rx_queued={} streams_with_data_rx_queued={} data_rx_queued_chunks_total={} queued_bytes_total={} streams_with_recv_fin={} streams_with_send_fin={} streams_discarding={} streams_with_unconsumed_rx={} enqueued_bytes={} dns_send_bytes_total={} last_enqueue_ms={} zero_send_with_streams={} zero_send_loops={} flow_blocked={} has_ready_stream={} maxdata_remote={} data_sent={} tx_window={} maxdata_local={} data_consumed={} rx_window={} backlog={:?}",
                         streams_len,
                         metrics.streams_with_rx_queued,
+                        metrics.streams_with_data_rx_queued,
+                        metrics.data_rx_queued_chunks_total,
                         metrics.queued_bytes_total,
                         metrics.streams_with_recv_fin,
                         metrics.streams_with_send_fin,
                         metrics.streams_discarding,
                         metrics.streams_with_unconsumed_rx,
                         enqueued_bytes,
+                        dns_send_bytes_total,
                         last_enqueue_ms,
                         zero_send_with_streams,
                         zero_send_loops,
                         flow_blocked,
                         has_ready_stream,
+                        flow_debug.maxdata_remote,
+                        flow_debug.data_sent,
+                        flow_debug.tx_window(),
+                        flow_debug.maxdata_local,
+                        flow_debug.data_consumed,
+                        flow_debug.rx_window(),
                         backlog
                     );
-                    last_flow_block_log_at = now;
+                } else {
+                    info!(
+                        "transfer_debug: streams={} streams_with_rx_queued={} streams_with_data_rx_queued={} data_rx_queued_chunks_total={} queued_bytes_total={} streams_with_recv_fin={} streams_with_send_fin={} streams_discarding={} streams_with_unconsumed_rx={} enqueued_bytes={} dns_send_bytes_total={} last_enqueue_ms={} zero_send_with_streams={} zero_send_loops={} flow_blocked={} has_ready_stream={} maxdata_remote={} data_sent={} tx_window={} maxdata_local={} data_consumed={} rx_window={} backlog={:?}",
+                        streams_len,
+                        metrics.streams_with_rx_queued,
+                        metrics.streams_with_data_rx_queued,
+                        metrics.data_rx_queued_chunks_total,
+                        metrics.queued_bytes_total,
+                        metrics.streams_with_recv_fin,
+                        metrics.streams_with_send_fin,
+                        metrics.streams_discarding,
+                        metrics.streams_with_unconsumed_rx,
+                        enqueued_bytes,
+                        dns_send_bytes_total,
+                        last_enqueue_ms,
+                        zero_send_with_streams,
+                        zero_send_loops,
+                        flow_blocked,
+                        has_ready_stream,
+                        flow_debug.maxdata_remote,
+                        flow_debug.data_sent,
+                        flow_debug.tx_window(),
+                        flow_debug.maxdata_local,
+                        flow_debug.data_consumed,
+                        flow_debug.rx_window(),
+                        backlog
+                    );
                 }
+                last_flow_block_log_at = now;
+            }
+
+            let connection_ready = unsafe { (*state_ptr).is_ready() };
+            if let Some(reason) = stall.tick(StallInput {
+                now,
+                streams_len,
+                enqueued_bytes,
+                data_consumed,
+                data_rx_queued_chunks_total: metrics.data_rx_queued_chunks_total,
+                streams_with_data_rx_queued: metrics.streams_with_data_rx_queued,
+                dns_send_bytes_total,
+                dns_responses_total,
+                has_ready_stream,
+                flow_blocked,
+                zero_send_with_streams,
+                last_enqueue_at,
+                connection_ready,
+            }) {
+                fatal_no_progress = Some(reason);
+                break;
             }
             for resolver in resolvers.iter_mut() {
                 if !refresh_resolver_path(cnx, resolver) {
@@ -455,18 +958,105 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 }
                 match resolver.mode {
                     ResolverMode::Authoritative => {
-                        let quality = fetch_path_quality(cnx, resolver);
-                        let snapshot = resolver.last_pacing_snapshot;
-                        let pacing_target = snapshot
-                            .map(|snapshot| snapshot.target_inflight)
-                            .unwrap_or_else(|| cwnd_target_polls(quality.cwin, mtu));
-                        let inflight_packets =
-                            inflight_packet_estimate(quality.bytes_in_transit, mtu);
-                        let mut poll_deficit = pacing_target.saturating_sub(inflight_packets);
+                        let mut quality_for_log = None;
+                        // Demand-driven polls. max_poll_qps is only a hard ceiling on empty polls
+                        // (anti-fingerprint / operator courtesy) — NOT a "always send this many"
+                        // target. (Megafon steady-poll-at-cap was removed: ~50 qps resolvers are
+                        // unusable for Slipstream; the path caused idle TG to hold ~1–4k qps.)
+                        let allow_poll = has_recent_stream_activity
+                            || flow_blocked
+                            || idle_stream_poll_due
+                            || streams_len > 0;
+                        let mut poll_deficit = if streams_len > 0 && allow_poll {
+                            let quality = fetch_path_quality(cnx, resolver);
+                            let snapshot = resolver.last_pacing_snapshot;
+                            // Full ~384 only on real activity / high-throughput.
+                            let max_target = if current_time < resolver.high_throughput_until
+                                || has_recent_stream_activity
+                            {
+                                MAX_ACTIVE_AUTHORITATIVE_TARGET_INFLIGHT
+                            } else if flow_blocked {
+                                FLOW_BLOCKED_MAX_INFLIGHT
+                            } else {
+                                // Quiet streams (TG open, no transfer): modest target; poll_backoff
+                                // further drops via unproductive_inflight_cap when no useful data.
+                                64
+                            };
+                            let pacing_target = snapshot
+                                .map(|snapshot| snapshot.target_inflight)
+                                .unwrap_or_else(|| {
+                                    if max_target > 0 {
+                                        clamp_authoritative_target_with_max(
+                                            cwnd_target_polls(quality.cwin, mtu),
+                                            mtu,
+                                            max_target,
+                                        )
+                                    } else {
+                                        clamp_authoritative_target(
+                                            cwnd_target_polls(quality.cwin, mtu),
+                                            mtu,
+                                        )
+                                    }
+                                });
+                            // Always apply poll_backoff when unproductive — including when
+                            // max_poll_qps > 0 (was skipped for Megafon steady mode).
+                            let pacing_target = if flow_blocked {
+                                pacing_target.min(FLOW_BLOCKED_MAX_INFLIGHT)
+                            } else if stall.poll_backoff_active() {
+                                pacing_target.min(stall.unproductive_inflight_cap(now))
+                            } else {
+                                pacing_target
+                            };
+                            let inflight_packets =
+                                inflight_packet_estimate(quality.bytes_in_transit, mtu);
+                            quality_for_log = Some(quality);
+                            pacing_target.saturating_sub(
+                                inflight_packets.saturating_add(resolver.inflight_poll_ids.len()),
+                            )
+                        } else {
+                            resolver.last_pacing_snapshot = None;
+                            0
+                        };
+                        if idle_stream_poll_due
+                            && !has_recent_stream_activity
+                            && !flow_blocked
+                        {
+                            poll_deficit = poll_deficit.min(1);
+                        }
+                        // Split budget: upload uses data_qps_cap (prepare path); download uses empty
+                        // polls. Never zero polls entirely while streams exist — responses carry
+                        // downlink + MAX_STREAM_DATA. During bulk upload keep a download slice.
                         if has_ready_stream && !flow_blocked {
-                            poll_deficit = 0;
+                            poll_deficit = poll_deficit.min(DOWNLOAD_POLL_KEEPALIVE_INFLIGHT);
+                        }
+                        // Optional anti-fingerprinting / download poll rate cap (max_poll_qps).
+                        // When flow_blocked, further cap so e.g. maxPollQps=1400 does not firehose.
+                        // While uploading, still guarantee DOWNLOAD_POLL_RESERVE_QPS headroom.
+                        if config.max_poll_qps > 0 && poll_deficit > 0 {
+                            if poll_window_start_us == 0
+                                || current_time.saturating_sub(poll_window_start_us) >= 1_000_000
+                            {
+                                poll_window_start_us = current_time;
+                                poll_window_sent = 0;
+                            }
+                            let effective_qps = if flow_blocked {
+                                // Prefer window updates over firehose; still keep download reserve.
+                                config
+                                    .max_poll_qps
+                                    .min(FLOW_BLOCKED_MAX_POLL_QPS)
+                                    .max(DOWNLOAD_POLL_RESERVE_QPS.min(config.max_poll_qps))
+                            } else if has_ready_stream {
+                                // Upload active: dedicate a fixed download-poll slice (not full 1400).
+                                DOWNLOAD_POLL_RESERVE_QPS.min(config.max_poll_qps)
+                            } else {
+                                config.max_poll_qps
+                            };
+                            let budget = (effective_qps as usize)
+                                .saturating_sub(poll_window_sent as usize);
+                            poll_deficit = poll_deficit.min(budget);
                         }
                         if poll_deficit > 0 && resolver.debug.enabled {
+                            let quality = quality_for_log.unwrap_or_default();
                             debug!(
                                 "cc_state: {} cwnd={} in_transit={} rtt_us={} flow_blocked={} deficit={}",
                                 resolver.label(),
@@ -478,34 +1068,46 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                             );
                         }
                         if poll_deficit > 0 {
-                            let burst_max = path_poll_burst_max(resolver);
-                            let mut to_send = poll_deficit.min(burst_max);
+                            let burst_max = path_poll_burst_max(resolver, packet_loop_send_base);
+                            let requested = poll_deficit.min(burst_max);
+                            let mut to_send = requested;
                             send_poll_queries(
                                 cnx,
-                                &udp,
+                                &mut dns_transport,
                                 config,
                                 &mut local_addr_storage,
-                                &mut dns_id,
+                                &mut txid,
                                 resolver,
                                 peer_addr_mode,
                                 &mut to_send,
                                 &mut send_buf,
                             )
                             .await?;
+                            if config.max_poll_qps > 0 {
+                                poll_window_sent = poll_window_sent
+                                    .saturating_add(requested.saturating_sub(to_send) as u32);
+                            }
+                            if idle_stream_poll_due
+                                && !has_recent_stream_activity
+                                && !flow_blocked
+                                && to_send == 0
+                            {
+                                last_idle_stream_poll_at = current_time;
+                            }
                         }
                     }
                     ResolverMode::Recursive => {
                         resolver.last_pacing_snapshot = None;
                         if resolver.pending_polls > 0 {
-                            let burst_max = path_poll_burst_max(resolver);
+                            let burst_max = path_poll_burst_max(resolver, packet_loop_send_base);
                             if resolver.pending_polls > burst_max {
                                 let mut to_send = burst_max;
                                 send_poll_queries(
                                     cnx,
-                                    &udp,
+                                    &mut dns_transport,
                                     config,
                                     &mut local_addr_storage,
-                                    &mut dns_id,
+                                    &mut txid,
                                     resolver,
                                     peer_addr_mode,
                                     &mut to_send,
@@ -520,10 +1122,10 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                                 let mut pending = resolver.pending_polls;
                                 send_poll_queries(
                                     cnx,
-                                    &udp,
+                                    &mut dns_transport,
                                     config,
                                     &mut local_addr_storage,
-                                    &mut dns_id,
+                                    &mut txid,
                                     resolver,
                                     peer_addr_mode,
                                     &mut pending,
@@ -577,6 +1179,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         unsafe {
             picoquic_close(cnx, 0);
         }
+        report_ready(&ready_tx, false);
 
         unsafe {
             (*state_ptr).reset_for_reconnect();
@@ -585,6 +1188,10 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         if dropped > 0 {
             warn!("Dropped {} queued commands while reconnecting", dropped);
         }
+        if let Some(reason) = fatal_no_progress {
+            error!("{}; leaving native reconnect to Android service", reason);
+            return Err(ClientError::new(reason));
+        }
         warn!(
             "Connection closed; reconnecting in {}ms",
             reconnect_delay.as_millis()
@@ -592,11 +1199,39 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         // Sleep in small chunks and drop commands that arrive while disconnected.
         let mut remaining_sleep = reconnect_delay;
         while remaining_sleep > Duration::ZERO {
+            if shutdown_requested(&mut shutdown_rx) || is_stale() {
+                return Ok(0);
+            }
             let chunk = remaining_sleep.min(Duration::from_millis(100));
             sleep(chunk).await;
             remaining_sleep -= chunk;
             let _ = drain_disconnected_commands(&mut command_rx);
         }
         reconnect_delay = (reconnect_delay * 2).min(Duration::from_millis(RECONNECT_SLEEP_MAX_MS));
+    }
+}
+
+fn report_ready(ready_tx: &Option<std_mpsc::Sender<bool>>, ready: bool) {
+    if let Some(ready_tx) = ready_tx {
+        let _ = ready_tx.send(ready);
+    }
+}
+
+fn shutdown_requested(shutdown_rx: &mut Option<mpsc::UnboundedReceiver<()>>) -> bool {
+    match shutdown_rx {
+        Some(rx) => match rx.try_recv() {
+            Ok(()) | Err(mpsc::error::TryRecvError::Disconnected) => true,
+            Err(mpsc::error::TryRecvError::Empty) => false,
+        },
+        None => false,
+    }
+}
+
+async fn wait_for_shutdown(shutdown_rx: &mut Option<mpsc::UnboundedReceiver<()>>) {
+    match shutdown_rx {
+        Some(rx) => {
+            let _ = rx.recv().await;
+        }
+        None => pending::<()>().await,
     }
 }
